@@ -1,10 +1,28 @@
 use serde::{Deserialize, Serialize};
 
-use crate::codec::CodecId;
+use crate::{PROTOCOL_VERSION, codec::CodecId};
 
 pub type RoomId = u64;
 pub type UserId = u64;
 pub type StreamId = u32;
+pub type RequestId = u64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlEnvelope<T> {
+    pub protocol_version: u8,
+    pub request_id: RequestId,
+    pub message: T,
+}
+
+impl<T> ControlEnvelope<T> {
+    pub fn new(request_id: RequestId, message: T) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            message,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientControl {
@@ -29,11 +47,16 @@ pub enum ServerControl {
     RoomJoined(RoomJoined),
     StreamPublished(StreamPublished),
     StreamSubscribed(StreamSubscribed),
+    StreamUnsubscribed(StreamUnsubscribed),
+    RoomLeft(RoomLeft),
     RequestKeyframe(RequestKeyframe),
     StreamConfig(StreamConfig),
     PublisherFeedback(PublisherFeedback),
     Error(ControlError),
 }
+
+pub type ClientEnvelope = ControlEnvelope<ClientControl>;
+pub type ServerEnvelope = ControlEnvelope<ServerControl>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -113,7 +136,18 @@ pub struct UnsubscribeStream {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUnsubscribed {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaveRoom {
+    pub room_id: RoomId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomLeft {
     pub room_id: RoomId,
 }
 
@@ -192,10 +226,63 @@ pub struct ControlError {
     pub message: String,
 }
 
+impl ControlError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControlCodecError {
+    #[error("control message json error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("unsupported control protocol version {0}")]
+    UnsupportedVersion(u8),
+}
+
+pub fn encode_client_envelope(envelope: &ClientEnvelope) -> Result<Vec<u8>, ControlCodecError> {
+    encode_envelope(envelope)
+}
+
+pub fn decode_client_envelope(bytes: &[u8]) -> Result<ClientEnvelope, ControlCodecError> {
+    decode_envelope(bytes)
+}
+
+pub fn encode_server_envelope(envelope: &ServerEnvelope) -> Result<Vec<u8>, ControlCodecError> {
+    encode_envelope(envelope)
+}
+
+pub fn decode_server_envelope(bytes: &[u8]) -> Result<ServerEnvelope, ControlCodecError> {
+    decode_envelope(bytes)
+}
+
+fn encode_envelope<T: Serialize>(
+    envelope: &ControlEnvelope<T>,
+) -> Result<Vec<u8>, ControlCodecError> {
+    let mut bytes = serde_json::to_vec(envelope)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn decode_envelope<T>(bytes: &[u8]) -> Result<ControlEnvelope<T>, ControlCodecError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let envelope: ControlEnvelope<T> = serde_json::from_slice(bytes.trim_ascii())?;
+    if envelope.protocol_version != PROTOCOL_VERSION {
+        return Err(ControlCodecError::UnsupportedVersion(
+            envelope.protocol_version,
+        ));
+    }
+    Ok(envelope)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PROTOCOL_VERSION;
 
     #[test]
     fn hello_carries_protocol_version() {
@@ -224,5 +311,30 @@ mod tests {
 
         assert_eq!(publish.codec, CodecId::H264);
         assert_eq!(publish.media_kind, MediaKind::Screen);
+    }
+
+    #[test]
+    fn client_envelope_round_trips_as_json_line() {
+        let envelope = ClientEnvelope::new(
+            7,
+            ClientControl::Hello(Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "desktop-client".to_owned(),
+            }),
+        );
+
+        let encoded = encode_client_envelope(&envelope).unwrap();
+        assert_eq!(encoded.last(), Some(&b'\n'));
+        assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn rejects_unsupported_envelope_version() {
+        let encoded = br#"{"protocol_version":99,"request_id":1,"message":{"Hello":{"protocol_version":1,"client_name":"bad"}}}"#;
+
+        assert!(matches!(
+            decode_client_envelope(encoded),
+            Err(ControlCodecError::UnsupportedVersion(99))
+        ));
     }
 }

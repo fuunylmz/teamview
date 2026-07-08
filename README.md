@@ -14,7 +14,7 @@ Capture
   -> low-buffer decode and playback
 ```
 
-The first milestone validates the transport and Relay/SFU behavior before implementing real screen capture or hardware encoding.
+The first milestones validate the QUIC transport, control plane, and Relay/SFU state model before implementing real screen capture or hardware encoding.
 
 ## Workspace
 
@@ -31,11 +31,20 @@ crates/load-test      Synthetic publisher/viewer load testing tool
 cargo fmt
 cargo test
 cargo build
-cargo run -p relay-server -- --help
-cargo run -p desktop-client -- --help
-cargo run -p load-test -- --help
+cargo clippy --all-targets -- -D warnings
+cargo run -p relay-server -- --listen 127.0.0.1:4433
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433
+cargo run -p load-test -- --publishers 1 --viewers 10 --include-slow-viewer
+```
+
+For a smoke test that starts the relay and exits after a few seconds:
+
+```bash
+timeout 3s cargo run -p relay-server -- --listen 127.0.0.1:0 || true
 ```
 
 ## Current stage
 
-Stage 0: Git repository, Rust workspace, protocol primitives, and runnable binary skeletons.
+Stage 1: QUIC endpoint setup, versioned JSON-line control envelopes, room/publish/subscribe control state, and local QUIC handshake tests.
+
+Media datagram fanout is the next stage.

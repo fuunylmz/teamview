@@ -11,6 +11,8 @@ mod transport;
 use clap::{Parser, ValueEnum};
 use tracing::info;
 
+use crate::transport::quic::build_client_endpoint;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
     Broadcaster,
@@ -27,14 +29,18 @@ struct Args {
     relay: String,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    info!(?args.mode, relay = %args.relay, "desktop client scaffold ready");
+    let endpoint = build_client_endpoint("127.0.0.1:0")?;
+    let local_addr = endpoint.local_addr()?;
+
+    info!(?args.mode, relay = %args.relay, local = %local_addr, "desktop client QUIC endpoint ready");
     println!(
-        "desktop-client scaffold mode={:?} relay={}",
-        args.mode, args.relay
+        "desktop-client mode={:?} relay={} local={}",
+        args.mode, args.relay, local_addr
     );
 
     Ok(())
