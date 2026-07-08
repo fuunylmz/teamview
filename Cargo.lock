@@ -498,7 +498,9 @@ name = "load-test"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
+ "relay-server",
  "teamview-protocol",
  "tracing",
  "tracing-subscriber",
@@ -800,6 +802,7 @@ name = "relay-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "futures-util",
  "quinn",

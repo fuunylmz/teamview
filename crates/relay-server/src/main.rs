@@ -1,18 +1,6 @@
-#![allow(dead_code)]
-
-mod config;
-mod control;
-mod metrics;
-mod pacing;
-mod room;
-mod router;
-mod session;
-mod transport;
-
 use clap::Parser;
+use relay_server::{config::ServerConfig, transport::build_server_endpoint};
 use tracing::info;
-
-use crate::{config::ServerConfig, transport::build_server_endpoint};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "TeamView QUIC Relay/SFU server")]
