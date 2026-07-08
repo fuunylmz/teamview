@@ -8,6 +8,7 @@ The latency target is below 200 ms glass-to-glass for same-region viewers on goo
 - Same-region good-network typical latency below 200 ms once live capture exists.
 - Synthetic relay tests prove that one slow viewer does not increase fast viewer queue depth or forwarding latency.
 - The viewer buffer drops late frames instead of accumulating delay.
+- The capture pipeline drops stale frames instead of letting a capture queue grow.
 
 ## Stage 2 synthetic fanout checks
 
@@ -58,8 +59,29 @@ Example output:
 sample-forward frames=3 fragments=18 reassembled=3 delivered=36 dropped=0
 ```
 
+## Stage 4 capture queue checks
+
+Stage 4 validates capture-side latency policy without requiring interactive screen selection.
+
+The key invariant is that the capture queue keeps only the newest frame by default. If three frames arrive before encode/network consumes them, the first two are dropped and only the latest frame is returned.
+
+Covered by unit tests:
+
+- `latest_frame_queue_keeps_only_latest_frame_by_default`
+- `latest_frame_queue_capacity_is_never_zero`
+- `capture_returns_latest_queued_frame`
+- `support_detection_matches_target_os`
+
+Smoke test:
+
+```bash
+cargo run -p desktop-client -- --mode broadcaster --capture-source primary-monitor
+```
+
+On Windows, expected output includes `capture_supported=true`.
+
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency, queue behavior, and encoded-frame reassembly behavior. Later milestones add capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
+Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, and capture queue behavior. Later milestones add real capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.

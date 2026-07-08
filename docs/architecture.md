@@ -18,6 +18,19 @@ Windows capture
   -> playback
 ```
 
-## First milestone
+## Capture foundation
 
-The first milestone uses synthetic media datagrams instead of real capture. This proves the server routing model, per-viewer isolation, and low-latency queue policy before hardware capture and encoding are added.
+Stage 4 introduces the desktop capture abstraction without yet depending on an interactive screen picker or GPU frame API in tests.
+
+The capture layer provides:
+
+- `CaptureSource` for primary monitor, monitor id, or window id/title.
+- `CaptureFrame` metadata with frame id, dimensions, capture timestamp, pixel format, and storage kind.
+- `LatestFrameQueue`, a bounded queue that drops older frames and keeps the newest frame.
+- `WindowsGraphicsCapture` support detection and a test-frame path for non-interactive verification.
+
+The queue defaults to capacity 1. This is intentional: if capture outruns encode/network, the app should drop stale frames and keep realtime behavior instead of accumulating latency.
+
+## First milestones
+
+The first milestones use synthetic media datagrams and pre-encoded sample frames before real capture. This proves the server routing model, per-viewer isolation, packetization, and low-latency queue policy before hardware capture and encoding are added.

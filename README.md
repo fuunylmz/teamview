@@ -14,7 +14,7 @@ Capture
   -> low-buffer decode and playback
 ```
 
-The first milestones validate the QUIC transport, control plane, Relay/SFU state model, slow-viewer isolation, and encoded-frame packetization before implementing real screen capture or hardware encoding.
+The first milestones validate the QUIC transport, control plane, Relay/SFU state model, slow-viewer isolation, encoded-frame packetization, and low-latency capture queueing before implementing hardware encoding.
 
 ## Workspace
 
@@ -34,6 +34,7 @@ cargo build
 cargo clippy --all-targets -- -D warnings
 cargo run -p relay-server -- --listen 127.0.0.1:4433
 cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433
+cargo run -p desktop-client -- --mode broadcaster --capture-source primary-monitor
 cargo run -p load-test -- --publishers 1 --viewers 10 --packets 120 --include-slow-viewer
 ```
 
@@ -67,8 +68,16 @@ Expected output shows frames split into multiple fragments, relayed to viewers, 
 sample-forward frames=3 fragments=18 reassembled=3 delivered=36 dropped=0
 ```
 
+For the Stage 4 capture foundation smoke test:
+
+```bash
+cargo run -p desktop-client -- --mode broadcaster --capture-source primary-monitor
+```
+
+Expected output includes `capture_supported=true` on Windows.
+
 ## Current stage
 
-Stage 3: pre-encoded H.264-like sample frames can be packetized into MTU-safe media packets, forwarded through the existing fanout model, and reassembled by a viewer with byte-for-byte validation.
+Stage 4: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup.
 
-Real QUIC media datagram I/O, live capture, hardware encode, decode, and rendering are later stages.
+Actual Windows Graphics Capture frame acquisition, hardware encode, decode, rendering, and real QUIC media datagram I/O are later stages.
