@@ -69,3 +69,27 @@ The packet header is defined in `crates/protocol/src/packet.rs` and includes:
 - payload length
 
 The decoder accepts longer header lengths for forward-compatible extensions, rejects shorter headers, validates fragment invariants, and rejects trailing bytes.
+
+## Encoded frame packetization
+
+Stage 3 adds reusable encoded-frame helpers in `crates/protocol/src/frame.rs`.
+
+`EncodedFrame` represents one encoded access unit before network packetization:
+
+- `room_stream_id`
+- `frame_id`
+- `media_timestamp`
+- `sender_capture_time_micros`
+- `codec`
+- `is_keyframe`
+- opaque encoded bytes
+
+`packetize_frame` splits a frame into `MediaPacket` fragments:
+
+- `sequence_number` increments for every fragment.
+- `frame_id` stays the same for all fragments in the frame.
+- `fragment_index` and `fragment_count` describe reassembly order.
+- `KEYFRAME` is set on fragments belonging to a keyframe.
+- `END_OF_FRAME` is set only on the last fragment.
+
+`reassemble_frame` sorts fragments by index, verifies frame metadata consistency, and reconstructs the original encoded bytes. Incomplete frames are rejected instead of being passed to a decoder.

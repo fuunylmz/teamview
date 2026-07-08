@@ -34,8 +34,32 @@ Example output:
 synthetic-fanout publishers=1 viewers=4 packets=10 delivered=31 dropped=9 slow_viewer_dropped=9
 ```
 
+## Stage 3 encoded sample forwarding checks
+
+Stage 3 validates encoded-frame packetization and reassembly before live capture or hardware encoding exists.
+
+Run:
+
+```bash
+cargo run -p load-test -- --mode sample-forward --viewers 2 --packets 3 --max-payload 700
+```
+
+Expected behavior:
+
+- Each H.264-like sample frame is split into multiple media packet fragments.
+- Fanout delivers each fragment to viewers through the same queue model used by Stage 2.
+- The first viewer reassembles every frame.
+- Reassembled bytes exactly match the original encoded frame bytes.
+- Missing or incomplete fragment sets are rejected by protocol tests.
+
+Example output:
+
+```text
+sample-forward frames=3 fragments=18 reassembled=3 delivered=36 dropped=0
+```
+
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency and queue behavior. Later milestones add capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
+Early milestones measure synthetic packet forwarding latency, queue behavior, and encoded-frame reassembly behavior. Later milestones add capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.
