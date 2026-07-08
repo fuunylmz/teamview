@@ -1,9 +1,11 @@
-use std::{net::SocketAddr, sync::Arc};
-
-use anyhow::Context;
-use quinn::{ClientConfig, Endpoint};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use super::RelayEndpoint;
+use anyhow::Context;
+use quinn::{ClientConfig, Endpoint};
+use teamview_protocol::control::{
+    ClientEnvelope, ServerEnvelope, decode_server_envelope, encode_client_envelope,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicClientConfig {
@@ -20,6 +22,9 @@ impl QuicClientConfig {
     }
 }
 
+const CONTROL_STREAM_READ_LIMIT: usize = 64 * 1024;
+const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub fn build_client_endpoint(bind_addr: &str) -> anyhow::Result<Endpoint> {
     let addr: SocketAddr = bind_addr
         .parse()
@@ -27,6 +32,40 @@ pub fn build_client_endpoint(bind_addr: &str) -> anyhow::Result<Endpoint> {
     let mut endpoint = Endpoint::client(addr).context("failed to bind QUIC client endpoint")?;
     endpoint.set_default_client_config(build_insecure_local_client_config());
     Ok(endpoint)
+}
+
+pub async fn send_control_request(
+    endpoint: &Endpoint,
+    relay_addr: &str,
+    request: &ClientEnvelope,
+) -> anyhow::Result<ServerEnvelope> {
+    let relay_addr: SocketAddr = relay_addr
+        .parse()
+        .with_context(|| format!("invalid relay address {relay_addr}"))?;
+    let connection = endpoint
+        .connect(relay_addr, "localhost")
+        .context("failed to start QUIC connection")?
+        .await
+        .context("failed to connect to relay")?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("failed to open control stream")?;
+    let request_bytes =
+        encode_client_envelope(request).context("failed to encode control request")?;
+    send.write_all(&request_bytes)
+        .await
+        .context("failed to write control request")?;
+    send.finish().context("failed to finish control request")?;
+
+    let response_bytes = tokio::time::timeout(
+        CONTROL_STREAM_TIMEOUT,
+        recv.read_to_end(CONTROL_STREAM_READ_LIMIT),
+    )
+    .await
+    .context("timed out waiting for control response")?
+    .context("failed to read control response")?;
+    decode_server_envelope(&response_bytes).context("failed to decode control response")
 }
 
 fn build_insecure_local_client_config() -> ClientConfig {

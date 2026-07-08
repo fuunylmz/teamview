@@ -1,5 +1,6 @@
 pub mod config;
 pub mod control;
+pub mod control_stream;
 pub mod metrics;
 pub mod pacing;
 pub mod room;

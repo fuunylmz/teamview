@@ -1,5 +1,7 @@
 use clap::Parser;
-use relay_server::{config::ServerConfig, transport::build_server_endpoint};
+use relay_server::{
+    config::ServerConfig, control_stream::serve_control_endpoint, transport::build_server_endpoint,
+};
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -21,6 +23,6 @@ async fn main() -> anyhow::Result<()> {
     info!(listen = %local_addr, "relay server QUIC endpoint ready");
     println!("relay-server listening on {local_addr}");
 
-    endpoint.wait_idle().await;
+    serve_control_endpoint(endpoint).await;
     Ok(())
 }

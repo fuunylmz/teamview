@@ -9,9 +9,16 @@ mod stats;
 mod transport;
 
 use clap::{Parser, ValueEnum};
+use teamview_protocol::{
+    PROTOCOL_VERSION,
+    control::{ClientControl, ClientEnvelope, Hello},
+};
 use tracing::info;
 
-use crate::{capture::windows, transport::quic::build_client_endpoint};
+use crate::{
+    capture::windows,
+    transport::quic::{build_client_endpoint, send_control_request},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -61,6 +68,19 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?}",
         args.mode, args.relay, local_addr, capture_supported, args.capture_source
+    );
+
+    let hello = ClientEnvelope::new(
+        1,
+        ClientControl::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_name: format!("desktop-client/{:?}", args.mode),
+        }),
+    );
+    let response = send_control_request(&endpoint, &args.relay, &hello).await?;
+    println!(
+        "control-response request_id={} message={:?}",
+        response.request_id, response.message
     );
 
     Ok(())
