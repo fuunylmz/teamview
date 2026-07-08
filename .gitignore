@@ -1,0 +1,22 @@
+/target/
+**/target/
+
+# Claude/local automation state
+.claude/
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Logs and temporary media output
+*.log
+/tmp/
+/captures/
+/recordings/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
