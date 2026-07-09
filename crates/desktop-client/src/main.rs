@@ -16,9 +16,10 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     codec::CodecId,
     control::{
-        ClientControl, CreateRoom, Hello, JoinRoom, MediaKind, PollPublisherFeedback,
-        PollStreamConfig, PublishStream, PublisherFeedback, RoomId, ServerControl, ServerEnvelope,
-        StreamConfig, StreamId, SubscribeStream, ViewerStatsReport,
+        ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind,
+        PollPublisherFeedback, PollStreamConfig, PublishStream, PublisherFeedback, RequestKeyframe,
+        RoomId, ServerControl, ServerEnvelope, StreamConfig, StreamId, SubscribeStream,
+        ViewerStatsReport,
     },
     frame::packetize_frame_for_datagram_target,
     packet::DEFAULT_DATAGRAM_PAYLOAD_TARGET,
@@ -367,6 +368,9 @@ async fn run_synthetic_viewer_media(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<()> {
+    let room_id = args
+        .room_id
+        .context("viewer mode requires --room-id for media receive")?;
     let target_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
@@ -377,6 +381,7 @@ async fn run_synthetic_viewer_media(
     let mut reassembled_frames = 0_u32;
     let mut decoded_frames = 0_u32;
     let mut received_packets = 0_u64;
+    let mut awaiting_recovery_keyframe = false;
 
     while reassembled_frames < target_frames {
         let packet = match tokio::time::timeout(
@@ -394,11 +399,17 @@ async fn run_synthetic_viewer_media(
                 return Err(error).context("timed out waiting for media packet");
             }
         };
+        let lost_packets_before = stats.lost_packets;
         stats.record_packet(&packet);
         received_packets += 1;
         let outcome = buffer.push_with_stats(packet)?;
+        let packet_loss_detected = stats.lost_packets > lost_packets_before;
         if outcome.dropped_frames > 0 {
             stats.record_dropped_frames(outcome.dropped_frames);
+        }
+        if (packet_loss_detected || outcome.dropped_frames > 0) && !awaiting_recovery_keyframe {
+            request_keyframe(control, room_id, args.stream_id, KeyframeReason::PacketLoss).await?;
+            awaiting_recovery_keyframe = true;
         }
         stats.jitter_buffer_ms = buffer.estimated_jitter_ms(frame_interval_ms.max(1));
         if let Some(frame) = outcome.frame {
@@ -412,19 +423,32 @@ async fn run_synthetic_viewer_media(
                 playback.render(decoded)?;
                 stats.record_decoded_frame();
                 decoded_frames += 1;
+                if frame.is_keyframe {
+                    awaiting_recovery_keyframe = false;
+                }
             } else {
                 stats.record_dropped_frame();
+                if !awaiting_recovery_keyframe {
+                    request_keyframe(
+                        control,
+                        room_id,
+                        args.stream_id,
+                        KeyframeReason::DecoderRecovery,
+                    )
+                    .await?;
+                    awaiting_recovery_keyframe = true;
+                }
             }
             reassembled_frames += 1;
             if args.stats_interval_frames > 0
                 && reassembled_frames.is_multiple_of(args.stats_interval_frames)
             {
-                send_viewer_stats(control, args.room_id.unwrap(), args.stream_id, stats).await?;
+                send_viewer_stats(control, room_id, args.stream_id, stats).await?;
             }
         }
     }
     if received_packets > 0 {
-        send_viewer_stats(control, args.room_id.unwrap(), args.stream_id, stats).await?;
+        send_viewer_stats(control, room_id, args.stream_id, stats).await?;
     }
 
     println!(
@@ -436,6 +460,27 @@ async fn run_synthetic_viewer_media(
         stats.dropped_frames
     );
     Ok(())
+}
+
+async fn request_keyframe(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+    reason: KeyframeReason,
+) -> anyhow::Result<()> {
+    let response = control
+        .send(ClientControl::RequestKeyframe(RequestKeyframe {
+            room_id,
+            stream_id,
+            reason,
+        }))
+        .await?;
+    print_control_response("request-keyframe", &response);
+    match response.message {
+        ServerControl::RequestKeyframe(_) => Ok(()),
+        ServerControl::Error(error) => bail!("request keyframe failed: {}", error.message),
+        other => bail!("unexpected request keyframe response: {other:?}"),
+    }
 }
 
 async fn send_viewer_stats(

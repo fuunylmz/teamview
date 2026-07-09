@@ -3,9 +3,10 @@ use std::collections::BTreeMap;
 use teamview_protocol::{
     PROTOCOL_VERSION,
     control::{
-        ClientControl, ClientEnvelope, ControlError, HelloAccepted, RoomCreated, RoomId,
-        RoomJoined, RoomLeft, ServerControl, ServerEnvelope, StreamConfig, StreamId,
-        StreamPublished, StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
+        ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason,
+        RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, ServerControl, ServerEnvelope,
+        StreamConfig, StreamId, StreamPublished, StreamSubscribed, StreamUnsubscribed, UserId,
+        ViewerStatsReport,
     },
 };
 
@@ -18,6 +19,7 @@ use crate::{
 pub struct ControlState {
     rooms: BTreeMap<RoomId, Room>,
     viewer_stats: BTreeMap<StreamId, BTreeMap<UserId, ViewerStatsReport>>,
+    pending_keyframe_requests: BTreeMap<StreamId, KeyframeReason>,
     next_room_id: RoomId,
     next_user_id: UserId,
 }
@@ -27,6 +29,7 @@ impl ControlState {
         Self {
             rooms: BTreeMap::new(),
             viewer_stats: BTreeMap::new(),
+            pending_keyframe_requests: BTreeMap::new(),
             next_room_id: 1,
             next_user_id: 1,
         }
@@ -143,7 +146,17 @@ impl ControlState {
                 match self.rooms.get_mut(&subscribe.room_id) {
                     Some(room) => match session.user_id {
                         Some(user_id) if room.participants.contains(&user_id) => {
+                            let already_subscribed = room
+                                .subscriptions
+                                .get(&subscribe.stream_id)
+                                .is_some_and(|subscribers| subscribers.contains(&user_id));
                             if room.subscribe(subscribe.stream_id, user_id) {
+                                if !already_subscribed {
+                                    self.register_keyframe_request(
+                                        subscribe.stream_id,
+                                        KeyframeReason::NewSubscriber,
+                                    );
+                                }
                                 ServerControl::StreamSubscribed(StreamSubscribed {
                                     room_id: subscribe.room_id,
                                     stream_id: subscribe.stream_id,
@@ -206,6 +219,7 @@ impl ControlState {
             ClientControl::PollStreamConfig(poll) => {
                 self.poll_stream_config(session, poll.room_id, poll.stream_id)
             }
+            ClientControl::RequestKeyframe(request) => self.request_keyframe(session, request),
             ClientControl::ViewerStats(report) => {
                 if let Some(user_id) = session.user_id {
                     self.viewer_stats
@@ -217,20 +231,9 @@ impl ControlState {
                     self.aggregate_publisher_feedback(report.room_id, report.stream_id),
                 )
             }
-            ClientControl::PollPublisherFeedback(poll) => match session.user_id {
-                Some(user_id) if self.publisher_for_stream(poll.stream_id) == Some(user_id) => {
-                    ServerControl::PublisherFeedback(
-                        self.aggregate_publisher_feedback(poll.room_id, poll.stream_id),
-                    )
-                }
-                Some(_) => ServerControl::Error(ControlError::new(
-                    "not_publisher",
-                    "only the stream publisher can poll publisher feedback",
-                )),
-                None => {
-                    ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"))
-                }
-            },
+            ClientControl::PollPublisherFeedback(poll) => {
+                self.poll_publisher_feedback(session, poll.room_id, poll.stream_id)
+            }
             ClientControl::SetTargetBitrate(_) | ClientControl::SetTargetFramerate(_) => {
                 ServerControl::Error(ControlError::new(
                     "not_implemented",
@@ -284,6 +287,7 @@ impl ControlState {
                 room.published_streams.remove(&stream_id);
                 room.subscriptions.remove(&stream_id);
                 self.viewer_stats.remove(&stream_id);
+                self.pending_keyframe_requests.remove(&stream_id);
             }
         }
         for stream_viewer_stats in self.viewer_stats.values_mut() {
@@ -300,7 +304,7 @@ impl ControlState {
     ) -> teamview_protocol::control::PublisherFeedback {
         let total_viewer_count = self.subscribers_for_stream(stream_id).len() as u32;
         let mut degraded_viewer_count = 0_u32;
-        let mut keyframe_requested = false;
+        let mut keyframe_requested = self.pending_keyframe_requests.contains_key(&stream_id);
 
         if let Some(stream_viewer_stats) = self.viewer_stats.get(&stream_id) {
             for report in stream_viewer_stats.values() {
@@ -327,6 +331,66 @@ impl ControlState {
             if stream_viewer_stats.is_empty() {
                 self.viewer_stats.remove(&stream_id);
             }
+        }
+    }
+
+    fn register_keyframe_request(&mut self, stream_id: StreamId, reason: KeyframeReason) {
+        self.pending_keyframe_requests.insert(stream_id, reason);
+    }
+
+    fn request_keyframe(&mut self, session: &Session, request: RequestKeyframe) -> ServerControl {
+        let Some(user_id) = session.user_id else {
+            return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
+        };
+        let Some(room) = self.rooms.get(&request.room_id) else {
+            return ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            ));
+        };
+        if !room.participants.contains(&user_id) {
+            return ServerControl::Error(ControlError::new(
+                "not_in_room",
+                "join room before requesting a keyframe",
+            ));
+        }
+        let Some(stream) = room.published_streams.get(&request.stream_id) else {
+            return ServerControl::Error(ControlError::new(
+                "stream_not_found",
+                "stream does not exist",
+            ));
+        };
+        let is_subscriber = room
+            .subscriptions
+            .get(&request.stream_id)
+            .is_some_and(|subscribers| subscribers.contains(&user_id));
+        if stream.publisher_id != user_id && !is_subscriber {
+            return ServerControl::Error(ControlError::new(
+                "not_subscribed",
+                "subscribe to the stream before requesting a keyframe",
+            ));
+        }
+        self.register_keyframe_request(request.stream_id, request.reason);
+        ServerControl::RequestKeyframe(request)
+    }
+
+    fn poll_publisher_feedback(
+        &mut self,
+        session: &Session,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) -> ServerControl {
+        match session.user_id {
+            Some(user_id) if self.publisher_for_stream(stream_id) == Some(user_id) => {
+                let feedback = self.aggregate_publisher_feedback(room_id, stream_id);
+                self.pending_keyframe_requests.remove(&stream_id);
+                ServerControl::PublisherFeedback(feedback)
+            }
+            Some(_) => ServerControl::Error(ControlError::new(
+                "not_publisher",
+                "only the stream publisher can poll publisher feedback",
+            )),
+            None => ServerControl::Error(ControlError::new("unauthenticated", "send Hello first")),
         }
     }
 
@@ -412,8 +476,9 @@ mod tests {
         PROTOCOL_VERSION,
         codec::CodecId,
         control::{
-            ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind, PollPublisherFeedback,
-            PollStreamConfig, PublishStream, StreamConfig, SubscribeStream, ViewerStatsReport,
+            ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind,
+            PollPublisherFeedback, PollStreamConfig, PublishStream, RequestKeyframe, StreamConfig,
+            SubscribeStream, ViewerStatsReport,
         },
     };
 
@@ -604,6 +669,139 @@ mod tests {
                 assert!(feedback.keyframe_requested);
             }
             other => panic!("unexpected poll feedback response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_subscriber_requests_keyframe_until_publisher_polls_feedback() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        let first = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                6,
+                ClientControl::PollPublisherFeedback(PollPublisherFeedback {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+        match first.message {
+            ServerControl::PublisherFeedback(feedback) => {
+                assert_eq!(feedback.total_viewer_count, 1);
+                assert!(feedback.keyframe_requested);
+            }
+            other => panic!("unexpected first feedback response: {other:?}"),
+        }
+
+        let second = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                7,
+                ClientControl::PollPublisherFeedback(PollPublisherFeedback {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+        match second.message {
+            ServerControl::PublisherFeedback(feedback) => {
+                assert_eq!(feedback.total_viewer_count, 1);
+                assert!(!feedback.keyframe_requested);
+            }
+            other => panic!("unexpected second feedback response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subscribed_viewer_can_request_decoder_recovery_keyframe() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+        state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                6,
+                ClientControl::PollPublisherFeedback(PollPublisherFeedback {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        let request = RequestKeyframe {
+            room_id,
+            stream_id: 9,
+            reason: KeyframeReason::DecoderRecovery,
+        };
+        let acknowledged = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(7, ClientControl::RequestKeyframe(request.clone())),
+        );
+        assert_eq!(
+            acknowledged.message,
+            ServerControl::RequestKeyframe(request)
+        );
+
+        let feedback = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                8,
+                ClientControl::PollPublisherFeedback(PollPublisherFeedback {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+        match feedback.message {
+            ServerControl::PublisherFeedback(feedback) => assert!(feedback.keyframe_requested),
+            other => panic!("unexpected feedback response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_subscriber_cannot_request_keyframe() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::RequestKeyframe(RequestKeyframe {
+                    room_id,
+                    stream_id: 9,
+                    reason: KeyframeReason::DecoderRecovery,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_subscribed"),
+            other => panic!("unexpected request-keyframe response: {other:?}"),
         }
     }
 

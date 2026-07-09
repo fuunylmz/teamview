@@ -36,6 +36,7 @@ pub enum ClientControl {
     LeaveRoom(LeaveRoom),
     SetStreamConfig(StreamConfig),
     PollStreamConfig(PollStreamConfig),
+    RequestKeyframe(RequestKeyframe),
     ViewerStats(ViewerStatsReport),
     PollPublisherFeedback(PollPublisherFeedback),
     SetTargetBitrate(SetTargetBitrate),
@@ -340,6 +341,22 @@ mod tests {
 
         let encoded = encode_client_envelope(&envelope).unwrap();
         assert_eq!(encoded.last(), Some(&b'\n'));
+        assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn keyframe_request_round_trips_from_client() {
+        let envelope = ClientEnvelope::new(
+            8,
+            ClientControl::RequestKeyframe(RequestKeyframe {
+                room_id: 1,
+                stream_id: 9,
+                reason: KeyframeReason::DecoderRecovery,
+            }),
+        );
+
+        let encoded = encode_client_envelope(&envelope).unwrap();
+
         assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
     }
 
