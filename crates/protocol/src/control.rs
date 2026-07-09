@@ -34,6 +34,8 @@ pub enum ClientControl {
     SubscribeStream(SubscribeStream),
     UnsubscribeStream(UnsubscribeStream),
     LeaveRoom(LeaveRoom),
+    SetStreamConfig(StreamConfig),
+    PollStreamConfig(PollStreamConfig),
     ViewerStats(ViewerStatsReport),
     PollPublisherFeedback(PollPublisherFeedback),
     SetTargetBitrate(SetTargetBitrate),
@@ -168,6 +170,12 @@ pub struct StreamConfig {
     pub height: u32,
     pub frames_per_second: u16,
     pub timebase_hz: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollStreamConfig {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

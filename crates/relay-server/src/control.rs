@@ -4,8 +4,8 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     control::{
         ClientControl, ClientEnvelope, ControlError, HelloAccepted, RoomCreated, RoomId,
-        RoomJoined, RoomLeft, ServerControl, ServerEnvelope, StreamId, StreamPublished,
-        StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
+        RoomJoined, RoomLeft, ServerControl, ServerEnvelope, StreamConfig, StreamId,
+        StreamPublished, StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
     },
 };
 
@@ -116,6 +116,7 @@ impl ControlState {
                                     publisher_id: user_id,
                                     codec: publish.codec,
                                     media_kind: publish.media_kind,
+                                    config: None,
                                 });
                                 ServerControl::StreamPublished(StreamPublished {
                                     room_id: publish.room_id,
@@ -200,6 +201,10 @@ impl ControlState {
                 ServerControl::RoomLeft(RoomLeft {
                     room_id: leave.room_id,
                 })
+            }
+            ClientControl::SetStreamConfig(config) => self.set_stream_config(session, config),
+            ClientControl::PollStreamConfig(poll) => {
+                self.poll_stream_config(session, poll.room_id, poll.stream_id)
             }
             ClientControl::ViewerStats(report) => {
                 if let Some(user_id) = session.user_id {
@@ -324,6 +329,74 @@ impl ControlState {
             }
         }
     }
+
+    fn set_stream_config(&mut self, session: &Session, config: StreamConfig) -> ServerControl {
+        let Some(user_id) = session.user_id else {
+            return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
+        };
+        let Some(room) = self.rooms.get_mut(&config.room_id) else {
+            return ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            ));
+        };
+        let Some(stream) = room.published_streams.get_mut(&config.stream_id) else {
+            return ServerControl::Error(ControlError::new(
+                "stream_not_found",
+                "stream does not exist",
+            ));
+        };
+        if stream.publisher_id != user_id {
+            return ServerControl::Error(ControlError::new(
+                "not_publisher",
+                "only the stream publisher can set stream config",
+            ));
+        }
+        if stream.codec != config.codec {
+            return ServerControl::Error(ControlError::new(
+                "codec_mismatch",
+                "stream config codec must match published stream codec",
+            ));
+        }
+        stream.config = Some(config.clone());
+        ServerControl::StreamConfig(config)
+    }
+
+    fn poll_stream_config(
+        &self,
+        session: &Session,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) -> ServerControl {
+        let Some(user_id) = session.user_id else {
+            return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
+        };
+        let Some(room) = self.rooms.get(&room_id) else {
+            return ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            ));
+        };
+        if !room.participants.contains(&user_id) {
+            return ServerControl::Error(ControlError::new(
+                "not_in_room",
+                "join room before polling stream config",
+            ));
+        }
+        let Some(stream) = room.published_streams.get(&stream_id) else {
+            return ServerControl::Error(ControlError::new(
+                "stream_not_found",
+                "stream does not exist",
+            ));
+        };
+        match &stream.config {
+            Some(config) => ServerControl::StreamConfig(config.clone()),
+            None => ServerControl::Error(ControlError::new(
+                "stream_config_unavailable",
+                "publisher has not sent stream config yet",
+            )),
+        }
+    }
 }
 
 fn viewer_is_degraded(report: &ViewerStatsReport) -> bool {
@@ -340,7 +413,7 @@ mod tests {
         codec::CodecId,
         control::{
             ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind, PollPublisherFeedback,
-            PublishStream, SubscribeStream, ViewerStatsReport,
+            PollStreamConfig, PublishStream, StreamConfig, SubscribeStream, ViewerStatsReport,
         },
     };
 
@@ -564,6 +637,95 @@ mod tests {
     }
 
     #[test]
+    fn publisher_sets_and_viewer_polls_stream_config() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        let config = sample_stream_config(room_id, 9);
+        let set = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(6, ClientControl::SetStreamConfig(config.clone())),
+        );
+        assert_eq!(set.message, ServerControl::StreamConfig(config.clone()));
+
+        let polled = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                7,
+                ClientControl::PollStreamConfig(PollStreamConfig {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+        assert_eq!(polled.message, ServerControl::StreamConfig(config));
+    }
+
+    #[test]
+    fn stream_config_poll_reports_unavailable_until_publisher_sets_it() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::PollStreamConfig(PollStreamConfig {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "stream_config_unavailable"),
+            other => panic!("unexpected config response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_publisher_cannot_set_stream_config() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::SetStreamConfig(sample_stream_config(room_id, 9)),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_publisher"),
+            other => panic!("unexpected set config response: {other:?}"),
+        }
+    }
+
+    #[test]
     fn create_join_publish_subscribe_flow_updates_state() {
         let mut state = ControlState::new();
         let mut publisher = Session::anonymous(1);
@@ -726,5 +888,17 @@ mod tests {
             response.message,
             ServerControl::StreamSubscribed(_)
         ));
+    }
+
+    fn sample_stream_config(room_id: RoomId, stream_id: StreamId) -> StreamConfig {
+        StreamConfig {
+            room_id,
+            stream_id,
+            codec: CodecId::H264,
+            width: 1280,
+            height: 720,
+            frames_per_second: 30,
+            timebase_hz: 90_000,
+        }
     }
 }

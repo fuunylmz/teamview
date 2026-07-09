@@ -17,8 +17,8 @@ use teamview_protocol::{
     codec::CodecId,
     control::{
         ClientControl, CreateRoom, Hello, JoinRoom, MediaKind, PollPublisherFeedback,
-        PublishStream, PublisherFeedback, RoomId, ServerControl, ServerEnvelope, StreamId,
-        SubscribeStream, ViewerStatsReport,
+        PollStreamConfig, PublishStream, PublisherFeedback, RoomId, ServerControl, ServerEnvelope,
+        StreamConfig, StreamId, SubscribeStream, ViewerStatsReport,
     },
     frame::packetize_frame_for_datagram_target,
     packet::DEFAULT_DATAGRAM_PAYLOAD_TARGET,
@@ -179,6 +179,17 @@ async fn run_broadcaster_control_flow(
     print_control_response("publish-stream", &published);
     ensure_not_error("publish stream", &published)?;
 
+    let stream_config = args.synthetic_stream_config(room_id);
+    let configured = control
+        .send(ClientControl::SetStreamConfig(stream_config.clone()))
+        .await?;
+    print_control_response("set-stream-config", &configured);
+    match configured.message {
+        ServerControl::StreamConfig(config) if config == stream_config => {}
+        ServerControl::Error(error) => bail!("set stream config failed: {}", error.message),
+        other => bail!("unexpected stream config response: {other:?}"),
+    }
+
     println!(
         "control-flow broadcaster room_id={} stream_id={}",
         room_id, args.stream_id
@@ -212,6 +223,17 @@ async fn run_viewer_control_flow(
     print_control_response("subscribe-stream", &subscribed);
     ensure_not_error("subscribe stream", &subscribed)?;
 
+    let stream_config = poll_stream_config(control, room_id, args.stream_id).await?;
+    println!(
+        "stream-config stream_id={} codec={:?} width={} height={} fps={} timebase_hz={}",
+        stream_config.stream_id,
+        stream_config.codec,
+        stream_config.width,
+        stream_config.height,
+        stream_config.frames_per_second,
+        stream_config.timebase_hz
+    );
+
     println!(
         "control-flow viewer room_id={} stream_id={}",
         room_id, args.stream_id
@@ -220,6 +242,25 @@ async fn run_viewer_control_flow(
         run_synthetic_viewer_media(control, args).await?;
     }
     Ok(())
+}
+
+async fn poll_stream_config(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+) -> anyhow::Result<StreamConfig> {
+    let response = control
+        .send(ClientControl::PollStreamConfig(PollStreamConfig {
+            room_id,
+            stream_id,
+        }))
+        .await?;
+    print_control_response("poll-stream-config", &response);
+    match response.message {
+        ServerControl::StreamConfig(config) => Ok(config),
+        ServerControl::Error(error) => bail!("poll stream config failed: {}", error.message),
+        other => bail!("unexpected stream config response: {other:?}"),
+    }
 }
 
 async fn run_synthetic_broadcaster_media(
@@ -438,5 +479,17 @@ impl Args {
             bail!("--media-fps must be greater than zero");
         }
         Ok(Duration::from_micros(1_000_000 / self.media_fps as u64))
+    }
+
+    fn synthetic_stream_config(&self, room_id: RoomId) -> StreamConfig {
+        StreamConfig {
+            room_id,
+            stream_id: self.stream_id,
+            codec: CodecId::H264,
+            width: H264Encoder::default().config.width,
+            height: H264Encoder::default().config.height,
+            frames_per_second: self.media_fps.max(1),
+            timebase_hz: 90_000,
+        }
     }
 }

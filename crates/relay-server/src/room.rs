@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use teamview_protocol::{
     codec::CodecId,
-    control::{MediaKind, RoomId, StreamId, UserId},
+    control::{MediaKind, RoomId, StreamConfig, StreamId, UserId},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +65,7 @@ pub struct PublishedStream {
     pub publisher_id: UserId,
     pub codec: CodecId,
     pub media_kind: MediaKind,
+    pub config: Option<StreamConfig>,
 }
 
 #[cfg(test)]
@@ -79,12 +80,14 @@ mod tests {
             publisher_id: 1,
             codec: CodecId::H264,
             media_kind: MediaKind::Screen,
+            config: None,
         });
         room.publish_stream(PublishedStream {
             stream_id: 7,
             publisher_id: 1,
             codec: CodecId::H264,
             media_kind: MediaKind::Screen,
+            config: None,
         });
 
         assert_eq!(room.published_streams.len(), 1);
@@ -100,6 +103,7 @@ mod tests {
             publisher_id: 1,
             codec: CodecId::H264,
             media_kind: MediaKind::Screen,
+            config: None,
         });
         assert!(room.subscribe(9, 2));
     }
