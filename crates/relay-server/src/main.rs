@@ -1,6 +1,12 @@
 use clap::Parser;
 use relay_server::{
-    config::ServerConfig, control_stream::serve_control_endpoint, transport::build_server_endpoint,
+    config::ServerConfig,
+    control::{
+        ControlLimits, DEFAULT_MAX_PARTICIPANTS_PER_ROOM, DEFAULT_MAX_ROOMS,
+        DEFAULT_MAX_STREAMS_PER_ROOM,
+    },
+    control_stream::serve_control_endpoint,
+    transport::build_server_endpoint,
 };
 use tracing::info;
 
@@ -18,6 +24,15 @@ struct Args {
 
     #[arg(long, default_value_t = teamview_protocol::packet::DEFAULT_DATAGRAM_PAYLOAD_TARGET)]
     max_datagram_payload: usize,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_ROOMS)]
+    max_rooms: usize,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_PARTICIPANTS_PER_ROOM)]
+    max_participants_per_room: usize,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_STREAMS_PER_ROOM)]
+    max_streams_per_room: usize,
 }
 
 #[tokio::main]
@@ -27,7 +42,12 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let mut config = ServerConfig::new(args.listen)
         .with_access_token(args.access_token)
-        .with_max_datagram_payload(args.max_datagram_payload);
+        .with_max_datagram_payload(args.max_datagram_payload)
+        .with_control_limits(ControlLimits {
+            max_rooms: args.max_rooms,
+            max_participants_per_room: args.max_participants_per_room,
+            max_streams_per_room: args.max_streams_per_room,
+        });
     config.viewer_queue_budget_ms = args.viewer_queue_budget_ms.max(1);
     let endpoint = build_server_endpoint(&config.listen_addr)?;
     let local_addr = endpoint.local_addr()?;

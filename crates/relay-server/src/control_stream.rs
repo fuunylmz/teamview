@@ -48,8 +48,10 @@ impl ControlRuntime {
 
     pub fn from_config(config: ServerConfig) -> Self {
         let state = match config.access_token {
-            Some(access_token) => ControlState::with_access_token(access_token),
-            None => ControlState::new(),
+            Some(access_token) => {
+                ControlState::with_access_token_and_limits(access_token, config.control_limits)
+            }
+            None => ControlState::with_limits(config.control_limits),
         };
         Self {
             state: Arc::new(Mutex::new(state)),

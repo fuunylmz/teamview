@@ -32,6 +32,9 @@ const MIN_TARGET_HEIGHT: u32 = 180;
 const MAX_TARGET_WIDTH: u32 = 7680;
 const MAX_TARGET_HEIGHT: u32 = 4320;
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
+pub const DEFAULT_MAX_ROOMS: usize = 128;
+pub const DEFAULT_MAX_PARTICIPANTS_PER_ROOM: usize = 64;
+pub const DEFAULT_MAX_STREAMS_PER_ROOM: usize = 8;
 
 #[derive(Debug, Default)]
 pub struct ControlState {
@@ -42,8 +45,36 @@ pub struct ControlState {
     pending_keyframe_requests: BTreeMap<StreamId, KeyframeReason>,
     stream_metrics: BTreeMap<StreamId, StreamForwardingMetrics>,
     access_token: Option<String>,
+    limits: ControlLimits,
     next_room_id: RoomId,
     next_user_id: UserId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlLimits {
+    pub max_rooms: usize,
+    pub max_participants_per_room: usize,
+    pub max_streams_per_room: usize,
+}
+
+impl Default for ControlLimits {
+    fn default() -> Self {
+        Self {
+            max_rooms: DEFAULT_MAX_ROOMS,
+            max_participants_per_room: DEFAULT_MAX_PARTICIPANTS_PER_ROOM,
+            max_streams_per_room: DEFAULT_MAX_STREAMS_PER_ROOM,
+        }
+    }
+}
+
+impl ControlLimits {
+    pub fn sanitized(self) -> Self {
+        Self {
+            max_rooms: self.max_rooms.max(1),
+            max_participants_per_room: self.max_participants_per_room.max(1),
+            max_streams_per_room: self.max_streams_per_room.max(1),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +95,7 @@ impl ControlState {
             pending_keyframe_requests: BTreeMap::new(),
             stream_metrics: BTreeMap::new(),
             access_token: None,
+            limits: ControlLimits::default(),
             next_room_id: 1,
             next_user_id: 1,
         }
@@ -71,6 +103,21 @@ impl ControlState {
 
     pub fn with_access_token(access_token: impl Into<String>) -> Self {
         let mut state = Self::new();
+        state.access_token = Some(access_token.into());
+        state
+    }
+
+    pub fn with_limits(limits: ControlLimits) -> Self {
+        let mut state = Self::new();
+        state.limits = limits.sanitized();
+        state
+    }
+
+    pub fn with_access_token_and_limits(
+        access_token: impl Into<String>,
+        limits: ControlLimits,
+    ) -> Self {
+        let mut state = Self::with_limits(limits);
         state.access_token = Some(access_token.into());
         state
     }
@@ -162,6 +209,15 @@ impl ControlState {
             },
             ClientControl::CreateRoom(create) => match session.user_id {
                 Some(user_id) => {
+                    if self.rooms.len() >= self.limits.max_rooms {
+                        return ServerEnvelope::new(
+                            request_id,
+                            ServerControl::Error(ControlError::new(
+                                "room_limit_reached",
+                                "server room limit has been reached",
+                            )),
+                        );
+                    }
                     let room_id = self.next_room_id;
                     self.next_room_id += 1;
                     let mut room = Room::new(room_id, &create.name);
@@ -181,6 +237,17 @@ impl ControlState {
             ClientControl::JoinRoom(join) => match self.rooms.get_mut(&join.room_id) {
                 Some(room) => match session.user_id {
                     Some(user_id) => {
+                        if !room.participants.contains(&user_id)
+                            && room.participants.len() >= self.limits.max_participants_per_room
+                        {
+                            return ServerEnvelope::new(
+                                request_id,
+                                ServerControl::Error(ControlError::new(
+                                    "room_full",
+                                    "room participant limit has been reached",
+                                )),
+                            );
+                        }
                         let participant_count = room.join(user_id);
                         self.ensure_voice_state(join.room_id, user_id);
                         ServerControl::RoomJoined(RoomJoined {
@@ -208,6 +275,16 @@ impl ControlState {
                     match self.rooms.get_mut(&publish.room_id) {
                         Some(room) => match session.user_id {
                             Some(user_id) if room.participants.contains(&user_id) => {
+                                if room.published_streams.len() >= self.limits.max_streams_per_room
+                                {
+                                    return ServerEnvelope::new(
+                                        request_id,
+                                        ServerControl::Error(ControlError::new(
+                                            "stream_limit_reached",
+                                            "room stream limit has been reached",
+                                        )),
+                                    );
+                                }
                                 room.publish_stream(PublishedStream {
                                     stream_id: publish.stream_id,
                                     publisher_id: user_id,
@@ -1387,6 +1464,94 @@ mod tests {
         match duplicate.message {
             ServerControl::Error(error) => assert_eq!(error.code, "stream_id_conflict"),
             other => panic!("unexpected duplicate stream response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_room_respects_server_room_limit() {
+        let mut state = ControlState::with_limits(ControlLimits {
+            max_rooms: 1,
+            max_participants_per_room: 64,
+            max_streams_per_room: 8,
+        });
+        let mut session = Session::anonymous(1);
+        authenticate(&mut state, &mut session, "creator");
+        create_room(&mut state, &mut session, "first");
+
+        let response = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                4,
+                ClientControl::CreateRoom(CreateRoom {
+                    name: "second".to_owned(),
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "room_limit_reached"),
+            other => panic!("unexpected create room response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_room_respects_participant_limit_but_allows_existing_participant() {
+        let mut state = ControlState::with_limits(ControlLimits {
+            max_rooms: 8,
+            max_participants_per_room: 1,
+            max_streams_per_room: 8,
+        });
+        let mut creator = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut creator, "creator");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut creator, "stage1");
+
+        let rejoined = state.handle_client_envelope(
+            &mut creator,
+            ClientEnvelope::new(4, ClientControl::JoinRoom(JoinRoom { room_id })),
+        );
+        assert!(matches!(rejoined.message, ServerControl::RoomJoined(_)));
+
+        let blocked = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(5, ClientControl::JoinRoom(JoinRoom { room_id })),
+        );
+        match blocked.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "room_full"),
+            other => panic!("unexpected join response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_stream_respects_room_stream_limit() {
+        let mut state = ControlState::with_limits(ControlLimits {
+            max_rooms: 8,
+            max_participants_per_room: 64,
+            max_streams_per_room: 1,
+        });
+        let mut publisher = Session::anonymous(1);
+        authenticate(&mut state, &mut publisher, "publisher");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                5,
+                ClientControl::PublishStream(PublishStream {
+                    room_id,
+                    stream_id: 10,
+                    codec: CodecId::Opus,
+                    media_kind: MediaKind::Voice,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "stream_limit_reached"),
+            other => panic!("unexpected publish response: {other:?}"),
         }
     }
 

@@ -170,6 +170,7 @@ For a visible preview, add `--render-output window` to the viewer command.
 
 If the relay is started with `--access-token`, pass the same `--access-token` to both desktop-client commands.
 If the relay is started with a custom `--max-datagram-payload`, use the same or lower `--max-datagram-payload` on the desktop broadcaster so packetized media stays below the relay ingress limit.
+Small relay capacity limits such as `--max-rooms 1 --max-participants-per-room 2 --max-streams-per-room 1` are useful for boundary smoke tests; excess clients should receive control-plane errors instead of creating unbounded server state.
 
 Expected behavior:
 

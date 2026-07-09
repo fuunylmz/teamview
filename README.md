@@ -40,6 +40,7 @@ cargo run -p load-test -- --publishers 1 --viewers 10 --packets 120 --include-sl
 
 The relay defaults each subscribed viewer stream egress queue to a 100 ms media budget. For weak-network tests, adjust it with `--viewer-queue-budget-ms`.
 The relay also drops ingress media datagrams larger than `--max-datagram-payload`, which defaults to the protocol datagram target. Keep this aligned with the desktop client's `--max-datagram-payload` when testing custom MTU budgets.
+Room capacity is bounded with `--max-rooms`, `--max-participants-per-room`, and `--max-streams-per-room`.
 
 To require a shared access token for control actions and media datagrams:
 
