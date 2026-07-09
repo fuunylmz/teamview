@@ -8,6 +8,7 @@ mod decode;
 mod encode;
 mod media_foundation;
 mod playback;
+mod remote_input;
 mod stats;
 mod transport;
 
@@ -55,6 +56,7 @@ use crate::{
         },
     },
     playback::{FramePlayback, VideoPlayback},
+    remote_input::{LoggingRemoteInputApplier, NativeRemoteInputApplier, RemoteInputApplier},
     stats::{ClientBroadcasterStats, ClientMediaStats},
     transport::quic::{build_client_endpoint, connect_control_client},
 };
@@ -125,6 +127,12 @@ enum RemoteInputScriptArg {
     PointerTap,
     KeyEnter,
     Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RemoteInputOutputArg {
+    Log,
+    Native,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -270,6 +278,9 @@ struct Args {
 
     #[arg(long)]
     remote_input_text: Option<String>,
+
+    #[arg(long, value_enum, default_value_t = RemoteInputOutputArg::Log)]
+    remote_input_output: RemoteInputOutputArg,
 }
 
 #[tokio::main]
@@ -306,11 +317,12 @@ async fn main() -> anyhow::Result<()> {
         ?args.voice_input,
         ?args.render_output,
         ?args.audio_output,
+        ?args.remote_input_output,
         cursor_visible = args.cursor_visible,
         "desktop client endpoint and capture foundation ready"
     );
     println!(
-        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} video_encoder={:?} video_decoder={:?} voice_input={:?} render_output={:?} audio_output={:?} muted={} deafened={} push_to_talk={} speaking={}",
+        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} video_encoder={:?} video_decoder={:?} voice_input={:?} render_output={:?} audio_output={:?} remote_input_output={:?} muted={} deafened={} push_to_talk={} speaking={}",
         args.mode,
         args.relay,
         local_addr,
@@ -322,6 +334,7 @@ async fn main() -> anyhow::Result<()> {
         args.voice_input,
         args.render_output,
         args.audio_output,
+        args.remote_input_output,
         args.muted,
         args.deafened,
         args.voice_push_to_talk_enabled(),
@@ -1297,6 +1310,8 @@ async fn run_synthetic_screen_broadcaster_media(
         windows::WindowsGraphicsCapture::new(args.capture_source()?, args.capture_config())?;
     let mut encoder = args.video_encoder(target_width, target_height)?;
     encoder.request_keyframe();
+    let mut remote_input = args.remote_input_applier()?;
+    println!("remote-input-output mode={}", remote_input.output_mode());
 
     let mut ticker = tokio::time::interval(frame_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1385,7 +1400,7 @@ async fn run_synthetic_screen_broadcaster_media(
                 )
                 .await?;
             }
-            poll_remote_input(control, room_id, args.stream_id).await?;
+            poll_remote_input(control, room_id, args.stream_id, remote_input.as_mut()).await?;
         }
     }
     let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
@@ -1414,7 +1429,7 @@ async fn run_synthetic_screen_broadcaster_media(
         )
         .await?;
     }
-    poll_remote_input(control, room_id, args.stream_id).await?;
+    poll_remote_input(control, room_id, args.stream_id, remote_input.as_mut()).await?;
     let stream_metrics = poll_stream_metrics(control, room_id, args.stream_id).await?;
     println!(
         "stream-metrics stream_id={} ingress_packets={} ingress_bytes={} egress_queued={} egress_dropped={} egress_queue_packets={} egress_queue_media_ms={} subscribers={} last_ingress_time_micros={} server_route_ms_p50={} server_route_ms_p95={}",
@@ -1445,6 +1460,11 @@ async fn run_synthetic_screen_broadcaster_media(
         timing.packetize_ms_p95,
         timing.send_ms_p50,
         timing.send_ms_p95
+    );
+    println!(
+        "remote-input-summary output={} applied={}",
+        remote_input.output_mode(),
+        remote_input.applied_events()
     );
     if args.media_end_linger_ms > 0 {
         tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
@@ -1921,6 +1941,7 @@ async fn poll_remote_input(
     control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
     stream_id: StreamId,
+    applier: &mut dyn RemoteInputApplier,
 ) -> anyhow::Result<()> {
     let response = control
         .send(ClientControl::PollRemoteInput(PollRemoteInput {
@@ -1939,6 +1960,7 @@ async fn poll_remote_input(
             );
             for event in &batch.events {
                 println!("{}", format_remote_input_event(event));
+                applier.apply(event)?;
             }
             Ok(())
         }
@@ -3023,6 +3045,15 @@ impl Args {
         }
     }
 
+    fn remote_input_applier(&self) -> anyhow::Result<Box<dyn RemoteInputApplier>> {
+        match self.remote_input_output {
+            RemoteInputOutputArg::Log => Ok(Box::new(LoggingRemoteInputApplier::default())),
+            RemoteInputOutputArg::Native => Ok(Box::new(
+                NativeRemoteInputApplier::new().context("failed to create native input applier")?,
+            )),
+        }
+    }
+
     fn remote_input_script_events(&self, script: RemoteInputScriptArg) -> Vec<RemoteInputKind> {
         match script {
             RemoteInputScriptArg::PointerTap => vec![
@@ -3460,6 +3491,7 @@ mod tests {
             tap.remote_input_script,
             Some(RemoteInputScriptArg::PointerTap)
         );
+        assert_eq!(tap.remote_input_output, RemoteInputOutputArg::Log);
         assert_eq!(
             tap.remote_input_script_events(RemoteInputScriptArg::PointerTap)
                 .len(),
@@ -3471,6 +3503,14 @@ mod tests {
                 text: "hi".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn remote_input_output_flag_selects_native_mode() {
+        let args =
+            Args::try_parse_from(["desktop-client", "--remote-input-output", "native"]).unwrap();
+
+        assert_eq!(args.remote_input_output, RemoteInputOutputArg::Native);
     }
 
     #[test]
