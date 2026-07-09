@@ -194,11 +194,11 @@ During media runs the desktop client refreshes relay clock offset with `TimeSync
 
 The viewer bounds incomplete-frame jitter by media time. `--jitter-buffer-max-ms` defaults to 150 ms; when incomplete frames exceed that budget, the viewer drops the oldest incomplete frames instead of accumulating latency.
 
-For a local synthetic voice session, use `--media-kind voice` and a 50 fps packet cadence:
+For a local synthetic voice session, use `--media-kind voice`. Voice defaults to a 50 fps packet cadence, which gives 20 ms audio frames; use `--voice-fps` to tune it separately from screen frame rate.
 
 ```bash
-cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --media-frame-bytes 96 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --media-start-delay-ms 2000 --voice-fps 50 --media-frame-bytes 96 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --voice-fps 50
 ```
 
 Add `--audio-output speaker` to the viewer to queue decoded PCM to the default Windows speaker through WinMM instead of only recording the latest-audio sink.
@@ -207,19 +207,19 @@ Use `--muted` on a voice broadcaster to publish the room/stream state without se
 
 Expected voice output includes `audio-send` with capture/encode/packetize/send timing, `audio-recv` with `latency_ms`, `calibrated_latency_ms`, sender encode/send, server queue, and reassembly timing, `audio-play` with decode/play timing, relay `stream-metrics`, and final broadcaster/viewer summaries similar to `media-summary role=broadcaster kind=voice frames=50 ... encode_ms_p95=0 ...` and `media-summary role=viewer kind=voice frames=50 decoded=50 played=50 ... calibrated_latency_ms=1 ... sender_send_ms_p95=0 ... server_queue_ms_p95=0 ... play_fps=50`.
 
-To publish channel screen sharing and channel voice from one broadcaster connection, use `--channel-name` with `--media-kind both`. The screen stream uses `--stream-id`; the voice stream defaults to the next id and can be set with `--voice-stream-id`. A viewer can also use `--media-kind both` to subscribe to both selected streams on one connection and demux packets by stream id.
+To publish channel screen sharing and channel voice from one broadcaster connection, use `--channel-name` with `--media-kind both`. The screen stream uses `--stream-id` and `--media-fps`; the voice stream defaults to the next id, can be set with `--voice-stream-id`, and uses independent `--voice-fps` cadence. A viewer can also use `--media-kind both` to subscribe to both selected streams on one connection and demux packets by stream id.
 
 ```bash
-cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 30 --media-frame-bytes 800 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-fps 30
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 30 --voice-fps 50 --media-frame-bytes 800 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-fps 30 --voice-fps 50
 ```
 
 To use a real Windows microphone as the voice input, list devices first and pass `--voice-input microphone`. `--microphone-id` is optional; without it the default WinMM capture device is used.
 
 ```bash
 cargo run -p desktop-client -- --list-audio-sources
-cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --voice-input microphone --microphone-id 0 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --voice-input microphone --microphone-id 0 --media-run-ms 1000 --media-start-delay-ms 2000 --voice-fps 50 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --voice-fps 50
 ```
 
 The microphone path captures 16-bit PCM with WinMM and carries those samples inside the temporary Opus-like test payload so the relay, packetization, reassembly, latency metrics, latest-audio sink, and optional speaker playback handoff can be exercised before real Opus encoding is added.

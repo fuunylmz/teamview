@@ -208,13 +208,13 @@ Expected behavior:
 
 ## Desktop synthetic voice checks
 
-The same desktop client path can publish a synthetic Opus-like voice stream with `--media-kind voice`. The relay validates it as `MediaKind::Voice`, forwards it as audio datagrams, and the viewer reassembles, decodes, and plays frames into a latest-audio playback sink.
+The same desktop client path can publish a synthetic Opus-like voice stream with `--media-kind voice`. Voice defaults to `--voice-fps 50`, giving 20 ms audio frames. The relay validates it as `MediaKind::Voice`, forwards it as audio datagrams, and the viewer reassembles, decodes, and plays frames into a latest-audio playback sink.
 
 Run in separate terminals after starting the relay:
 
 ```bash
-cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind voice --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --media-frame-bytes 96 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind voice --media-run-ms 1000 --media-start-delay-ms 2000 --voice-fps 50 --media-frame-bytes 96 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --voice-fps 50
 ```
 
 For audible local playback, add `--audio-output speaker` to the viewer command. The default `sink` mode keeps smoke tests quiet and records only the latest played-frame summary.
@@ -243,18 +243,18 @@ Expected behavior:
 
 ## Desktop dual-stream broadcaster/viewer checks
 
-The broadcaster can publish channel screen sharing and channel voice together from one QUIC connection with `--channel-name` and `--media-kind both`. The screen stream uses `--stream-id`; the voice stream uses `--voice-stream-id` or defaults to the next stream id. A viewer can subscribe to both selected streams from one process and demux forwarded media packets by stream id.
+The broadcaster can publish channel screen sharing and channel voice together from one QUIC connection with `--channel-name` and `--media-kind both`. The screen stream uses `--stream-id` and `--media-fps`; the voice stream uses `--voice-stream-id` or defaults to the next stream id, with cadence controlled independently by `--voice-fps`. A viewer can subscribe to both selected streams from one process and demux forwarded media packets by stream id.
 
 Run in separate terminals after starting the relay:
 
 ```bash
-cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 30 --media-frame-bytes 800 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-fps 30
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 30 --voice-fps 50 --media-frame-bytes 800 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-fps 30 --voice-fps 50
 ```
 
 Expected behavior:
 
-- The broadcaster publishes and configures two streams, one `Screen/H264` and one `Voice/Opus`.
+- The broadcaster publishes and configures two streams, one `Screen/H264` at the selected screen FPS and one `Voice/Opus` at the selected voice FPS.
 - The broadcaster prints both `media-send` and `audio-send` lines during the same run.
 - The viewer subscribes to both stream ids, prints both `media-render` and `audio-play` lines, sends per-stream viewer stats, and reports separate zero-loss screen and voice summaries on a healthy local run.
 
@@ -265,8 +265,8 @@ On Windows, the broadcaster can use a real microphone source instead of syntheti
 Run in separate terminals after starting the relay and choosing an id from `--list-audio-sources`:
 
 ```bash
-cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --voice-input microphone --microphone-id 0 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --voice-input microphone --microphone-id 0 --media-run-ms 1000 --media-start-delay-ms 2000 --voice-fps 50 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --voice-fps 50
 ```
 
 Add `--audio-output speaker` to the viewer to hear the decoded microphone PCM through the default Windows speaker.

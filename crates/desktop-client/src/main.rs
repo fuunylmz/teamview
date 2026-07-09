@@ -66,6 +66,8 @@ const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_TIME_SYNC_SAMPLES: u8 = 5;
 const DEFAULT_TIME_SYNC_SPACING_MS: u64 = 20;
 const DEFAULT_CHANNEL_NAME: &str = "stage1";
+const DEFAULT_SCREEN_FPS: u16 = 30;
+const DEFAULT_VOICE_FPS: u16 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -241,8 +243,11 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     media_run_ms: u64,
 
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = DEFAULT_SCREEN_FPS)]
     media_fps: u16,
+
+    #[arg(long, default_value_t = DEFAULT_VOICE_FPS)]
+    voice_fps: u16,
 
     #[arg(long, default_value_t = 512)]
     media_frame_bytes: usize,
@@ -1541,7 +1546,7 @@ async fn run_synthetic_voice_broadcaster_media(
     let mut encoder = SyntheticOpusEncoder::default();
     encoder.config.synthetic_payload_bytes = args.media_frame_bytes;
     encoder.config.bitrate_bps = args.synthetic_bitrate_bps();
-    encoder.set_frames_per_second(args.media_fps.max(1));
+    encoder.set_frames_per_second(args.active_media_fps().max(1));
     let mut microphone_capture = match args.voice_input {
         VoiceInputArg::Synthetic => None,
         VoiceInputArg::Microphone => {
@@ -1560,7 +1565,7 @@ async fn run_synthetic_voice_broadcaster_media(
 
     let mut ticker = tokio::time::interval(frame_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut active_fps = args.media_fps;
+    let mut active_fps = args.active_media_fps();
     let mut sent_frames = 0_u32;
     let mut sent_packets = 0_u64;
     let mut next_sequence_number = 1_u32;
@@ -1674,7 +1679,7 @@ async fn run_synthetic_voice_broadcaster_media(
         "media-summary role=broadcaster kind=voice frames={} packets={} fps={} run_ms={} capture_ms_p50={} capture_ms_p95={} encode_ms_p50={} encode_ms_p95={} packetize_ms_p50={} packetize_ms_p95={} send_ms_p50={} send_ms_p95={}",
         sent_frames,
         sent_packets,
-        args.media_fps,
+        args.active_media_fps(),
         args.media_run_ms,
         timing.capture_ms_p50,
         timing.capture_ms_p95,
@@ -1710,7 +1715,7 @@ async fn set_publisher_target_media(
         .send(ClientControl::SetTargetFramerate(SetTargetFramerate {
             room_id,
             stream_id: args.stream_id,
-            frames_per_second: args.media_fps.max(1),
+            frames_per_second: args.active_media_fps().max(1),
         }))
         .await?;
     print_control_response("set-target-framerate", &framerate);
@@ -2003,13 +2008,21 @@ async fn run_synthetic_dual_viewer_media(
     voice_stream_id: StreamId,
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
-    let target_frames = args.synthetic_media_frames()?;
-    let target_voice_frames = if args.deafened { 0 } else { target_frames };
-    let frame_interval = args.media_frame_interval()?;
-    let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
+    let target_screen_frames =
+        args.synthetic_media_frames_for_fps(args.media_fps, "--media-fps")?;
+    let target_voice_frames = if args.deafened {
+        0
+    } else {
+        args.synthetic_media_frames_for_fps(args.voice_frames_per_second(), "--voice-fps")?
+    };
+    let screen_frame_interval = args.media_frame_interval_for_fps(args.media_fps, "--media-fps")?;
+    let voice_frame_interval =
+        args.media_frame_interval_for_fps(args.voice_frames_per_second(), "--voice-fps")?;
+    let screen_frame_interval_ms = screen_frame_interval.as_millis().min(u16::MAX as u128) as u16;
+    let voice_frame_interval_ms = voice_frame_interval.as_millis().min(u16::MAX as u128) as u16;
     let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
 
-    let mut screen_buffer = args.frame_reassembly_buffer(frame_interval_ms);
+    let mut screen_buffer = args.frame_reassembly_buffer(screen_frame_interval_ms);
     let mut screen_decoder = args.video_decoder()?;
     let mut screen_playback = args.video_playback()?;
     let mut screen_stats = ClientMediaStats::default();
@@ -2018,7 +2031,7 @@ async fn run_synthetic_dual_viewer_media(
     let mut screen_received_packets = 0_u64;
     let mut awaiting_recovery_keyframe = false;
 
-    let mut voice_buffer = args.frame_reassembly_buffer(frame_interval_ms);
+    let mut voice_buffer = args.frame_reassembly_buffer(voice_frame_interval_ms);
     let mut voice_decoder = SyntheticOpusDecoder;
     let mut voice_playback = (!args.deafened)
         .then(|| args.audio_playback())
@@ -2034,7 +2047,7 @@ async fn run_synthetic_dual_viewer_media(
         );
     }
 
-    while screen_reassembled_frames < target_frames
+    while screen_reassembled_frames < target_screen_frames
         || voice_reassembled_frames < target_voice_frames
     {
         let packet = match recv_media_packet_with_keepalive(
@@ -2057,7 +2070,8 @@ async fn run_synthetic_dual_viewer_media(
         let sync_estimate = clock_sync.refresh_if_due(control, "dual-viewer").await?;
         let packet_stream_id = packet.header.room_stream_id;
 
-        if packet_stream_id == screen_stream_id && screen_reassembled_frames < target_frames {
+        if packet_stream_id == screen_stream_id && screen_reassembled_frames < target_screen_frames
+        {
             let lost_packets_before = screen_stats.lost_packets;
             screen_stats.record_packet(&packet);
             screen_received_packets += 1;
@@ -2077,7 +2091,7 @@ async fn run_synthetic_dual_viewer_media(
                 awaiting_recovery_keyframe = true;
             }
             screen_stats.jitter_buffer_ms =
-                screen_buffer.estimated_jitter_ms(frame_interval_ms.max(1));
+                screen_buffer.estimated_jitter_ms(screen_frame_interval_ms.max(1));
             if let Some(frame) = outcome.frame {
                 screen_stats.record_reassembly_millis(outcome.reassembly_ms);
                 screen_stats.record_estimated_latency(
@@ -2170,7 +2184,7 @@ async fn run_synthetic_dual_viewer_media(
                 voice_stats.record_dropped_frames(outcome.dropped_frames);
             }
             voice_stats.jitter_buffer_ms =
-                voice_buffer.estimated_jitter_ms(frame_interval_ms.max(1));
+                voice_buffer.estimated_jitter_ms(voice_frame_interval_ms.max(1));
             if let Some(frame) = outcome.frame {
                 voice_stats.record_reassembly_millis(outcome.reassembly_ms);
                 voice_stats.record_estimated_latency(
@@ -2859,25 +2873,54 @@ impl Args {
     }
 
     fn synthetic_media_frames(&self) -> anyhow::Result<u32> {
+        self.synthetic_media_frames_for_fps(self.active_media_fps(), "--media-fps/--voice-fps")
+    }
+
+    fn synthetic_media_frames_for_fps(
+        &self,
+        frames_per_second: u16,
+        fps_flag: &str,
+    ) -> anyhow::Result<u32> {
         if self.media_frames > 0 {
             return Ok(self.media_frames);
         }
-        if self.media_fps == 0 {
-            bail!("--media-fps must be greater than zero");
+        if frames_per_second == 0 {
+            bail!("{fps_flag} must be greater than zero");
         }
         let frames = self
             .media_run_ms
-            .saturating_mul(self.media_fps as u64)
+            .saturating_mul(frames_per_second as u64)
             .div_ceil(1_000)
             .max(1);
         Ok(frames.min(u32::MAX as u64) as u32)
     }
 
     fn media_frame_interval(&self) -> anyhow::Result<Duration> {
-        if self.media_fps == 0 {
-            bail!("--media-fps must be greater than zero");
+        self.media_frame_interval_for_fps(self.active_media_fps(), "--media-fps/--voice-fps")
+    }
+
+    fn media_frame_interval_for_fps(
+        &self,
+        frames_per_second: u16,
+        fps_flag: &str,
+    ) -> anyhow::Result<Duration> {
+        if frames_per_second == 0 {
+            bail!("{fps_flag} must be greater than zero");
         }
-        Ok(Duration::from_micros(media_interval_micros(self.media_fps)))
+        Ok(Duration::from_micros(media_interval_micros(
+            frames_per_second,
+        )))
+    }
+
+    fn active_media_fps(&self) -> u16 {
+        match self.media_kind {
+            MediaKindArg::Voice => self.voice_fps,
+            MediaKindArg::Screen | MediaKindArg::Both => self.media_fps,
+        }
+    }
+
+    fn voice_frames_per_second(&self) -> u16 {
+        self.voice_fps
     }
 
     fn clock_sync_refresh_interval(&self) -> Option<Duration> {
@@ -2895,7 +2938,7 @@ impl Args {
 
     fn synthetic_bitrate_bps(&self) -> u32 {
         let bitrate = (self.media_frame_bytes as u128)
-            .saturating_mul(self.media_fps.max(1) as u128)
+            .saturating_mul(self.active_media_fps().max(1) as u128)
             .saturating_mul(8);
         bitrate.min(u32::MAX as u128) as u32
     }
@@ -2969,7 +3012,7 @@ impl Args {
                 codec: CodecId::Opus,
                 width: 0,
                 height: 0,
-                frames_per_second: self.media_fps.max(1),
+                frames_per_second: self.voice_frames_per_second().max(1),
                 timebase_hz: 48_000,
             }),
             MediaKindArg::Both => bail!("--media-kind both does not map to a single stream config"),
@@ -3053,7 +3096,7 @@ impl Args {
         AudioCaptureConfig {
             sample_rate_hz: 48_000,
             channel_count: 1,
-            frame_duration_ms: audio_frame_duration_ms(self.media_fps),
+            frame_duration_ms: audio_frame_duration_ms(self.voice_frames_per_second()),
             queue_capacity: 1,
         }
     }
@@ -3261,8 +3304,6 @@ mod tests {
             "microphone",
             "--microphone-id",
             "1",
-            "--media-fps",
-            "50",
         ])
         .unwrap();
 
@@ -3272,6 +3313,75 @@ mod tests {
             MicrophoneSource::Device { id: "1".to_owned() }
         );
         assert_eq!(args.audio_capture_config().frame_duration_ms, 20);
+    }
+
+    #[test]
+    fn screen_media_defaults_to_thirty_fps() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "screen",
+            "--media-run-ms",
+            "1000",
+        ])
+        .unwrap();
+
+        assert_eq!(args.active_media_fps(), DEFAULT_SCREEN_FPS);
+        assert_eq!(args.synthetic_media_frames().unwrap(), 30);
+        assert_eq!(
+            args.media_frame_interval().unwrap(),
+            Duration::from_micros(33_333)
+        );
+        assert_eq!(
+            args.stream_config(1).unwrap().frames_per_second,
+            DEFAULT_SCREEN_FPS
+        );
+    }
+
+    #[test]
+    fn voice_media_defaults_to_twenty_millisecond_frames() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "voice",
+            "--media-run-ms",
+            "1000",
+        ])
+        .unwrap();
+
+        assert_eq!(args.active_media_fps(), DEFAULT_VOICE_FPS);
+        assert_eq!(args.synthetic_media_frames().unwrap(), 50);
+        assert_eq!(
+            args.media_frame_interval().unwrap(),
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            args.stream_config(1).unwrap().frames_per_second,
+            DEFAULT_VOICE_FPS
+        );
+        assert_eq!(args.audio_capture_config().frame_duration_ms, 20);
+    }
+
+    #[test]
+    fn voice_fps_overrides_audio_cadence() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "voice",
+            "--media-run-ms",
+            "1000",
+            "--voice-fps",
+            "40",
+        ])
+        .unwrap();
+
+        assert_eq!(args.active_media_fps(), 40);
+        assert_eq!(args.synthetic_media_frames().unwrap(), 40);
+        assert_eq!(
+            args.media_frame_interval().unwrap(),
+            Duration::from_millis(25)
+        );
+        assert_eq!(args.audio_capture_config().frame_duration_ms, 25);
     }
 
     #[test]
@@ -3375,6 +3485,11 @@ mod tests {
         assert_eq!(voice_args.media_kind, MediaKindArg::Voice);
         assert_eq!(voice_args.stream_id, 8);
         assert_eq!(voice_args.codec().unwrap(), CodecId::Opus);
+        assert_eq!(voice_args.active_media_fps(), DEFAULT_VOICE_FPS);
+        assert_eq!(
+            voice_args.stream_config(1).unwrap().frames_per_second,
+            DEFAULT_VOICE_FPS
+        );
     }
 
     #[test]
