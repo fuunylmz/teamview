@@ -6,6 +6,7 @@ mod audio_capture;
 mod capture;
 mod decode;
 mod encode;
+mod media_foundation;
 mod playback;
 mod stats;
 mod transport;
@@ -41,7 +42,10 @@ use crate::{
     capture::{
         CaptureConfig, CaptureSource, CaptureSourceInfo, CaptureSourceKind, ScreenCapture, windows,
     },
-    decode::{FrameReassemblyBuffer, VideoDecoder, h264::H264Decoder},
+    decode::{
+        FrameReassemblyBuffer, VideoDecoder,
+        h264::{H264VideoDecoder, H264VideoDecoderBackend, h264_decoder_backend_status},
+    },
     encode::{
         VideoEncoder,
         h264::{
@@ -87,6 +91,12 @@ enum ScreenInputArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum VideoEncoderArg {
+    Synthetic,
+    MediaFoundation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VideoDecoderArg {
     Synthetic,
     MediaFoundation,
 }
@@ -174,6 +184,9 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = VideoEncoderArg::Synthetic)]
     video_encoder: VideoEncoderArg,
+
+    #[arg(long, value_enum, default_value_t = VideoDecoderArg::Synthetic)]
+    video_decoder: VideoDecoderArg,
 
     #[arg(long, value_enum, default_value_t = VoiceInputArg::Synthetic)]
     voice_input: VoiceInputArg,
@@ -269,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
         ?args.capture_source,
         ?args.screen_input,
         ?args.video_encoder,
+        ?args.video_decoder,
         ?args.voice_input,
         ?args.render_output,
         ?args.audio_output,
@@ -276,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
         "desktop client endpoint and capture foundation ready"
     );
     println!(
-        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} video_encoder={:?} voice_input={:?} render_output={:?} audio_output={:?} muted={} deafened={} push_to_talk={} speaking={}",
+        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} video_encoder={:?} video_decoder={:?} voice_input={:?} render_output={:?} audio_output={:?} muted={} deafened={} push_to_talk={} speaking={}",
         args.mode,
         args.relay,
         local_addr,
@@ -284,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
         args.capture_source,
         args.screen_input,
         args.video_encoder,
+        args.video_decoder,
         args.voice_input,
         args.render_output,
         args.audio_output,
@@ -1721,7 +1736,7 @@ async fn run_synthetic_dual_viewer_media(
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
 
     let mut screen_buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
-    let mut screen_decoder = H264Decoder::default();
+    let mut screen_decoder = args.video_decoder()?;
     let mut screen_playback = args.video_playback()?;
     let mut screen_stats = ClientMediaStats::default();
     let mut screen_reassembled_frames = 0_u32;
@@ -2051,7 +2066,7 @@ async fn run_synthetic_screen_viewer_media(
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
     let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
-    let mut decoder = H264Decoder::default();
+    let mut decoder = args.video_decoder()?;
     let mut playback = args.video_playback()?;
     let mut stats = ClientMediaStats::default();
     let mut reassembled_frames = 0_u32;
@@ -2446,18 +2461,28 @@ fn print_audio_sources() -> anyhow::Result<()> {
 }
 
 fn print_codec_backends() {
-    print_h264_backend(H264VideoEncoderBackend::Synthetic, true);
-    print_h264_backend(H264VideoEncoderBackend::MediaFoundation, false);
+    print_h264_encoder_backend(H264VideoEncoderBackend::Synthetic, true);
+    print_h264_encoder_backend(H264VideoEncoderBackend::MediaFoundation, false);
+    print_h264_decoder_backend(H264VideoDecoderBackend::Synthetic, true);
+    print_h264_decoder_backend(H264VideoDecoderBackend::MediaFoundation, false);
     println!(
-        "codec-backend kind=audio codec=Opus backend=synthetic available=true hardware=false default=true detail={:?}",
+        "codec-backend kind=audio codec=Opus backend=synthetic role=encoder-decoder available=true hardware=false default=true detail={:?}",
         "synthetic Opus-like test encoder"
     );
 }
 
-fn print_h264_backend(backend: H264VideoEncoderBackend, is_default: bool) {
+fn print_h264_encoder_backend(backend: H264VideoEncoderBackend, is_default: bool) {
     let status = h264_encoder_backend_status(backend);
     println!(
-        "codec-backend kind=video codec=H264 backend={} available={} hardware={} default={} detail={:?}",
+        "codec-backend kind=video codec=H264 backend={} role=encoder available={} hardware={} default={} detail={:?}",
+        status.backend, status.available, status.hardware, is_default, status.detail
+    );
+}
+
+fn print_h264_decoder_backend(backend: H264VideoDecoderBackend, is_default: bool) {
+    let status = h264_decoder_backend_status(backend);
+    println!(
+        "codec-backend kind=video codec=H264 backend={} role=decoder available={} hardware={} default={} detail={:?}",
         status.backend, status.available, status.hardware, is_default, status.detail
     );
 }
@@ -2578,6 +2603,17 @@ impl Args {
                 synthetic_payload_bytes: self.media_frame_bytes,
             },
         )
+    }
+
+    fn video_decoder_backend(&self) -> H264VideoDecoderBackend {
+        match self.video_decoder {
+            VideoDecoderArg::Synthetic => H264VideoDecoderBackend::Synthetic,
+            VideoDecoderArg::MediaFoundation => H264VideoDecoderBackend::MediaFoundation,
+        }
+    }
+
+    fn video_decoder(&self) -> anyhow::Result<H264VideoDecoder> {
+        H264VideoDecoder::new(self.video_decoder_backend())
     }
 
     fn protocol_media_kind(&self) -> anyhow::Result<MediaKind> {
@@ -2874,6 +2910,18 @@ mod tests {
         assert_eq!(
             args.video_encoder_backend(),
             H264VideoEncoderBackend::MediaFoundation
+        );
+    }
+
+    #[test]
+    fn video_decoder_flag_selects_media_foundation_backend() {
+        let args = Args::try_parse_from(["desktop-client", "--video-decoder", "media-foundation"])
+            .unwrap();
+
+        assert_eq!(args.video_decoder, VideoDecoderArg::MediaFoundation);
+        assert_eq!(
+            args.video_decoder_backend(),
+            H264VideoDecoderBackend::MediaFoundation
         );
     }
 

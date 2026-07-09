@@ -1,5 +1,7 @@
 use bytes::Bytes;
 
+use std::fmt;
+
 use super::{DecodedFrame, DecodedPixelFormat, VideoDecoder};
 
 const SYNTHETIC_SPS_MAGIC: &[u8; 4] = b"TVS1";
@@ -14,6 +16,115 @@ const MAX_SYNTHETIC_DECODED_PIXELS: u64 = 3840 * 2160;
 #[derive(Debug, Default)]
 pub struct H264Decoder {
     config: Option<SyntheticStreamConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264VideoDecoderBackend {
+    Synthetic,
+    MediaFoundation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H264DecoderBackendStatus {
+    pub backend: H264VideoDecoderBackend,
+    pub available: bool,
+    pub hardware: bool,
+    pub detail: String,
+}
+
+#[derive(Debug)]
+pub enum H264VideoDecoder {
+    Synthetic(H264Decoder),
+    MediaFoundation(MediaFoundationH264Decoder),
+}
+
+impl H264VideoDecoder {
+    pub fn new(backend: H264VideoDecoderBackend) -> anyhow::Result<Self> {
+        match backend {
+            H264VideoDecoderBackend::Synthetic => Ok(Self::Synthetic(H264Decoder::default())),
+            H264VideoDecoderBackend::MediaFoundation => {
+                Ok(Self::MediaFoundation(MediaFoundationH264Decoder::new()?))
+            }
+        }
+    }
+}
+
+impl VideoDecoder for H264VideoDecoder {
+    fn decode(&mut self, encoded: &[u8]) -> anyhow::Result<Option<DecodedFrame>> {
+        match self {
+            Self::Synthetic(decoder) => decoder.decode(encoded),
+            Self::MediaFoundation(decoder) => decoder.decode(encoded),
+        }
+    }
+}
+
+pub fn h264_decoder_backend_status(backend: H264VideoDecoderBackend) -> H264DecoderBackendStatus {
+    match backend {
+        H264VideoDecoderBackend::Synthetic => H264DecoderBackendStatus {
+            backend,
+            available: true,
+            hardware: false,
+            detail: "synthetic Annex B test decoder".to_owned(),
+        },
+        H264VideoDecoderBackend::MediaFoundation => media_foundation_h264_decoder_status(),
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MediaFoundationH264Decoder;
+
+impl MediaFoundationH264Decoder {
+    pub fn new() -> anyhow::Result<Self> {
+        let status = media_foundation_h264_decoder_status();
+        if !status.available {
+            anyhow::bail!(
+                "Media Foundation H.264 decoder is unavailable: {}",
+                status.detail
+            );
+        }
+        Ok(Self)
+    }
+}
+
+impl VideoDecoder for MediaFoundationH264Decoder {
+    fn decode(&mut self, _encoded: &[u8]) -> anyhow::Result<Option<DecodedFrame>> {
+        anyhow::bail!(
+            "Media Foundation H.264 decoder was selected and detected, but frame output is not wired yet"
+        );
+    }
+}
+
+impl fmt::Display for H264VideoDecoderBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Synthetic => formatter.write_str("synthetic"),
+            Self::MediaFoundation => formatter.write_str("media-foundation"),
+        }
+    }
+}
+
+fn media_foundation_h264_decoder_status() -> H264DecoderBackendStatus {
+    match crate::media_foundation::probe_hardware_h264_decoder_count() {
+        Ok(count) if count > 0 => H264DecoderBackendStatus {
+            backend: H264VideoDecoderBackend::MediaFoundation,
+            available: true,
+            hardware: true,
+            detail: format!("{count} hardware H.264 decoder MFT(s) available"),
+        },
+        Ok(_) => H264DecoderBackendStatus {
+            backend: H264VideoDecoderBackend::MediaFoundation,
+            available: false,
+            hardware: true,
+            detail: "Media Foundation started, but no hardware H.264 decoder MFT was enumerated"
+                .to_owned(),
+        },
+        Err(error) => H264DecoderBackendStatus {
+            backend: H264VideoDecoderBackend::MediaFoundation,
+            available: false,
+            hardware: true,
+            detail: error.to_string(),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +394,27 @@ mod tests {
                 pixels: synthetic_bgra_pixels(1920, 1080, 1, true),
             })
         );
+    }
+
+    #[test]
+    fn video_decoder_wrapper_uses_synthetic_backend() {
+        let mut decoder = H264VideoDecoder::new(H264VideoDecoderBackend::Synthetic).unwrap();
+        let encoded = encode_frame(1, 64, 36).bytes;
+
+        let decoded = decoder.decode(&encoded).unwrap().unwrap();
+
+        assert_eq!(decoded.frame_id, 1);
+        assert_eq!(decoded.width, 64);
+        assert_eq!(decoded.height, 36);
+    }
+
+    #[test]
+    fn synthetic_decoder_backend_status_is_available() {
+        let status = h264_decoder_backend_status(H264VideoDecoderBackend::Synthetic);
+
+        assert!(status.available);
+        assert!(!status.hardware);
+        assert_eq!(status.backend, H264VideoDecoderBackend::Synthetic);
     }
 
     #[test]
