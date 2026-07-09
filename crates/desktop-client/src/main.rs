@@ -34,7 +34,7 @@ use crate::{
     capture::{CaptureConfig, CaptureSource, ScreenCapture, windows},
     decode::{FrameReassemblyBuffer, VideoDecoder, h264::H264Decoder},
     encode::{VideoEncoder, h264::H264Encoder},
-    playback::{LatestFramePlayback, VideoPlayback},
+    playback::{FramePlayback, VideoPlayback},
     stats::ClientMediaStats,
     transport::quic::{build_client_endpoint, connect_control_client},
 };
@@ -63,6 +63,12 @@ enum MediaKindArg {
 enum ScreenInputArg {
     Synthetic,
     Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RenderOutputArg {
+    Sink,
+    Window,
 }
 
 #[derive(Debug, Parser)]
@@ -97,6 +103,9 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = ScreenInputArg::Synthetic)]
     screen_input: ScreenInputArg,
+
+    #[arg(long, value_enum, default_value_t = RenderOutputArg::Sink)]
+    render_output: RenderOutputArg,
 
     #[arg(long, default_value_t = 0)]
     media_frames: u32,
@@ -148,17 +157,19 @@ async fn main() -> anyhow::Result<()> {
         capture_supported,
         ?args.capture_source,
         ?args.screen_input,
+        ?args.render_output,
         cursor_visible = args.cursor_visible,
         "desktop client endpoint and capture foundation ready"
     );
     println!(
-        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?}",
+        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} render_output={:?}",
         args.mode,
         args.relay,
         local_addr,
         capture_supported,
         args.capture_source,
-        args.screen_input
+        args.screen_input,
+        args.render_output
     );
 
     let mut control = connect_control_client(&endpoint, &args.relay).await?;
@@ -857,7 +868,7 @@ async fn run_synthetic_screen_viewer_media(
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
     let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
     let mut decoder = H264Decoder::default();
-    let mut playback = LatestFramePlayback::new();
+    let mut playback = args.video_playback()?;
     let mut stats = ClientMediaStats::default();
     let mut reassembled_frames = 0_u32;
     let mut decoded_frames = 0_u32;
@@ -903,7 +914,7 @@ async fn run_synthetic_screen_viewer_media(
             );
             if let Some(decoded) = decoder.decode(&frame.bytes)? {
                 playback.render(decoded)?;
-                if let Some(rendered) = playback.latest() {
+                if let Some(rendered) = playback.latest_frame() {
                     println!(
                         "media-render frame_id={} width={} height={} pixel_bytes={} render_time_micros={}",
                         rendered.frame_id,
@@ -1214,6 +1225,15 @@ impl Args {
             }
             ScreenInputArg::Live => windows::primary_monitor_size()
                 .context("failed to query primary monitor size for live screen stream"),
+        }
+    }
+
+    fn video_playback(&self) -> anyhow::Result<FramePlayback> {
+        match self.render_output {
+            RenderOutputArg::Sink => Ok(FramePlayback::latest()),
+            RenderOutputArg::Window => {
+                FramePlayback::window("TeamView Viewer").context("failed to create render window")
+            }
         }
     }
 }

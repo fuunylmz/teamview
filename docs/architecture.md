@@ -29,9 +29,10 @@ The capture layer provides:
 - `LatestFrameQueue`, a bounded queue that drops older frames and keeps the newest frame.
 - `WindowsGraphicsCapture` support detection, a test-frame path for non-interactive verification, and live primary-monitor CPU BGRA capture via GDI for the `--screen-input live` broadcaster path.
 - The temporary H.264-like screen encoder embeds a bounded BGRA preview for CPU-backed frames, allowing live screen pixels to travel through packetization, relay forwarding, reassembly, decode, and playback before hardware H.264 is integrated.
+- The viewer can render decoded BGRA frames into the latest-frame sink for tests or a native Win32 preview window with `--render-output window`.
 
 The queue defaults to capacity 1. This is intentional: if capture outruns encode/network, the app should drop stale frames and keep realtime behavior instead of accumulating latency.
 
 ## First milestones
 
-The first milestones use synthetic media datagrams, pre-encoded sample frames, live CPU screen frames with downsampled BGRA previews wrapped by the synthetic H.264-like encoder, and synthetic Opus-like voice frames. This proves the server routing model, per-viewer isolation, packetization, decoder-to-playback handoff, audio playback handoff, and low-latency queue policy before interactive Windows Graphics Capture GPU textures, microphone capture, hardware encoding, real Opus, and native window rendering are added.
+The first milestones use synthetic media datagrams, pre-encoded sample frames, live CPU screen frames with downsampled BGRA previews wrapped by the synthetic H.264-like encoder, and synthetic Opus-like voice frames. This proves the server routing model, per-viewer isolation, packetization, decoder-to-playback handoff, audio playback handoff, and low-latency queue policy before interactive Windows Graphics Capture GPU textures, microphone capture, hardware encoding, real Opus, and production window controls are added.
