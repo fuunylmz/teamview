@@ -114,6 +114,8 @@ const fallbackClientApp = {
 
 let clientApp = cloneState(fallbackClientApp);
 let localUserId = FALLBACK_LOCAL_USER_ID;
+let pendingVoiceUpdate = false;
+let pendingScreenShareUpdate = false;
 
 const elements = {
   channelList: document.querySelector("#channelList"),
@@ -134,6 +136,7 @@ const elements = {
   pttButton: document.querySelector("#pttButton"),
   voiceState: document.querySelector("#voiceState"),
   voiceDeviceState: document.querySelector("#voiceDeviceState"),
+  voiceStatusMetric: document.querySelector("#voiceStatusMetric"),
   voiceCodecMetric: document.querySelector("#voiceCodecMetric"),
   voiceLatencyMetric: document.querySelector("#voiceLatencyMetric"),
   voiceDropMetric: document.querySelector("#voiceDropMetric"),
@@ -307,7 +310,9 @@ function syncChannelState(channel) {
   localParticipant.muted = clientApp.localVoice.muted;
   localParticipant.deafened = clientApp.localVoice.deafened;
   localParticipant.pushToTalk = clientApp.localVoice.pushToTalk;
-  localParticipant.speaking = localSpeaking();
+  localParticipant.speaking =
+    localSpeaking() &&
+    (!canUseClientApi() || pendingVoiceUpdate || channel.voiceStream?.publisherId === localUserId);
   localParticipant.sharingScreen = clientApp.localScreenShare.sharing;
 
   if (clientApp.role === "broadcaster" && clientApp.localScreenShare.sharing) {
@@ -330,7 +335,7 @@ function syncChannelState(channel) {
     channel.screenStream = null;
   }
 
-  if (clientApp.role === "broadcaster") {
+  if (clientApp.role === "broadcaster" && localSpeaking() && !canUseClientApi()) {
     const previousVoice = channel.voiceStream?.publisherId === localUserId ? channel.voiceStream : {};
     channel.voiceStream = {
       streamId: previousVoice.streamId ?? 2,
@@ -343,7 +348,7 @@ function syncChannelState(channel) {
       latencyMs: previousVoice.latencyMs ?? 8,
       bitrateBps: previousVoice.bitrateBps ?? 38400,
     };
-  } else if (channel.voiceStream?.publisherId === localUserId) {
+  } else if (channel.voiceStream?.publisherId === localUserId && !localSpeaking()) {
     channel.voiceStream = null;
   }
 }
@@ -435,21 +440,37 @@ function renderControls(channel) {
   elements.muteButton.classList.toggle("danger", voice.muted);
   elements.deafenButton.classList.toggle("danger", voice.deafened);
   elements.pttButton.classList.toggle("active", voice.pushToTalk);
-  elements.shareButton.disabled = !canShare;
-  elements.pttButton.disabled = voice.muted || voice.deafened;
+  elements.shareButton.disabled = !canShare || pendingScreenShareUpdate;
+  elements.muteButton.disabled = pendingVoiceUpdate;
+  elements.deafenButton.disabled = pendingVoiceUpdate;
+  elements.pttButton.disabled = pendingVoiceUpdate || voice.muted || voice.deafened;
   elements.shareButton.setAttribute("aria-pressed", String(clientApp.localScreenShare.sharing));
   elements.muteButton.setAttribute("aria-pressed", String(voice.muted));
   elements.deafenButton.setAttribute("aria-pressed", String(voice.deafened));
   elements.pttButton.setAttribute("aria-pressed", String(voice.pushToTalk));
 
-  setButtonLabel(elements.shareButton, clientApp.localScreenShare.sharing ? "Stop share" : "Share screen");
-  setButtonLabel(elements.muteButton, voice.muted ? "Unmute" : "Mute");
-  setButtonLabel(elements.deafenButton, voice.deafened ? "Undeafen" : "Deafen");
+  setButtonLabel(
+    elements.shareButton,
+    pendingScreenShareUpdate
+      ? clientApp.localScreenShare.sharing
+        ? "Starting"
+        : "Stopping"
+      : clientApp.localScreenShare.sharing
+        ? "Stop share"
+        : "Share screen",
+  );
+  setButtonLabel(elements.muteButton, pendingVoiceUpdate ? "Updating" : voice.muted ? "Unmute" : "Mute");
+  setButtonLabel(
+    elements.deafenButton,
+    pendingVoiceUpdate ? "Updating" : voice.deafened ? "Undeafen" : "Deafen",
+  );
   setButtonLabel(elements.pttButton, voice.pttActive ? "PTT active" : voice.pushToTalk ? "PTT ready" : "PTT");
 
   const voiceStream = channel.voiceStream;
   elements.voiceState.textContent = voiceLabel(channel);
   elements.voiceDeviceState.textContent = `${voice.inputLabel} / ${voice.outputLabel}`;
+  elements.voiceStatusMetric.textContent = voicePublishLabel(channel);
+  elements.voiceStatusMetric.dataset.state = voicePublishState(channel);
   elements.voiceCodecMetric.textContent = voiceStream
     ? `${voiceStream.codec} / ${voiceStream.framesPerSecond} fps`
     : "Opus / 0 fps";
@@ -469,8 +490,12 @@ async function refreshStateFromServer() {
 
 async function updateVoiceState(nextVoice) {
   clientApp.localVoice = { ...clientApp.localVoice, ...nextVoice };
+  if (!canUseClientApi()) {
+    render();
+    return;
+  }
+  pendingVoiceUpdate = true;
   render();
-  if (!canUseClientApi()) return;
 
   try {
     const response = await fetch("api/voice-state", {
@@ -480,16 +505,21 @@ async function updateVoiceState(nextVoice) {
     });
     if (!response.ok) throw new Error(`voice update failed: ${response.status}`);
     applySnapshot(await response.json());
-    render();
   } catch {
+  } finally {
+    pendingVoiceUpdate = false;
     render();
   }
 }
 
 async function updateScreenShareState(nextScreenShare) {
   clientApp.localScreenShare = { ...clientApp.localScreenShare, ...nextScreenShare };
+  if (!canUseClientApi()) {
+    render();
+    return;
+  }
+  pendingScreenShareUpdate = true;
   render();
-  if (!canUseClientApi()) return;
 
   try {
     const response = await fetch("api/screen-share", {
@@ -499,8 +529,9 @@ async function updateScreenShareState(nextScreenShare) {
     });
     if (!response.ok) throw new Error(`screen share update failed: ${response.status}`);
     applySnapshot(await response.json());
-    render();
   } catch {
+  } finally {
+    pendingScreenShareUpdate = false;
     render();
   }
 }
@@ -513,9 +544,33 @@ function voiceLabel(channel) {
   const voice = clientApp.localVoice;
   if (voice.deafened) return "Deafened";
   if (voice.muted) return "Muted";
+  if (pendingVoiceUpdate && localSpeaking()) return "Starting voice";
+  if (clientApp.role === "broadcaster" && localSpeaking() && !localVoiceStreamPublished(channel)) {
+    return "Ready";
+  }
   if (voice.pushToTalk && voice.pttActive) return "PTT active";
   if (voice.pushToTalk) return "PTT ready";
   return activeSpeakerCount(channel) > 0 ? "Voice active" : "Idle";
+}
+
+function localVoiceStreamPublished(channel) {
+  return channel.voiceStream?.publisherId === localUserId;
+}
+
+function voicePublishLabel(channel) {
+  if (clientApp.role !== "broadcaster") return channel.voiceStream ? "Receiving" : "No stream";
+  if (localVoiceStreamPublished(channel)) return "Sending";
+  if (pendingVoiceUpdate && localSpeaking()) return "Starting";
+  if (pendingVoiceUpdate) return "Stopping";
+  if (localSpeaking()) return "Ready";
+  return "Stopped";
+}
+
+function voicePublishState(channel) {
+  if (localVoiceStreamPublished(channel)) return "live";
+  if (pendingVoiceUpdate) return "pending";
+  if (localSpeaking()) return "ready";
+  return "idle";
 }
 
 function renderParticipants(channel) {

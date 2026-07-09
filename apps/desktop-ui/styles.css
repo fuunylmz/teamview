@@ -309,6 +309,21 @@ h2 {
   margin-top: 10px;
 }
 
+.voice-stats span[data-state="live"] {
+  color: var(--teal);
+  border-color: rgba(44, 198, 164, 0.45);
+}
+
+.voice-stats span[data-state="pending"] {
+  color: var(--amber);
+  border-color: rgba(230, 169, 60, 0.45);
+}
+
+.voice-stats span[data-state="ready"] {
+  color: var(--blue);
+  border-color: rgba(77, 141, 255, 0.45);
+}
+
 .participants {
   min-height: 0;
   overflow: auto;

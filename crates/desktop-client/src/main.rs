@@ -766,6 +766,7 @@ async fn build_ui_state_json(
         args.ui_voice_control_state(),
         args.ui_screen_share_control_state(),
         false,
+        false,
     )
     .await
 }
@@ -776,6 +777,7 @@ async fn build_ui_state_json_with_controls(
     local_voice: VoiceControlState,
     local_screen_share: ScreenShareControlState,
     push_voice_state: bool,
+    keep_room_joined: bool,
 ) -> anyhow::Result<(String, ClientApp)> {
     let rooms = list_rooms(control).await?;
     let selected_channel_id = select_ui_state_channel_id(args, &rooms)?;
@@ -798,7 +800,7 @@ async fn build_ui_state_json_with_controls(
         streams = list_room_streams(control, room_id).await?;
         stream_configs = poll_configured_streams(control, room_id, &streams).await?;
         participants = list_room_participants(control, room_id).await?;
-        if !(push_voice_state && args.mode == Mode::Broadcaster && local_screen_share.sharing) {
+        if !keep_room_joined {
             leave_room(control, room_id).await?;
         }
     }
@@ -823,9 +825,15 @@ struct UiServerState {
     local_voice: Arc<Mutex<VoiceControlState>>,
     local_screen_share: Arc<Mutex<ScreenShareControlState>>,
     screen_media_task: Arc<Mutex<Option<UiScreenMediaTask>>>,
+    voice_media_task: Arc<Mutex<Option<UiVoiceMediaTask>>>,
 }
 
 struct UiScreenMediaTask {
+    stop: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+struct UiVoiceMediaTask {
     stop: Arc<AtomicBool>,
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
@@ -853,6 +861,7 @@ impl UiServerState {
             local_voice: Arc::new(Mutex::new(args.ui_voice_control_state())),
             local_screen_share: Arc::new(Mutex::new(local_screen_share)),
             screen_media_task: Arc::new(Mutex::new(None)),
+            voice_media_task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -923,6 +932,42 @@ impl UiServerState {
             .lock()
             .map(|mut current| current.take())
             .map_err(|_| anyhow::anyhow!("UI screen media task lock is poisoned"))
+    }
+
+    fn set_voice_media_task(&self, task: UiVoiceMediaTask) -> anyhow::Result<()> {
+        let mut current = self
+            .voice_media_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UI voice media task lock is poisoned"))?;
+        *current = Some(task);
+        Ok(())
+    }
+
+    fn take_voice_media_task(&self) -> anyhow::Result<Option<UiVoiceMediaTask>> {
+        self.voice_media_task
+            .lock()
+            .map(|mut current| current.take())
+            .map_err(|_| anyhow::anyhow!("UI voice media task lock is poisoned"))
+    }
+
+    fn screen_media_active(&self) -> anyhow::Result<bool> {
+        self.screen_media_task
+            .lock()
+            .map(|current| current.is_some())
+            .map_err(|_| anyhow::anyhow!("UI screen media task lock is poisoned"))
+    }
+
+    fn voice_media_active(&self) -> anyhow::Result<bool> {
+        self.voice_media_task
+            .lock()
+            .map(|current| current.is_some())
+            .map_err(|_| anyhow::anyhow!("UI voice media task lock is poisoned"))
+    }
+
+    fn keep_room_joined(&self) -> anyhow::Result<bool> {
+        Ok(self.local_screen_share()?.sharing
+            || self.screen_media_active()?
+            || self.voice_media_active()?)
     }
 }
 
@@ -1050,7 +1095,13 @@ fn handle_ui_http_connection(
                     );
                 }
             };
-            if let Err(error) = state.update_voice(patch) {
+            let voice = match state.update_voice(patch) {
+                Ok(voice) => voice,
+                Err(error) => return write_json_error(stream, "500 Internal Server Error", &error),
+            };
+            if let Err(error) = runtime.block_on(apply_ui_voice_media_state(
+                control, args, state, clock_sync, &voice,
+            )) {
                 return write_json_error(stream, "500 Internal Server Error", &error);
             }
             match runtime.block_on(build_ui_state_json_for_ui(control, args, state)) {
@@ -1186,7 +1237,7 @@ async fn start_ui_screen_share(
         return Ok(());
     }
 
-    let room_id = resolve_or_create_ui_screen_share_room_id(control, args).await?;
+    let room_id = resolve_or_create_ui_channel_id(control, args).await?;
     let joined = control
         .send(ClientControl::JoinRoom(JoinRoom { room_id }))
         .await?;
@@ -1230,7 +1281,9 @@ async fn stop_ui_screen_share(
     stop_ui_screen_media_task(state).await?;
     unpublish_stream_for_ui(control, room_id, screen.stream_id).await?;
     state.set_screen_sharing(false)?;
-    leave_room(control, room_id).await?;
+    if !state.keep_room_joined()? {
+        leave_room(control, room_id).await?;
+    }
     Ok(())
 }
 
@@ -1271,7 +1324,140 @@ async fn stop_ui_screen_media_task(state: &UiServerState) -> anyhow::Result<()> 
     }
 }
 
-async fn resolve_or_create_ui_screen_share_room_id(
+async fn apply_ui_voice_media_state(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    state: &UiServerState,
+    clock_sync: ClockSyncEstimate,
+    voice: &VoiceControlState,
+) -> anyhow::Result<()> {
+    if !ui_voice_media_supported(args) {
+        return Ok(());
+    }
+    if voice_speaking_from_state(voice) {
+        start_ui_voice_media(control, args, state, clock_sync, voice).await
+    } else {
+        stop_ui_voice_media(control, args, state).await
+    }
+}
+
+fn ui_voice_media_supported(args: &Args) -> bool {
+    args.mode == Mode::Broadcaster && args.media_kind != MediaKindArg::Screen
+}
+
+fn ui_voice_stream_id(args: &Args) -> anyhow::Result<StreamId> {
+    match args.media_kind {
+        MediaKindArg::Voice => Ok(args.stream_id),
+        MediaKindArg::Both => args.voice_stream_id(),
+        MediaKindArg::Screen => bail!("voice media is not available when --media-kind screen"),
+    }
+}
+
+async fn start_ui_voice_media(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    state: &UiServerState,
+    clock_sync: ClockSyncEstimate,
+    voice: &VoiceControlState,
+) -> anyhow::Result<()> {
+    if state.voice_media_active()? {
+        return Ok(());
+    }
+
+    let room_id = resolve_or_create_ui_channel_id(control, args).await?;
+    let joined = control
+        .send(ClientControl::JoinRoom(JoinRoom { room_id }))
+        .await?;
+    print_control_response("join-room", &joined);
+    ensure_not_error("join room", &joined)?;
+    set_voice_state(control, room_id, voice).await?;
+
+    let voice_stream_id = ui_voice_stream_id(args)?;
+    let voice_args = args.for_media_kind(MediaKindArg::Voice, voice_stream_id);
+    if let Err(error) = publish_configured_stream(control, &voice_args, room_id).await {
+        if !state.keep_room_joined()? {
+            let _ = leave_room(control, room_id).await;
+        }
+        return Err(error);
+    }
+    if let Err(error) = set_publisher_target_media(control, room_id, &voice_args).await {
+        let _ = unpublish_stream_for_ui(control, room_id, voice_stream_id).await;
+        if !state.keep_room_joined()? {
+            let _ = leave_room(control, room_id).await;
+        }
+        return Err(error);
+    }
+
+    start_ui_voice_media_task(control, args, state, room_id, voice_stream_id, clock_sync)
+}
+
+async fn stop_ui_voice_media(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    state: &UiServerState,
+) -> anyhow::Result<()> {
+    let had_task = state.voice_media_active()?;
+    if !had_task {
+        return Ok(());
+    }
+
+    let rooms = list_rooms(control).await?;
+    let Some(room_id) = select_ui_state_channel_id(args, &rooms)? else {
+        stop_ui_voice_media_task(state).await?;
+        return Ok(());
+    };
+    let voice_stream_id = ui_voice_stream_id(args)?;
+
+    stop_ui_voice_media_task(state).await?;
+    unpublish_stream_for_ui(control, room_id, voice_stream_id).await?;
+    if !state.keep_room_joined()? {
+        leave_room(control, room_id).await?;
+    }
+    Ok(())
+}
+
+fn start_ui_voice_media_task(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    state: &UiServerState,
+    room_id: RoomId,
+    voice_stream_id: StreamId,
+    clock_sync: ClockSyncEstimate,
+) -> anyhow::Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let media_stop = stop.clone();
+    let media_control = control.clone();
+    let media_args = args.for_media_kind(MediaKindArg::Voice, voice_stream_id);
+    let handle = tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build UI voice media runtime")?;
+        runtime.block_on(run_ui_voice_broadcaster_media(
+            &media_control,
+            &media_args,
+            room_id,
+            clock_sync,
+            media_stop,
+        ))
+    });
+    state.set_voice_media_task(UiVoiceMediaTask { stop, handle })
+}
+
+async fn stop_ui_voice_media_task(state: &UiServerState) -> anyhow::Result<()> {
+    let Some(task) = state.take_voice_media_task()? else {
+        return Ok(());
+    };
+    task.stop.store(true, Ordering::SeqCst);
+    match task.handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error).context("UI voice media task failed"),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("UI voice media task failed: {error}")),
+    }
+}
+
+async fn resolve_or_create_ui_channel_id(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<RoomId> {
@@ -1347,6 +1533,7 @@ async fn build_ui_state_json_for_ui(
         state.local_voice()?,
         state.local_screen_share()?,
         true,
+        state.keep_room_joined()?,
     )
     .await
 }
@@ -2468,7 +2655,62 @@ async fn run_synthetic_voice_broadcaster_media(
         sleep_with_keepalive(control, Duration::from_millis(args.media_start_delay_ms)).await?;
     }
     let media_frames = args.synthetic_media_frames()?;
+    run_voice_broadcaster_media_loop(
+        control,
+        args,
+        room_id,
+        clock_sync,
+        VoiceMediaRunOptions {
+            max_frames: Some(media_frames),
+            stop: None,
+            log_each_frame: true,
+            linger_on_end: true,
+            summary_run_ms: Some(args.media_run_ms),
+        },
+    )
+    .await
+}
+
+async fn run_ui_voice_broadcaster_media(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+    clock_sync: ClockSyncEstimate,
+    stop: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    run_voice_broadcaster_media_loop(
+        control,
+        args,
+        room_id,
+        clock_sync,
+        VoiceMediaRunOptions {
+            max_frames: None,
+            stop: Some(stop),
+            log_each_frame: false,
+            linger_on_end: false,
+            summary_run_ms: None,
+        },
+    )
+    .await
+}
+
+struct VoiceMediaRunOptions {
+    max_frames: Option<u32>,
+    stop: Option<Arc<AtomicBool>>,
+    log_each_frame: bool,
+    linger_on_end: bool,
+    summary_run_ms: Option<u64>,
+}
+
+async fn run_voice_broadcaster_media_loop(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+    clock_sync: ClockSyncEstimate,
+    options: VoiceMediaRunOptions,
+) -> anyhow::Result<()> {
     let frame_interval = args.media_frame_interval()?;
+    let run_started = Instant::now();
     let mut encoder = SyntheticOpusEncoder::default();
     encoder.config.synthetic_payload_bytes = args.active_media_frame_bytes();
     encoder.config.bitrate_bps = args.synthetic_bitrate_bps();
@@ -2498,8 +2740,28 @@ async fn run_synthetic_voice_broadcaster_media(
     let mut empty_capture_ticks = 0_u32;
     let mut timing = ClientBroadcasterStats::default();
     let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
-    while sent_frames < media_frames {
+    loop {
+        if options
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            break;
+        }
+        if options
+            .max_frames
+            .is_some_and(|max_frames| sent_frames >= max_frames)
+        {
+            break;
+        }
         ticker.tick().await;
+        if options
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            break;
+        }
         let frame_id = sent_frames.saturating_add(1);
         let capture_start = Instant::now();
         let captured_audio = if let Some(capture) = microphone_capture.as_mut() {
@@ -2564,18 +2826,20 @@ async fn run_synthetic_voice_broadcaster_media(
         let send_duration = send_start.elapsed();
         timing.record_send_duration(send_duration);
         sent_frames = sent_frames.saturating_add(1);
-        println!(
-            "audio-send frame_id={} fragments={} bytes={} target_bytes={} voice_input={:?} capture_ms={} encode_ms={} packetize_ms={} send_ms={}",
-            frame.frame_id,
-            packets.len(),
-            frame.bytes.len(),
-            encoder.config.synthetic_payload_bytes,
-            args.voice_input,
-            millis_for_log(capture_duration),
-            millis_for_log(encode_duration),
-            millis_for_log(packetize_duration),
-            millis_for_log(send_duration)
-        );
+        if options.log_each_frame {
+            println!(
+                "audio-send frame_id={} fragments={} bytes={} target_bytes={} voice_input={:?} capture_ms={} encode_ms={} packetize_ms={} send_ms={}",
+                frame.frame_id,
+                packets.len(),
+                frame.bytes.len(),
+                encoder.config.synthetic_payload_bytes,
+                args.voice_input,
+                millis_for_log(capture_duration),
+                millis_for_log(encode_duration),
+                millis_for_log(packetize_duration),
+                millis_for_log(send_duration)
+            );
+        }
         if args.feedback_interval_frames > 0
             && sent_frames.is_multiple_of(args.feedback_interval_frames)
         {
@@ -2601,12 +2865,15 @@ async fn run_synthetic_voice_broadcaster_media(
         stream_metrics.server_route_ms_p95
     );
     let timing = timing.timing_snapshot();
+    let summary_run_ms = options
+        .summary_run_ms
+        .unwrap_or_else(|| run_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
     println!(
         "media-summary role=broadcaster kind=voice frames={} packets={} fps={} run_ms={} capture_ms_p50={} capture_ms_p95={} encode_ms_p50={} encode_ms_p95={} packetize_ms_p50={} packetize_ms_p95={} send_ms_p50={} send_ms_p95={}",
         sent_frames,
         sent_packets,
         args.active_media_fps(),
-        args.media_run_ms,
+        summary_run_ms,
         timing.capture_ms_p50,
         timing.capture_ms_p95,
         timing.encode_ms_p50,
@@ -2616,7 +2883,7 @@ async fn run_synthetic_voice_broadcaster_media(
         timing.send_ms_p50,
         timing.send_ms_p95
     );
-    if args.media_end_linger_ms > 0 {
+    if options.linger_on_end && args.media_end_linger_ms > 0 {
         tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
     }
     Ok(())
