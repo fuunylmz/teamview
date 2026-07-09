@@ -115,6 +115,8 @@ cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media
 cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-id 1 --media-run-ms 1000 --media-fps 5 --max-datagram-payload 700
 ```
 
+If the relay is started with `--access-token`, pass the same `--access-token` to both desktop-client commands.
+
 Expected behavior:
 
 - The broadcaster prints five `media-send` lines at 5 fps for a 1000 ms run.

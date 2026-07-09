@@ -17,7 +17,7 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     codec::CodecId,
     control::{
-        ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind, Ping,
+        Authenticate, ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind, Ping,
         PollPublisherFeedback, PollStreamConfig, PollStreamMetrics, PublishStream,
         PublisherFeedback, RequestKeyframe, RoomId, ServerControl, ServerEnvelope,
         SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId, StreamMetricsSnapshot,
@@ -67,6 +67,9 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1:4433")]
     relay: String,
+
+    #[arg(long)]
+    access_token: Option<String>,
 
     #[arg(long, value_enum, default_value_t = CaptureSourceArg::PrimaryMonitor)]
     capture_source: CaptureSourceArg,
@@ -151,6 +154,10 @@ async fn main() -> anyhow::Result<()> {
         }))
         .await?;
     print_control_response("hello", &response);
+    ensure_not_error("hello", &response)?;
+    if let Some(access_token) = &args.access_token {
+        authenticate_control(&mut control, access_token).await?;
+    }
 
     match args.mode {
         Mode::Broadcaster => run_broadcaster_control_flow(&mut control, &args).await?,
@@ -158,6 +165,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn authenticate_control(
+    control: &mut crate::transport::quic::ControlClient,
+    access_token: &str,
+) -> anyhow::Result<()> {
+    let response = control
+        .send(ClientControl::Authenticate(Authenticate {
+            token: access_token.to_owned(),
+        }))
+        .await?;
+    print_control_response("authenticate", &response);
+    match response.message {
+        ServerControl::Authenticated(_) => Ok(()),
+        ServerControl::Error(error) => bail!("authenticate failed: {}", error.message),
+        other => bail!("unexpected authenticate response: {other:?}"),
+    }
 }
 
 async fn run_broadcaster_control_flow(

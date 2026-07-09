@@ -32,6 +32,7 @@ pub struct ControlState {
     viewer_stats: BTreeMap<StreamId, BTreeMap<UserId, ViewerStatsReport>>,
     pending_keyframe_requests: BTreeMap<StreamId, KeyframeReason>,
     stream_metrics: BTreeMap<StreamId, StreamForwardingMetrics>,
+    access_token: Option<String>,
     next_room_id: RoomId,
     next_user_id: UserId,
 }
@@ -49,9 +50,16 @@ impl ControlState {
             viewer_stats: BTreeMap::new(),
             pending_keyframe_requests: BTreeMap::new(),
             stream_metrics: BTreeMap::new(),
+            access_token: None,
             next_room_id: 1,
             next_user_id: 1,
         }
+    }
+
+    pub fn with_access_token(access_token: impl Into<String>) -> Self {
+        let mut state = Self::new();
+        state.access_token = Some(access_token.into());
+        state
     }
 
     pub fn handle_client_envelope(
@@ -60,6 +68,9 @@ impl ControlState {
         envelope: ClientEnvelope,
     ) -> ServerEnvelope {
         let request_id = envelope.request_id;
+        if let Some(error) = self.authorization_error(session, &envelope.message) {
+            return ServerEnvelope::new(request_id, error);
+        }
         let message = match envelope.message {
             ClientControl::Hello(hello) => {
                 if hello.protocol_version != PROTOCOL_VERSION {
@@ -74,7 +85,7 @@ impl ControlState {
                     if session.user_id.is_none() {
                         let user_id = self.next_user_id;
                         self.next_user_id += 1;
-                        session.authenticate(user_id);
+                        session.establish_identity(user_id, !self.requires_access_token());
                     }
                     ServerControl::HelloAccepted(HelloAccepted {
                         protocol_version: PROTOCOL_VERSION,
@@ -88,8 +99,20 @@ impl ControlState {
                     ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"))
                 }
             },
-            ClientControl::Authenticate(_) => match session.user_id {
+            ClientControl::Authenticate(authenticate) => match session.user_id {
                 Some(user_id) => {
+                    if let Some(expected_token) = &self.access_token
+                        && authenticate.token != *expected_token
+                    {
+                        return ServerEnvelope::new(
+                            request_id,
+                            ServerControl::Error(ControlError::new(
+                                "invalid_token",
+                                "access token is invalid",
+                            )),
+                        );
+                    }
+                    session.grant_access();
                     ServerControl::Authenticated(teamview_protocol::control::Authenticated {
                         user_id,
                         display_name: format!("user-{user_id}"),
@@ -273,6 +296,36 @@ impl ControlState {
         };
 
         ServerEnvelope::new(request_id, message)
+    }
+
+    pub fn requires_access_token(&self) -> bool {
+        self.access_token.is_some()
+    }
+
+    fn authorization_error(
+        &self,
+        session: &Session,
+        message: &ClientControl,
+    ) -> Option<ServerControl> {
+        if matches!(
+            message,
+            ClientControl::Hello(_) | ClientControl::Ping(_) | ClientControl::Authenticate(_)
+        ) {
+            return None;
+        }
+        if session.user_id.is_none() {
+            return Some(ServerControl::Error(ControlError::new(
+                "unauthenticated",
+                "send Hello first",
+            )));
+        }
+        if self.requires_access_token() && !session.access_granted {
+            return Some(ServerControl::Error(ControlError::new(
+                "not_authenticated",
+                "authenticate before using relay controls",
+            )));
+        }
+        None
     }
 
     pub fn room(&self, room_id: RoomId) -> Option<&Room> {
@@ -707,8 +760,8 @@ mod tests {
         PROTOCOL_VERSION,
         codec::CodecId,
         control::{
-            ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind, Ping,
-            PollPublisherFeedback, PollStreamConfig, PollStreamMetrics, PublishStream,
+            Authenticate, ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind,
+            Ping, PollPublisherFeedback, PollStreamConfig, PollStreamMetrics, PublishStream,
             RequestKeyframe, SetTargetBitrate, SetTargetFramerate, StreamConfig, SubscribeStream,
             ViewerStatsReport,
         },
@@ -767,6 +820,58 @@ mod tests {
         );
 
         assert_eq!(response.message, ServerControl::Pong(Pong { nonce: 99 }));
+    }
+
+    #[test]
+    fn access_token_blocks_controls_until_authenticate_succeeds() {
+        let mut state = ControlState::with_access_token("secret");
+        let mut session = Session::anonymous(1);
+        authenticate(&mut state, &mut session, "client");
+
+        let blocked = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                2,
+                ClientControl::CreateRoom(CreateRoom {
+                    name: "stage1".to_owned(),
+                }),
+            ),
+        );
+        match blocked.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_authenticated"),
+            other => panic!("unexpected unauthenticated response: {other:?}"),
+        }
+
+        let invalid = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                3,
+                ClientControl::Authenticate(Authenticate {
+                    token: "wrong".to_owned(),
+                }),
+            ),
+        );
+        match invalid.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "invalid_token"),
+            other => panic!("unexpected invalid token response: {other:?}"),
+        }
+
+        let authenticated = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                4,
+                ClientControl::Authenticate(Authenticate {
+                    token: "secret".to_owned(),
+                }),
+            ),
+        );
+        assert!(matches!(
+            authenticated.message,
+            ServerControl::Authenticated(_)
+        ));
+
+        let room_id = create_room(&mut state, &mut session, "stage1");
+        assert_eq!(room_id, 1);
     }
 
     #[test]

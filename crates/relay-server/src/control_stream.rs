@@ -18,7 +18,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    control::ControlState, media::MediaRelay, metrics::unix_time_micros, session::Session,
+    config::ServerConfig, control::ControlState, media::MediaRelay, metrics::unix_time_micros,
+    session::Session,
 };
 
 const CONTROL_STREAM_READ_LIMIT: usize = 64 * 1024;
@@ -35,6 +36,18 @@ impl ControlRuntime {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(ControlState::new())),
+            media: Arc::new(Mutex::new(MediaRelay::new())),
+            next_session_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn from_config(config: ServerConfig) -> Self {
+        let state = match config.access_token {
+            Some(access_token) => ControlState::with_access_token(access_token),
+            None => ControlState::new(),
+        };
+        Self {
+            state: Arc::new(Mutex::new(state)),
             media: Arc::new(Mutex::new(MediaRelay::new())),
             next_session_id: Arc::new(AtomicU64::new(1)),
         }
@@ -152,6 +165,13 @@ impl ControlRuntime {
             );
             return;
         };
+        if !session.access_granted {
+            debug!(
+                session_id = session.id,
+                user_id, "dropping media datagram before authentication"
+            );
+            return;
+        }
         let session_id = session.id;
         drop(session);
         let packet = match MediaPacket::decode(bytes) {
@@ -202,8 +222,10 @@ impl Default for ControlRuntime {
     }
 }
 
-pub async fn serve_control_endpoint(endpoint: Endpoint) {
-    ControlRuntime::new().serve_endpoint(endpoint).await;
+pub async fn serve_control_endpoint(endpoint: Endpoint, config: ServerConfig) {
+    ControlRuntime::from_config(config)
+        .serve_endpoint(endpoint)
+        .await;
 }
 
 #[cfg(test)]
@@ -214,14 +236,14 @@ mod tests {
         PROTOCOL_VERSION,
         codec::CodecId,
         control::{
-            ClientControl, ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind,
+            Authenticate, ClientControl, ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind,
             PollStreamMetrics, PublishStream, ServerControl, SubscribeStream,
             decode_server_envelope, encode_client_envelope,
         },
         packet::{MediaPacket, MediaPacketHeader, PacketFlags, PacketType},
     };
 
-    use crate::transport::build_server_endpoint;
+    use crate::{config::ServerConfig, transport::build_server_endpoint};
 
     use super::*;
 
@@ -382,6 +404,101 @@ mod tests {
             subscribed.message,
             ServerControl::StreamSubscribed(_)
         ));
+
+        connection.close(0_u32.into(), b"done");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_runtime_requires_access_token_when_configured() {
+        let server = build_server_endpoint("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let runtime = ControlRuntime::from_config(
+            ServerConfig::new("127.0.0.1:0".to_owned())
+                .with_access_token(Some("secret".to_owned())),
+        );
+        let server_task = tokio::spawn(async move {
+            let incoming = server.accept().await.expect("incoming connection");
+            let connection = incoming.await.expect("accepted connection");
+            runtime.serve_connection(connection).await;
+        });
+
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(build_insecure_local_client_config());
+        let connection = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .expect("client connects");
+
+        send_control_request(
+            &connection,
+            ClientEnvelope::new(
+                1,
+                ClientControl::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_name: "integration-client".to_owned(),
+                }),
+            ),
+        )
+        .await;
+
+        let blocked = send_control_request(
+            &connection,
+            ClientEnvelope::new(
+                2,
+                ClientControl::CreateRoom(CreateRoom {
+                    name: "stage1".to_owned(),
+                }),
+            ),
+        )
+        .await;
+        match blocked.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_authenticated"),
+            other => panic!("unexpected blocked response: {other:?}"),
+        }
+
+        let invalid = send_control_request(
+            &connection,
+            ClientEnvelope::new(
+                3,
+                ClientControl::Authenticate(Authenticate {
+                    token: "wrong".to_owned(),
+                }),
+            ),
+        )
+        .await;
+        match invalid.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "invalid_token"),
+            other => panic!("unexpected invalid token response: {other:?}"),
+        }
+
+        let authenticated = send_control_request(
+            &connection,
+            ClientEnvelope::new(
+                4,
+                ClientControl::Authenticate(Authenticate {
+                    token: "secret".to_owned(),
+                }),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            authenticated.message,
+            ServerControl::Authenticated(_)
+        ));
+
+        let created = send_control_request(
+            &connection,
+            ClientEnvelope::new(
+                5,
+                ClientControl::CreateRoom(CreateRoom {
+                    name: "stage1".to_owned(),
+                }),
+            ),
+        )
+        .await;
+        assert!(matches!(created.message, ServerControl::RoomCreated(_)));
 
         connection.close(0_u32.into(), b"done");
         server_task.await.unwrap();

@@ -9,6 +9,9 @@ use tracing::info;
 struct Args {
     #[arg(long, default_value = "0.0.0.0:4433")]
     listen: String,
+
+    #[arg(long)]
+    access_token: Option<String>,
 }
 
 #[tokio::main]
@@ -16,13 +19,17 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let config = ServerConfig::new(args.listen);
+    let config = ServerConfig::new(args.listen).with_access_token(args.access_token);
     let endpoint = build_server_endpoint(&config.listen_addr)?;
     let local_addr = endpoint.local_addr()?;
 
-    info!(listen = %local_addr, "relay server QUIC endpoint ready");
+    info!(
+        listen = %local_addr,
+        auth_required = config.access_token.is_some(),
+        "relay server QUIC endpoint ready"
+    );
     println!("relay-server listening on {local_addr}");
 
-    serve_control_endpoint(endpoint).await;
+    serve_control_endpoint(endpoint, config).await;
     Ok(())
 }

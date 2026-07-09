@@ -38,6 +38,13 @@ cargo run -p desktop-client -- --mode broadcaster --capture-source primary-monit
 cargo run -p load-test -- --publishers 1 --viewers 10 --packets 120 --include-slow-viewer
 ```
 
+To require a shared access token for control actions and media datagrams:
+
+```bash
+cargo run -p relay-server -- --listen 127.0.0.1:4433 --access-token dev-secret
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --access-token dev-secret
+```
+
 For a smoke test that starts the relay and exits after a few seconds:
 
 ```bash
@@ -114,6 +121,6 @@ Expected voice output includes `audio-send`, `audio-recv`, `audio-play`, relay `
 
 ## Current stage
 
-Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers through independent bounded viewer egress queues, store and serve stream config, expose stream ingress/egress metrics, aggregate viewer stats into publisher feedback, and the client/load-test paths can packetize, pace, send, receive, reassemble with stale-frame drops, parse synthetic Annex B H.264-like frames into BGRA preview frames, render them into a latest-frame playback sink, send and receive synthetic Opus-like voice frames, estimate capture-to-viewer latency from media timestamps, report viewer stats, poll publisher feedback and stream metrics, request synthetic keyframes for new subscribers, packet loss, or decoder recovery, adapt synthetic bitrate/FPS targets when viewers are degraded, and keep QUIC control connections alive while waiting for delayed media.
+Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers through independent bounded viewer egress queues, optionally require a shared access token, store and serve stream config, expose stream ingress/egress metrics, aggregate viewer stats into publisher feedback, and the client/load-test paths can packetize, pace, send, receive, reassemble with stale-frame drops, parse synthetic Annex B H.264-like frames into BGRA preview frames, render them into a latest-frame playback sink, send and receive synthetic Opus-like voice frames, estimate capture-to-viewer latency from media timestamps, report viewer stats, poll publisher feedback and stream metrics, request synthetic keyframes for new subscribers, packet loss, or decoder recovery, adapt synthetic bitrate/FPS targets when viewers are degraded, and keep QUIC control connections alive while waiting for delayed media.
 
 Actual Windows Graphics Capture frame acquisition, microphone capture, real Opus, hardware encode, native decode, native window rendering, and production-grade adaptive media feedback are later stages.
