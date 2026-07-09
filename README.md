@@ -106,10 +106,12 @@ Expected output includes `audio-source kind=device ...` lines on Windows systems
 To inspect room participants and their TeamSpeak-style voice state after a broadcaster has created a room:
 
 ```bash
+cargo run -p desktop-client -- --list-rooms
+cargo run -p desktop-client -- --list-streams --room-name stage1
 cargo run -p desktop-client -- --list-participants --room-name stage1 --display-name Alice
 ```
 
-Expected output includes `participant ... muted=... deafened=... push_to_talk=... speaking=... published_streams=... subscribed_streams=...` lines.
+Expected output includes `room ...`, `stream ...`, and `participant ... muted=... deafened=... push_to_talk=... speaking=... published_streams=... subscribed_streams=...` lines.
 
 To exercise live primary-monitor acquisition through the desktop broadcaster, start a relay and run one live screen frame:
 

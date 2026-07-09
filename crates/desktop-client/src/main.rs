@@ -119,6 +119,12 @@ struct Args {
     list_audio_sources: bool,
 
     #[arg(long)]
+    list_rooms: bool,
+
+    #[arg(long)]
+    list_streams: bool,
+
+    #[arg(long)]
     list_participants: bool,
 
     #[arg(long, value_enum, default_value_t = CaptureSourceArg::PrimaryMonitor)]
@@ -275,6 +281,14 @@ async fn main() -> anyhow::Result<()> {
     let clock_sync = sync_control_clock(&control, &args).await?;
     if let Some(access_token) = &args.access_token {
         authenticate_control(&control, access_token).await?;
+    }
+    if args.list_rooms {
+        run_list_rooms_flow(&control).await?;
+        return Ok(());
+    }
+    if args.list_streams {
+        run_list_streams_flow(&control, &args).await?;
+        return Ok(());
     }
     if args.list_participants {
         run_list_participants_flow(&control, &args).await?;
@@ -436,6 +450,37 @@ async fn set_voice_state_if_requested(
         ServerControl::Error(error) => bail!("set voice state failed: {}", error.message),
         other => bail!("unexpected set voice state response: {other:?}"),
     }
+}
+
+async fn run_list_rooms_flow(
+    control: &crate::transport::quic::ControlClient,
+) -> anyhow::Result<()> {
+    let rooms = list_rooms(control).await?;
+    println!("rooms count={}", rooms.len());
+    for room in &rooms {
+        println!("{}", format_room_summary(room));
+    }
+    Ok(())
+}
+
+async fn run_list_streams_flow(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let room_id = resolve_viewer_room_id(control, args).await?;
+    let joined = control
+        .send(ClientControl::JoinRoom(JoinRoom { room_id }))
+        .await?;
+    print_control_response("join-room", &joined);
+    ensure_not_error("join room", &joined)?;
+
+    let streams = list_room_streams(control, room_id).await?;
+    println!("streams room_id={} count={}", room_id, streams.len());
+    for stream in &streams {
+        println!("{}", format_stream_summary(stream));
+    }
+    leave_room(control, room_id).await?;
+    Ok(())
 }
 
 async fn run_list_participants_flow(
@@ -780,6 +825,28 @@ fn format_participant_summary(participant: &ParticipantSummary) -> String {
         participant.speaking,
         participant.published_stream_count,
         participant.subscribed_stream_count
+    )
+}
+
+fn format_room_summary(room: &RoomSummary) -> String {
+    format!(
+        "room room_id={} name={:?} participants={} streams={}",
+        room.room_id, room.name, room.participant_count, room.published_stream_count
+    )
+}
+
+fn format_stream_summary(stream: &StreamSummary) -> String {
+    format!(
+        "stream room_id={} stream_id={} publisher_id={} codec={:?} media_kind={:?} subscribers={} configured={} target_bitrate_bps={} target_fps={}",
+        stream.room_id,
+        stream.stream_id,
+        stream.publisher_id,
+        stream.codec,
+        stream.media_kind,
+        stream.subscriber_count,
+        stream.has_config,
+        stream.target_bitrate_bps,
+        stream.target_frames_per_second
     )
 }
 
@@ -2651,6 +2718,20 @@ mod tests {
     }
 
     #[test]
+    fn list_rooms_flag_parses_without_media_options() {
+        let args = Args::try_parse_from(["desktop-client", "--list-rooms"]).unwrap();
+
+        assert!(args.list_rooms);
+    }
+
+    #[test]
+    fn list_streams_flag_parses_without_media_options() {
+        let args = Args::try_parse_from(["desktop-client", "--list-streams"]).unwrap();
+
+        assert!(args.list_streams);
+    }
+
+    #[test]
     fn list_participants_flag_parses_without_media_options() {
         let args = Args::try_parse_from(["desktop-client", "--list-participants"]).unwrap();
 
@@ -3016,6 +3097,31 @@ mod tests {
         assert_eq!(
             format_participant_summary(&summary),
             "participant room_id=1 user_id=7 display_name=\"user-7\" muted=false deafened=true push_to_talk=true speaking=false published_streams=1 subscribed_streams=2"
+        );
+    }
+
+    #[test]
+    fn format_room_summary_prints_discovery_line() {
+        let room = RoomSummary {
+            room_id: 3,
+            name: "stage1".to_owned(),
+            participant_count: 2,
+            published_stream_count: 1,
+        };
+
+        assert_eq!(
+            format_room_summary(&room),
+            "room room_id=3 name=\"stage1\" participants=2 streams=1"
+        );
+    }
+
+    #[test]
+    fn format_stream_summary_prints_discovery_line() {
+        let stream = stream_summary(9, MediaKind::Screen);
+
+        assert_eq!(
+            format_stream_summary(&stream),
+            "stream room_id=1 stream_id=9 publisher_id=10 codec=H264 media_kind=Screen subscribers=0 configured=true target_bitrate_bps=800000 target_fps=30"
         );
     }
 
