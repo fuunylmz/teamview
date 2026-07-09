@@ -236,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
         args.audio_output
     );
 
-    let mut control = connect_control_client(&endpoint, &args.relay).await?;
+    let control = connect_control_client(&endpoint, &args.relay).await?;
     let response = control
         .send(ClientControl::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
@@ -245,14 +245,14 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     print_control_response("hello", &response);
     ensure_not_error("hello", &response)?;
-    let clock_sync = sync_control_clock(&mut control, &args).await?;
+    let clock_sync = sync_control_clock(&control, &args).await?;
     if let Some(access_token) = &args.access_token {
-        authenticate_control(&mut control, access_token).await?;
+        authenticate_control(&control, access_token).await?;
     }
 
     match args.mode {
-        Mode::Broadcaster => run_broadcaster_control_flow(&mut control, &args, clock_sync).await?,
-        Mode::Viewer => run_viewer_control_flow(&mut control, &args, clock_sync).await?,
+        Mode::Broadcaster => run_broadcaster_control_flow(&control, &args, clock_sync).await?,
+        Mode::Viewer => run_viewer_control_flow(&control, &args, clock_sync).await?,
     }
 
     Ok(())
@@ -266,7 +266,7 @@ struct ClockSyncEstimate {
 }
 
 async fn sync_control_clock(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<ClockSyncEstimate> {
     let sample_count = args.time_sync_samples.max(1);
@@ -355,7 +355,7 @@ fn select_best_clock_sync_estimate(
 }
 
 async fn authenticate_control(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     access_token: &str,
 ) -> anyhow::Result<()> {
     let response = control
@@ -372,7 +372,7 @@ async fn authenticate_control(
 }
 
 async fn run_broadcaster_control_flow(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
@@ -434,7 +434,7 @@ async fn run_broadcaster_control_flow(
 }
 
 async fn run_viewer_control_flow(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
@@ -482,7 +482,7 @@ async fn run_viewer_control_flow(
 }
 
 async fn resolve_viewer_room_id(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<RoomId> {
     if let Some(room_id) = args.room_id {
@@ -511,7 +511,7 @@ async fn resolve_viewer_room_id(
 }
 
 async fn list_rooms(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
 ) -> anyhow::Result<Vec<RoomSummary>> {
     let response = control.send(ClientControl::ListRooms(ListRooms)).await?;
     print_control_response("list-rooms", &response);
@@ -540,7 +540,7 @@ fn select_viewer_room<'a>(rooms: &'a [RoomSummary], room_name: &str) -> Option<&
 }
 
 async fn list_room_streams(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
 ) -> anyhow::Result<Vec<StreamSummary>> {
     let response = control
@@ -648,7 +648,7 @@ fn format_stream_summaries(streams: &[StreamSummary]) -> String {
 }
 
 async fn poll_stream_config(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
     stream_id: StreamId,
 ) -> anyhow::Result<StreamConfig> {
@@ -667,7 +667,7 @@ async fn poll_stream_config(
 }
 
 async fn unsubscribe_stream(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
     stream_id: StreamId,
 ) -> anyhow::Result<()> {
@@ -686,7 +686,7 @@ async fn unsubscribe_stream(
 }
 
 async fn leave_room(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
 ) -> anyhow::Result<()> {
     let response = control
@@ -701,7 +701,7 @@ async fn leave_room(
 }
 
 async fn run_synthetic_broadcaster_media(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
     room_id: RoomId,
     clock_sync: ClockSyncEstimate,
@@ -717,7 +717,7 @@ async fn run_synthetic_broadcaster_media(
 }
 
 async fn run_synthetic_screen_broadcaster_media(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
     room_id: RoomId,
     clock_sync: ClockSyncEstimate,
@@ -921,7 +921,7 @@ fn resize_capture_frame(
 }
 
 async fn run_synthetic_voice_broadcaster_media(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
     room_id: RoomId,
     clock_sync: ClockSyncEstimate,
@@ -1081,7 +1081,7 @@ async fn run_synthetic_voice_broadcaster_media(
 }
 
 async fn set_publisher_target_media(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
     args: &Args,
 ) -> anyhow::Result<()> {
@@ -1108,7 +1108,7 @@ async fn set_publisher_target_media(
 }
 
 async fn set_screen_stream_config(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
     args: &Args,
     width: u32,
@@ -1248,7 +1248,7 @@ fn unix_time_micros() -> u64 {
 }
 
 async fn poll_publisher_feedback(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
     stream_id: StreamId,
 ) -> anyhow::Result<PublisherFeedback> {
@@ -1266,7 +1266,7 @@ async fn poll_publisher_feedback(
 }
 
 async fn poll_stream_metrics(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
     stream_id: StreamId,
 ) -> anyhow::Result<StreamMetricsSnapshot> {
@@ -1285,7 +1285,7 @@ async fn poll_stream_metrics(
 }
 
 async fn run_synthetic_viewer_media(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
     room_id: RoomId,
     stream_id: StreamId,
@@ -1302,7 +1302,7 @@ async fn run_synthetic_viewer_media(
 }
 
 async fn run_synthetic_screen_viewer_media(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
     room_id: RoomId,
     stream_id: StreamId,
@@ -1456,7 +1456,7 @@ async fn run_synthetic_screen_viewer_media(
 }
 
 async fn run_synthetic_voice_viewer_media(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     args: &Args,
     room_id: RoomId,
     stream_id: StreamId,
@@ -1593,7 +1593,7 @@ async fn run_synthetic_voice_viewer_media(
 }
 
 async fn request_keyframe(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
     stream_id: StreamId,
     reason: KeyframeReason,
@@ -1614,7 +1614,7 @@ async fn request_keyframe(
 }
 
 async fn sleep_with_keepalive(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     duration: Duration,
 ) -> anyhow::Result<()> {
     let mut remaining = duration;
@@ -1630,7 +1630,7 @@ async fn sleep_with_keepalive(
 }
 
 async fn recv_media_packet_with_keepalive(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     idle_timeout: Duration,
 ) -> anyhow::Result<Option<MediaPacket>> {
     let mut remaining = idle_timeout;
@@ -1649,7 +1649,7 @@ async fn recv_media_packet_with_keepalive(
     Ok(None)
 }
 
-async fn send_keepalive(control: &mut crate::transport::quic::ControlClient) -> anyhow::Result<()> {
+async fn send_keepalive(control: &crate::transport::quic::ControlClient) -> anyhow::Result<()> {
     let nonce = unix_time_micros();
     let response = control.send(ClientControl::Ping(Ping { nonce })).await?;
     match response.message {
@@ -1660,7 +1660,7 @@ async fn send_keepalive(control: &mut crate::transport::quic::ControlClient) -> 
 }
 
 async fn send_viewer_stats(
-    control: &mut crate::transport::quic::ControlClient,
+    control: &crate::transport::quic::ControlClient,
     room_id: RoomId,
     stream_id: StreamId,
     stats: ClientMediaStats,

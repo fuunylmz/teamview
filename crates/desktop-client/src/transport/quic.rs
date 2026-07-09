@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use super::RelayEndpoint;
 use anyhow::Context;
@@ -53,23 +60,22 @@ pub async fn connect_control_client(
     Ok(ControlClient::new(connection))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ControlClient {
     connection: Connection,
-    next_request_id: RequestId,
+    request_ids: RequestIdAllocator,
 }
 
 impl ControlClient {
     pub fn new(connection: Connection) -> Self {
         Self {
             connection,
-            next_request_id: 1,
+            request_ids: RequestIdAllocator::new(),
         }
     }
 
-    pub async fn send(&mut self, message: ClientControl) -> anyhow::Result<ServerEnvelope> {
-        let request_id = self.next_request_id;
-        self.next_request_id += 1;
+    pub async fn send(&self, message: ClientControl) -> anyhow::Result<ServerEnvelope> {
+        let request_id = self.request_ids.allocate();
         self.send_envelope(&ClientEnvelope::new(request_id, message))
             .await
     }
@@ -92,6 +98,23 @@ impl ControlClient {
             .await
             .context("failed to read media datagram")?;
         MediaPacket::decode(&bytes).context("failed to decode media packet")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RequestIdAllocator {
+    next_request_id: Arc<AtomicU64>,
+}
+
+impl RequestIdAllocator {
+    fn new() -> Self {
+        Self {
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn allocate(&self) -> RequestId {
+        self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -190,5 +213,15 @@ mod tests {
     #[test]
     fn rejects_invalid_bind_addr() {
         assert!(build_client_endpoint("not-an-addr").is_err());
+    }
+
+    #[test]
+    fn cloned_request_id_allocators_share_sequence() {
+        let allocator = RequestIdAllocator::new();
+        let cloned = allocator.clone();
+
+        assert_eq!(allocator.allocate(), 1);
+        assert_eq!(cloned.allocate(), 2);
+        assert_eq!(allocator.allocate(), 3);
     }
 }
