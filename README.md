@@ -129,7 +129,7 @@ The first frontend workspace is a static channel console at `apps/desktop-ui/ind
 cargo run -p desktop-client -- --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --serve-ui --ui-listen 127.0.0.1:7788
 ```
 
-Open `http://127.0.0.1:7788/` to load the channel console. In broadcaster mode, the screen share control calls the client-local API to publish or unpublish the relay screen stream before refreshing the channel snapshot. The voice controls call the same local API surface and update relay `SetVoiceState` for mute, deafen, and push-to-talk state. For bridge/debug tooling, `--export-ui-state apps/desktop-ui/state.json` writes the same channel snapshot to disk and `--print-ui-state` prints it to stdout.
+Open `http://127.0.0.1:7788/` to load the channel console. In broadcaster mode, the screen share control calls the client-local API to publish or unpublish the relay screen stream and runs the screen media sender while sharing is active. The voice controls call the same local API surface and update relay `SetVoiceState` for mute, deafen, and push-to-talk state. For bridge/debug tooling, `--export-ui-state apps/desktop-ui/state.json` writes the same channel snapshot to disk and `--print-ui-state` prints it to stdout.
 
 To exercise live primary-monitor acquisition through the desktop broadcaster, start a relay and run one live screen frame:
 

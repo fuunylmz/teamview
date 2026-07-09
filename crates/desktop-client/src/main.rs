@@ -17,7 +17,10 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -398,7 +401,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if args.serve_ui {
-        run_ui_server_flow(&control, &args).await?;
+        run_ui_server_flow(&control, &args, clock_sync).await?;
         return Ok(());
     }
     if args.list_rooms {
@@ -815,10 +818,16 @@ async fn build_ui_state_json_with_controls(
     Ok((json, app))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct UiServerState {
     local_voice: Arc<Mutex<VoiceControlState>>,
     local_screen_share: Arc<Mutex<ScreenShareControlState>>,
+    screen_media_task: Arc<Mutex<Option<UiScreenMediaTask>>>,
+}
+
+struct UiScreenMediaTask {
+    stop: Arc<AtomicBool>,
+    handle: tokio::task::JoinHandle<anyhow::Result<()>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -843,6 +852,7 @@ impl UiServerState {
         Self {
             local_voice: Arc::new(Mutex::new(args.ui_voice_control_state())),
             local_screen_share: Arc::new(Mutex::new(local_screen_share)),
+            screen_media_task: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -898,11 +908,28 @@ impl UiServerState {
         screen.sharing = sharing;
         Ok(screen.clone())
     }
+
+    fn set_screen_media_task(&self, task: UiScreenMediaTask) -> anyhow::Result<()> {
+        let mut current = self
+            .screen_media_task
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UI screen media task lock is poisoned"))?;
+        *current = Some(task);
+        Ok(())
+    }
+
+    fn take_screen_media_task(&self) -> anyhow::Result<Option<UiScreenMediaTask>> {
+        self.screen_media_task
+            .lock()
+            .map(|mut current| current.take())
+            .map_err(|_| anyhow::anyhow!("UI screen media task lock is poisoned"))
+    }
 }
 
 async fn run_ui_server_flow(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&args.ui_listen)
         .with_context(|| format!("failed to bind UI server on {}", args.ui_listen))?;
@@ -918,9 +945,11 @@ async fn run_ui_server_flow(
     let args = args.clone();
     let state = UiServerState::new(&args);
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || serve_ui_http(listener, runtime, control, args, state))
-        .await
-        .context("UI server task failed")?
+    tokio::task::spawn_blocking(move || {
+        serve_ui_http(listener, runtime, control, args, state, clock_sync)
+    })
+    .await
+    .context("UI server task failed")?
 }
 
 fn serve_ui_http(
@@ -929,13 +958,19 @@ fn serve_ui_http(
     control: crate::transport::quic::ControlClient,
     args: Args,
     state: UiServerState,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(error) =
-                    handle_ui_http_connection(&mut stream, &runtime, &control, &args, &state)
-                {
+                if let Err(error) = handle_ui_http_connection(
+                    &mut stream,
+                    &runtime,
+                    &control,
+                    &args,
+                    &state,
+                    clock_sync,
+                ) {
                     eprintln!("ui-server request failed: {error:#}");
                 }
             }
@@ -951,6 +986,7 @@ fn handle_ui_http_connection(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
     state: &UiServerState,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     let request = read_ui_http_request(stream)?;
     let method = ui_request_method(&request).unwrap_or("GET");
@@ -1043,6 +1079,7 @@ fn handle_ui_http_connection(
                 control,
                 args,
                 state,
+                clock_sync,
                 patch.sharing,
             )) {
                 return write_json_error(stream, "500 Internal Server Error", &error);
@@ -1118,11 +1155,12 @@ async fn apply_ui_screen_share_state(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
     state: &UiServerState,
+    clock_sync: ClockSyncEstimate,
     sharing: bool,
 ) -> anyhow::Result<()> {
     ensure_ui_screen_share_allowed(args)?;
     if sharing {
-        start_ui_screen_share(control, args, state).await
+        start_ui_screen_share(control, args, state, clock_sync).await
     } else {
         stop_ui_screen_share(control, args, state).await
     }
@@ -1142,6 +1180,7 @@ async fn start_ui_screen_share(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
     state: &UiServerState,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     if state.local_screen_share()?.sharing {
         return Ok(());
@@ -1167,6 +1206,7 @@ async fn start_ui_screen_share(
     }
 
     state.set_screen_sharing(true)?;
+    start_ui_screen_media_task(control, args, state, room_id, clock_sync)?;
     Ok(())
 }
 
@@ -1182,14 +1222,53 @@ async fn stop_ui_screen_share(
 
     let rooms = list_rooms(control).await?;
     let Some(room_id) = select_ui_state_channel_id(args, &rooms)? else {
+        stop_ui_screen_media_task(state).await?;
         state.set_screen_sharing(false)?;
         return Ok(());
     };
 
+    stop_ui_screen_media_task(state).await?;
     unpublish_stream_for_ui(control, room_id, screen.stream_id).await?;
     state.set_screen_sharing(false)?;
     leave_room(control, room_id).await?;
     Ok(())
+}
+
+fn start_ui_screen_media_task(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    state: &UiServerState,
+    room_id: RoomId,
+    clock_sync: ClockSyncEstimate,
+) -> anyhow::Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let media_stop = stop.clone();
+    let media_control = control.clone();
+    let media_args = args.for_media_kind(MediaKindArg::Screen, args.stream_id);
+    let handle = tokio::spawn(async move {
+        run_ui_screen_broadcaster_media(
+            &media_control,
+            &media_args,
+            room_id,
+            clock_sync,
+            media_stop,
+        )
+        .await
+    });
+    state.set_screen_media_task(UiScreenMediaTask { stop, handle })
+}
+
+async fn stop_ui_screen_media_task(state: &UiServerState) -> anyhow::Result<()> {
+    let Some(task) = state.take_screen_media_task()? else {
+        return Ok(());
+    };
+    task.stop.store(true, Ordering::SeqCst);
+    match task.handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error).context("UI screen media task failed"),
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("UI screen media task failed: {error}")),
+    }
 }
 
 async fn resolve_or_create_ui_screen_share_room_id(
@@ -2076,8 +2155,63 @@ async fn run_synthetic_screen_broadcaster_media(
         sleep_with_keepalive(control, Duration::from_millis(args.media_start_delay_ms)).await?;
     }
     let media_frames = args.synthetic_media_frames()?;
+    run_screen_broadcaster_media_loop(
+        control,
+        args,
+        room_id,
+        clock_sync,
+        ScreenMediaRunOptions {
+            max_frames: Some(media_frames),
+            stop: None,
+            log_each_frame: true,
+            linger_on_end: true,
+            summary_run_ms: Some(args.media_run_ms),
+        },
+    )
+    .await
+}
+
+async fn run_ui_screen_broadcaster_media(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+    clock_sync: ClockSyncEstimate,
+    stop: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    run_screen_broadcaster_media_loop(
+        control,
+        args,
+        room_id,
+        clock_sync,
+        ScreenMediaRunOptions {
+            max_frames: None,
+            stop: Some(stop),
+            log_each_frame: false,
+            linger_on_end: false,
+            summary_run_ms: None,
+        },
+    )
+    .await
+}
+
+struct ScreenMediaRunOptions {
+    max_frames: Option<u32>,
+    stop: Option<Arc<AtomicBool>>,
+    log_each_frame: bool,
+    linger_on_end: bool,
+    summary_run_ms: Option<u64>,
+}
+
+async fn run_screen_broadcaster_media_loop(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+    clock_sync: ClockSyncEstimate,
+    options: ScreenMediaRunOptions,
+) -> anyhow::Result<()> {
     let frame_interval = args.media_frame_interval()?;
     let (mut target_width, mut target_height) = args.screen_capture_dimensions()?;
+    let run_started = Instant::now();
 
     let mut capture =
         windows::WindowsGraphicsCapture::new(args.capture_source()?, args.capture_config())?;
@@ -2093,11 +2227,34 @@ async fn run_synthetic_screen_broadcaster_media(
     let mut next_sequence_number = 1_u32;
     let mut timing = ClientBroadcasterStats::default();
     let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
-    for frame_id in 1..=media_frames {
+    let mut frame_id = 1_u32;
+    let mut sent_frames = 0_u32;
+    loop {
+        if options
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            break;
+        }
+        if options
+            .max_frames
+            .is_some_and(|max_frames| frame_id > max_frames)
+        {
+            break;
+        }
         ticker.tick().await;
+        if options
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            break;
+        }
         let capture_start = Instant::now();
         let Some(captured) = capture_screen_frame(&mut capture, args, target_width, target_height)?
         else {
+            frame_id = frame_id.saturating_add(1);
             continue;
         };
         let capture_duration = capture_start.elapsed();
@@ -2107,6 +2264,7 @@ async fn run_synthetic_screen_broadcaster_media(
         let encode_start = Instant::now();
         let Some(mut frame) = encoder.encode(captured, args.stream_id)? else {
             timing.record_encode_duration(encode_start.elapsed());
+            frame_id = frame_id.saturating_add(1);
             continue;
         };
         let sync_estimate = clock_sync
@@ -2131,22 +2289,25 @@ async fn run_synthetic_screen_broadcaster_media(
             control.send_media_packet(packet)?;
             sent_packets += 1;
         }
+        sent_frames = sent_frames.saturating_add(1);
         let send_duration = send_start.elapsed();
         timing.record_send_duration(send_duration);
-        println!(
-            "media-send frame_id={} fragments={} bytes={} target_bytes={} screen_input={:?} capture_width={} capture_height={} capture_ms={} encode_ms={} packetize_ms={} send_ms={}",
-            frame.frame_id,
-            packets.len(),
-            frame.bytes.len(),
-            args.media_frame_bytes,
-            args.screen_input,
-            captured_width,
-            captured_height,
-            millis_for_log(capture_duration),
-            millis_for_log(encode_duration),
-            millis_for_log(packetize_duration),
-            millis_for_log(send_duration)
-        );
+        if options.log_each_frame {
+            println!(
+                "media-send frame_id={} fragments={} bytes={} target_bytes={} screen_input={:?} capture_width={} capture_height={} capture_ms={} encode_ms={} packetize_ms={} send_ms={}",
+                frame.frame_id,
+                packets.len(),
+                frame.bytes.len(),
+                args.media_frame_bytes,
+                args.screen_input,
+                captured_width,
+                captured_height,
+                millis_for_log(capture_duration),
+                millis_for_log(encode_duration),
+                millis_for_log(packetize_duration),
+                millis_for_log(send_duration)
+            );
+        }
         if args.feedback_interval_frames > 0
             && frame_id.is_multiple_of(args.feedback_interval_frames)
         {
@@ -2175,6 +2336,7 @@ async fn run_synthetic_screen_broadcaster_media(
             }
             poll_remote_input(control, room_id, args.stream_id, remote_input.as_mut()).await?;
         }
+        frame_id = frame_id.saturating_add(1);
     }
     let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
     if feedback.keyframe_requested {
@@ -2219,12 +2381,16 @@ async fn run_synthetic_screen_broadcaster_media(
         stream_metrics.server_route_ms_p95
     );
     let timing = timing.timing_snapshot();
+    let summary_frames = options.max_frames.unwrap_or(sent_frames);
+    let summary_run_ms = options
+        .summary_run_ms
+        .unwrap_or_else(|| run_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
     println!(
         "media-summary role=broadcaster frames={} packets={} fps={} run_ms={} capture_ms_p50={} capture_ms_p95={} encode_ms_p50={} encode_ms_p95={} packetize_ms_p50={} packetize_ms_p95={} send_ms_p50={} send_ms_p95={}",
-        media_frames,
+        summary_frames,
         sent_packets,
         args.media_fps,
-        args.media_run_ms,
+        summary_run_ms,
         timing.capture_ms_p50,
         timing.capture_ms_p95,
         timing.encode_ms_p50,
@@ -2239,7 +2405,7 @@ async fn run_synthetic_screen_broadcaster_media(
         remote_input.output_mode(),
         remote_input.applied_events()
     );
-    if args.media_end_linger_ms > 0 {
+    if options.linger_on_end && args.media_end_linger_ms > 0 {
         tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
     }
     Ok(())

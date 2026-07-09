@@ -1,6 +1,6 @@
 use teamview_protocol::control::{RemoteInputEvent, RemoteInputKind};
 
-pub trait RemoteInputApplier {
+pub trait RemoteInputApplier: Send {
     fn output_mode(&self) -> &'static str;
     fn applied_events(&self) -> u64;
     fn apply(&mut self, event: &RemoteInputEvent) -> anyhow::Result<()>;
