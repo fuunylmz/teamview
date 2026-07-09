@@ -107,6 +107,19 @@ impl MediaRelay {
                 dropped: 1,
             };
         }
+        if published.media_kind == MediaKind::Voice
+            && !state.voice_publisher_can_send(stream_id, publisher_id)
+        {
+            debug!(
+                publisher_id,
+                stream_id, "dropping voice datagram for inactive speaker"
+            );
+            return MediaForwardSummary {
+                stream_id,
+                queued: 0,
+                dropped: 1,
+            };
+        }
 
         let Ok(_) = packet.encode() else {
             return MediaForwardSummary {
@@ -641,6 +654,28 @@ mod tests {
         assert!(viewer_rx.try_recv().is_err());
     }
 
+    #[test]
+    fn inactive_push_to_talk_publisher_voice_datagrams_are_dropped() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        let room_id = setup_published_stream(&mut state, &mut publisher, &mut viewer);
+        publish_voice_stream(&mut state, &mut publisher, room_id, 10);
+        subscribe_stream(&mut state, &mut viewer, room_id, 10);
+        set_voice_state_with_push_to_talk(&mut state, &mut publisher, room_id, false, false);
+
+        let mut relay = MediaRelay::with_egress_limits(8, 100);
+        let mut viewer_rx = relay.register_paused_for_test(viewer.user_id.unwrap());
+        let voice = synthetic_audio_packet_with_sequence(10, 1);
+
+        let summary =
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &voice, 123_000);
+
+        assert_eq!(summary.queued, 0);
+        assert_eq!(summary.dropped, 1);
+        assert!(viewer_rx.try_recv().is_err());
+    }
+
     fn setup_published_stream(
         state: &mut ControlState,
         publisher: &mut Session,
@@ -791,6 +826,30 @@ mod tests {
                     room_id,
                     muted,
                     deafened,
+                    push_to_talk: false,
+                    speaking: !muted,
+                }),
+            ),
+        );
+    }
+
+    fn set_voice_state_with_push_to_talk(
+        state: &mut ControlState,
+        participant: &mut Session,
+        room_id: u64,
+        muted: bool,
+        speaking: bool,
+    ) {
+        state.handle_client_envelope(
+            participant,
+            ClientEnvelope::new(
+                8,
+                ClientControl::SetVoiceState(SetVoiceState {
+                    room_id,
+                    muted,
+                    deafened: false,
+                    push_to_talk: true,
+                    speaking,
                 }),
             ),
         );

@@ -234,6 +234,8 @@ pub struct SetVoiceState {
     pub room_id: RoomId,
     pub muted: bool,
     pub deafened: bool,
+    pub push_to_talk: bool,
+    pub speaking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +244,8 @@ pub struct VoiceState {
     pub user_id: UserId,
     pub muted: bool,
     pub deafened: bool,
+    pub push_to_talk: bool,
+    pub speaking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +578,8 @@ mod tests {
                 room_id: 1,
                 muted: true,
                 deafened: false,
+                push_to_talk: true,
+                speaking: false,
             }),
         );
         let response = ServerEnvelope::new(
@@ -583,6 +589,8 @@ mod tests {
                 user_id: 7,
                 muted: true,
                 deafened: false,
+                push_to_talk: true,
+                speaking: false,
             }),
         );
 

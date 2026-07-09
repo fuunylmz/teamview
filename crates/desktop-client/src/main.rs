@@ -162,6 +162,12 @@ struct Args {
     #[arg(long)]
     deafened: bool,
 
+    #[arg(long)]
+    push_to_talk: bool,
+
+    #[arg(long)]
+    ptt_active: bool,
+
     #[arg(long, default_value_t = 0)]
     media_frames: u32,
 
@@ -234,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
         "desktop client endpoint and capture foundation ready"
     );
     println!(
-        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} voice_input={:?} render_output={:?} audio_output={:?} muted={} deafened={}",
+        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} voice_input={:?} render_output={:?} audio_output={:?} muted={} deafened={} push_to_talk={} speaking={}",
         args.mode,
         args.relay,
         local_addr,
@@ -245,7 +251,9 @@ async fn main() -> anyhow::Result<()> {
         args.render_output,
         args.audio_output,
         args.muted,
-        args.deafened
+        args.deafened,
+        args.voice_push_to_talk_enabled(),
+        args.voice_speaking()
     );
 
     let control = connect_control_client(&endpoint, &args.relay).await?;
@@ -388,7 +396,7 @@ async fn set_voice_state_if_requested(
     args: &Args,
     room_id: RoomId,
 ) -> anyhow::Result<()> {
-    if !args.muted && !args.deafened {
+    if !args.voice_state_requested() {
         return Ok(());
     }
     let response = control
@@ -396,14 +404,21 @@ async fn set_voice_state_if_requested(
             room_id,
             muted: args.muted,
             deafened: args.deafened,
+            push_to_talk: args.voice_push_to_talk_enabled(),
+            speaking: args.voice_speaking(),
         }))
         .await?;
     print_control_response("set-voice-state", &response);
     match response.message {
         ServerControl::VoiceStateUpdated(state) => {
             println!(
-                "voice-state room_id={} user_id={} muted={} deafened={}",
-                state.room_id, state.user_id, state.muted, state.deafened
+                "voice-state room_id={} user_id={} muted={} deafened={} push_to_talk={} speaking={}",
+                state.room_id,
+                state.user_id,
+                state.muted,
+                state.deafened,
+                state.push_to_talk,
+                state.speaking
             );
             Ok(())
         }
@@ -1145,13 +1160,17 @@ async fn run_synthetic_voice_broadcaster_media(
     room_id: RoomId,
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
-    if args.muted {
+    if !args.voice_speaking() {
         println!(
-            "voice-muted role=broadcaster room_id={} stream_id={}",
-            room_id, args.stream_id
+            "voice-send-disabled role=broadcaster room_id={} stream_id={} muted={} push_to_talk={} speaking={}",
+            room_id,
+            args.stream_id,
+            args.muted,
+            args.voice_push_to_talk_enabled(),
+            args.voice_speaking()
         );
         println!(
-            "media-summary role=broadcaster kind=voice muted=true frames=0 packets=0 fps=0 run_ms=0 capture_ms_p50=0 capture_ms_p95=0 encode_ms_p50=0 encode_ms_p95=0 packetize_ms_p50=0 packetize_ms_p95=0 send_ms_p50=0 send_ms_p95=0"
+            "media-summary role=broadcaster kind=voice inactive=true frames=0 packets=0 fps=0 run_ms=0 capture_ms_p50=0 capture_ms_p95=0 encode_ms_p50=0 encode_ms_p95=0 packetize_ms_p50=0 packetize_ms_p95=0 send_ms_p50=0 send_ms_p95=0"
         );
         return Ok(());
     }
@@ -2320,6 +2339,18 @@ impl Args {
         self.media_frames > 0 || self.media_run_ms > 0
     }
 
+    fn voice_state_requested(&self) -> bool {
+        self.muted || self.deafened || self.voice_push_to_talk_enabled()
+    }
+
+    fn voice_push_to_talk_enabled(&self) -> bool {
+        self.push_to_talk || self.ptt_active
+    }
+
+    fn voice_speaking(&self) -> bool {
+        !self.muted && (!self.voice_push_to_talk_enabled() || self.ptt_active)
+    }
+
     fn synthetic_media_frames(&self) -> anyhow::Result<u32> {
         if self.media_frames > 0 {
             return Ok(self.media_frames);
@@ -2588,6 +2619,27 @@ mod tests {
 
         assert!(args.muted);
         assert!(args.deafened);
+        assert!(!args.voice_speaking());
+    }
+
+    #[test]
+    fn push_to_talk_requires_active_press_to_speak() {
+        let idle =
+            Args::try_parse_from(["desktop-client", "--media-kind", "voice", "--push-to-talk"])
+                .unwrap();
+        let active = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "voice",
+            "--push-to-talk",
+            "--ptt-active",
+        ])
+        .unwrap();
+
+        assert!(idle.voice_push_to_talk_enabled());
+        assert!(!idle.voice_speaking());
+        assert!(active.voice_push_to_talk_enabled());
+        assert!(active.voice_speaking());
     }
 
     #[test]

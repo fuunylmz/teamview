@@ -395,6 +395,13 @@ impl ControlState {
             .and_then(|room_voice_states| room_voice_states.get(&user_id))
     }
 
+    pub fn voice_publisher_can_send(&self, stream_id: StreamId, user_id: UserId) -> bool {
+        self.voice_state_for_stream(stream_id, user_id)
+            .is_none_or(|voice_state| {
+                !voice_state.muted && (!voice_state.push_to_talk || voice_state.speaking)
+            })
+    }
+
     pub fn disconnect_user(&mut self, user_id: UserId) {
         let affected_rooms = self
             .rooms
@@ -472,6 +479,8 @@ impl ControlState {
                 user_id,
                 muted: false,
                 deafened: false,
+                push_to_talk: false,
+                speaking: true,
             });
     }
 
@@ -506,6 +515,8 @@ impl ControlState {
             user_id,
             muted: request.muted,
             deafened: request.deafened,
+            push_to_talk: request.push_to_talk,
+            speaking: request.speaking && !request.muted,
         };
         self.voice_states
             .entry(request.room_id)
@@ -2322,6 +2333,8 @@ mod tests {
                     room_id,
                     muted: true,
                     deafened: false,
+                    push_to_talk: false,
+                    speaking: false,
                 }),
             ),
         );
@@ -2349,6 +2362,8 @@ mod tests {
                     room_id,
                     muted: true,
                     deafened: true,
+                    push_to_talk: true,
+                    speaking: false,
                 }),
             ),
         );
@@ -2360,6 +2375,8 @@ mod tests {
                 user_id,
                 muted: true,
                 deafened: true,
+                push_to_talk: true,
+                speaking: false,
             })
         );
         assert_eq!(
@@ -2369,6 +2386,44 @@ mod tests {
                 user_id,
                 muted: true,
                 deafened: true,
+                push_to_talk: true,
+                speaking: false,
+            })
+        );
+    }
+
+    #[test]
+    fn muted_voice_state_clears_speaking() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        authenticate(&mut state, &mut publisher, "publisher");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        let user_id = publisher.user_id.unwrap();
+
+        let response = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                4,
+                ClientControl::SetVoiceState(SetVoiceState {
+                    room_id,
+                    muted: true,
+                    deafened: false,
+                    push_to_talk: true,
+                    speaking: true,
+                }),
+            ),
+        );
+
+        assert_eq!(
+            response.message,
+            ServerControl::VoiceStateUpdated(VoiceState {
+                room_id,
+                user_id,
+                muted: true,
+                deafened: false,
+                push_to_talk: true,
+                speaking: false,
             })
         );
     }
@@ -2390,6 +2445,8 @@ mod tests {
                     room_id,
                     muted: true,
                     deafened: false,
+                    push_to_talk: false,
+                    speaking: false,
                 }),
             ),
         );
