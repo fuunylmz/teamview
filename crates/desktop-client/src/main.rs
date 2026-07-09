@@ -69,6 +69,7 @@ enum CaptureSourceArg {
 enum MediaKindArg {
     Screen,
     Voice,
+    Both,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -95,7 +96,7 @@ enum AudioOutputArg {
     Speaker,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 #[command(author, version, about = "TeamView native desktop client scaffold")]
 struct Args {
     #[arg(long, value_enum, default_value_t = Mode::Viewer)]
@@ -133,6 +134,9 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     stream_id: StreamId,
+
+    #[arg(long)]
+    voice_stream_id: Option<StreamId>,
 
     #[arg(long, value_enum, default_value_t = MediaKindArg::Screen)]
     media_kind: MediaKindArg,
@@ -399,12 +403,37 @@ async fn run_broadcaster_control_flow(
     print_control_response("join-room", &joined);
     ensure_not_error("join room", &joined)?;
 
+    if args.media_kind == MediaKindArg::Both {
+        run_broadcaster_dual_stream_control_flow(control, args, room_id, clock_sync).await?;
+        leave_room(control, room_id).await?;
+        return Ok(());
+    }
+
+    publish_configured_stream(control, args, room_id).await?;
+
+    println!(
+        "control-flow broadcaster room_id={} stream_id={}",
+        room_id, args.stream_id
+    );
+    if args.synthetic_media_enabled() {
+        set_publisher_target_media(control, room_id, args).await?;
+        run_synthetic_broadcaster_media(control, args, room_id, clock_sync).await?;
+    }
+    leave_room(control, room_id).await?;
+    Ok(())
+}
+
+async fn publish_configured_stream(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+) -> anyhow::Result<()> {
     let published = control
         .send(ClientControl::PublishStream(PublishStream {
             room_id,
             stream_id: args.stream_id,
-            codec: args.codec(),
-            media_kind: args.protocol_media_kind(),
+            codec: args.codec()?,
+            media_kind: args.protocol_media_kind()?,
         }))
         .await?;
     print_control_response("publish-stream", &published);
@@ -420,16 +449,40 @@ async fn run_broadcaster_control_flow(
         ServerControl::Error(error) => bail!("set stream config failed: {}", error.message),
         other => bail!("unexpected stream config response: {other:?}"),
     }
+    Ok(())
+}
 
+async fn run_broadcaster_dual_stream_control_flow(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+    clock_sync: ClockSyncEstimate,
+) -> anyhow::Result<()> {
+    let voice_stream_id = args.voice_stream_id()?;
+    let screen_args = args.for_media_kind(MediaKindArg::Screen, args.stream_id);
+    let voice_args = args.for_media_kind(MediaKindArg::Voice, voice_stream_id);
+
+    publish_configured_stream(control, &screen_args, room_id).await?;
+    publish_configured_stream(control, &voice_args, room_id).await?;
     println!(
-        "control-flow broadcaster room_id={} stream_id={}",
-        room_id, args.stream_id
+        "control-flow broadcaster room_id={} screen_stream_id={} voice_stream_id={}",
+        room_id, screen_args.stream_id, voice_args.stream_id
     );
     if args.synthetic_media_enabled() {
-        set_publisher_target_media(control, room_id, args).await?;
-        run_synthetic_broadcaster_media(control, args, room_id, clock_sync).await?;
+        set_publisher_target_media(control, room_id, &screen_args).await?;
+        set_publisher_target_media(control, room_id, &voice_args).await?;
+        let screen_control = control.clone();
+        let voice_control = control.clone();
+        tokio::try_join!(
+            run_synthetic_screen_broadcaster_media(
+                &screen_control,
+                &screen_args,
+                room_id,
+                clock_sync
+            ),
+            run_synthetic_voice_broadcaster_media(&voice_control, &voice_args, room_id, clock_sync)
+        )?;
     }
-    leave_room(control, room_id).await?;
     Ok(())
 }
 
@@ -438,6 +491,11 @@ async fn run_viewer_control_flow(
     args: &Args,
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
+    if args.media_kind == MediaKindArg::Both {
+        bail!(
+            "viewer --media-kind both is not supported yet; run separate screen and voice viewers or select one media kind"
+        );
+    }
     let room_id = resolve_viewer_room_id(control, args).await?;
 
     let joined = control
@@ -555,7 +613,7 @@ async fn list_room_streams(
 }
 
 fn resolve_viewer_stream_id(args: &Args, streams: &[StreamSummary]) -> anyhow::Result<StreamId> {
-    let expected_kind = args.protocol_media_kind();
+    let expected_kind = args.protocol_media_kind()?;
     if let Some(stream) = streams
         .iter()
         .find(|stream| stream.stream_id == args.stream_id)
@@ -712,6 +770,9 @@ async fn run_synthetic_broadcaster_media(
         }
         MediaKindArg::Voice => {
             run_synthetic_voice_broadcaster_media(control, args, room_id, clock_sync).await
+        }
+        MediaKindArg::Both => {
+            bail!("dual-stream broadcaster media should be started by control flow")
         }
     }
 }
@@ -1298,6 +1359,7 @@ async fn run_synthetic_viewer_media(
         MediaKindArg::Voice => {
             run_synthetic_voice_viewer_media(control, args, room_id, stream_id, clock_sync).await
         }
+        MediaKindArg::Both => bail!("viewer --media-kind both is not supported yet"),
     }
 }
 
@@ -1776,17 +1838,21 @@ impl Args {
         bitrate.min(u32::MAX as u128) as u32
     }
 
-    fn protocol_media_kind(&self) -> MediaKind {
+    fn protocol_media_kind(&self) -> anyhow::Result<MediaKind> {
         match self.media_kind {
-            MediaKindArg::Screen => MediaKind::Screen,
-            MediaKindArg::Voice => MediaKind::Voice,
+            MediaKindArg::Screen => Ok(MediaKind::Screen),
+            MediaKindArg::Voice => Ok(MediaKind::Voice),
+            MediaKindArg::Both => {
+                bail!("--media-kind both does not map to a single protocol media kind")
+            }
         }
     }
 
-    fn codec(&self) -> CodecId {
+    fn codec(&self) -> anyhow::Result<CodecId> {
         match self.media_kind {
-            MediaKindArg::Screen => CodecId::H264,
-            MediaKindArg::Voice => CodecId::Opus,
+            MediaKindArg::Screen => Ok(CodecId::H264),
+            MediaKindArg::Voice => Ok(CodecId::Opus),
+            MediaKindArg::Both => bail!("--media-kind both does not map to a single codec"),
         }
     }
 
@@ -1813,7 +1879,25 @@ impl Args {
                 frames_per_second: self.media_fps.max(1),
                 timebase_hz: 48_000,
             }),
+            MediaKindArg::Both => bail!("--media-kind both does not map to a single stream config"),
         }
+    }
+
+    fn voice_stream_id(&self) -> anyhow::Result<StreamId> {
+        let voice_stream_id = self
+            .voice_stream_id
+            .unwrap_or_else(|| self.stream_id.saturating_add(1));
+        if voice_stream_id == self.stream_id {
+            bail!("--voice-stream-id must be different from --stream-id for --media-kind both");
+        }
+        Ok(voice_stream_id)
+    }
+
+    fn for_media_kind(&self, media_kind: MediaKindArg, stream_id: StreamId) -> Self {
+        let mut args = self.clone();
+        args.media_kind = media_kind;
+        args.stream_id = stream_id;
+        args
     }
 
     fn screen_capture_dimensions(&self) -> anyhow::Result<(u32, u32)> {
@@ -1967,6 +2051,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.audio_output, AudioOutputArg::Speaker);
+    }
+
+    #[test]
+    fn media_kind_both_derives_voice_stream_id() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--mode",
+            "broadcaster",
+            "--media-kind",
+            "both",
+            "--stream-id",
+            "7",
+        ])
+        .unwrap();
+
+        assert_eq!(args.media_kind, MediaKindArg::Both);
+        assert_eq!(args.voice_stream_id().unwrap(), 8);
+
+        let voice_args = args.for_media_kind(MediaKindArg::Voice, args.voice_stream_id().unwrap());
+        assert_eq!(voice_args.media_kind, MediaKindArg::Voice);
+        assert_eq!(voice_args.stream_id, 8);
+        assert_eq!(voice_args.codec().unwrap(), CodecId::Opus);
+    }
+
+    #[test]
+    fn media_kind_both_rejects_conflicting_voice_stream_id() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "both",
+            "--stream-id",
+            "3",
+            "--voice-stream-id",
+            "3",
+        ])
+        .unwrap();
+
+        let error = args.voice_stream_id().unwrap_err();
+
+        assert!(error.to_string().contains("--voice-stream-id"));
+    }
+
+    #[test]
+    fn media_kind_both_has_no_single_stream_config() {
+        let args = Args::try_parse_from(["desktop-client", "--media-kind", "both"]).unwrap();
+
+        assert!(args.stream_config(1).is_err());
+        assert!(args.protocol_media_kind().is_err());
     }
 
     #[test]

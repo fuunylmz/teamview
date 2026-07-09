@@ -211,6 +211,24 @@ Expected behavior:
 - The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams, zero drops, current egress queue depth, and server route timing percentiles.
 - The final viewer summary reports `kind=voice`, matching decoded and played frame counts, and zero loss on a healthy local run.
 
+## Desktop dual-stream broadcaster checks
+
+The broadcaster can publish screen and voice streams together from one QUIC connection with `--media-kind both`. The screen stream uses `--stream-id`; the voice stream uses `--voice-stream-id` or defaults to the next stream id. Viewers currently subscribe to one selected media kind per process.
+
+Run in separate terminals after starting the relay:
+
+```bash
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 30 --media-frame-bytes 800 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-kind screen --stream-id 1 --media-run-ms 1000 --media-fps 30
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-kind voice --stream-id 2 --media-run-ms 1000 --media-fps 30
+```
+
+Expected behavior:
+
+- The broadcaster publishes and configures two streams, one `Screen/H264` and one `Voice/Opus`.
+- The broadcaster prints both `media-send` and `audio-send` lines during the same run.
+- Each viewer receives only the selected stream id and reports the usual zero-loss summary on a healthy local run.
+
 ## Desktop microphone voice checks
 
 On Windows, the broadcaster can use a real microphone source instead of synthetic samples. The payload is still the temporary Opus-like test container, but it now carries captured PCM so the receive/playback path sees the original microphone samples.
@@ -232,6 +250,6 @@ Expected behavior:
 
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, live primary-monitor acquisition, microphone PCM capture handoff, optional speaker playback handoff, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, microphone voice forwarding behavior, synthetic capture-to-viewer latency, multi-sample relay clock offset estimates, TimeSync-derived calibrated capture-to-viewer latency, broadcaster capture/encode/packetize/send timing, publisher stamped capture-to-encode/send timing, server receive-to-route timing, relay receive-to-send queue timing, viewer receive-to-reassembly timing, viewer decode/render timing, and render/playback FPS. Later milestones add hardware encode, real Opus, continuous calibrated cross-machine clock offset filtering, viewer receive, decode, and render timestamp calibration.
+Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, live primary-monitor acquisition, microphone PCM capture handoff, optional speaker playback handoff, dual-stream broadcaster publication, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, microphone voice forwarding behavior, synthetic capture-to-viewer latency, multi-sample relay clock offset estimates, TimeSync-derived calibrated capture-to-viewer latency, broadcaster capture/encode/packetize/send timing, publisher stamped capture-to-encode/send timing, server receive-to-route timing, relay receive-to-send queue timing, viewer receive-to-reassembly timing, viewer decode/render timing, and render/playback FPS. Later milestones add hardware encode, real Opus, continuous calibrated cross-machine clock offset filtering, viewer receive, decode, and render timestamp calibration.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.
