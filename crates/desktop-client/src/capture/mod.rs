@@ -23,6 +23,40 @@ impl CaptureFrame {
             storage: CaptureFrameStorage::MetadataOnly,
         }
     }
+
+    pub fn cpu_bgra(
+        frame_id: u64,
+        width: u32,
+        height: u32,
+        capture_time_micros: u64,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<Self> {
+        let expected_len = Self::bgra_byte_len(width, height)?;
+        if bytes.len() != expected_len {
+            anyhow::bail!(
+                "BGRA frame buffer length {} does not match {}x{}x4 ({})",
+                bytes.len(),
+                width,
+                height,
+                expected_len
+            );
+        }
+        Ok(Self {
+            frame_id,
+            width,
+            height,
+            capture_time_micros,
+            format: CapturePixelFormat::Bgra8,
+            storage: CaptureFrameStorage::CpuBytes(bytes),
+        })
+    }
+
+    pub fn bgra_byte_len(width: u32, height: u32) -> anyhow::Result<usize> {
+        (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| anyhow::anyhow!("BGRA frame dimensions are too large"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,5 +163,15 @@ mod tests {
 
         assert_eq!(queue.len(), 1);
         assert_eq!(queue.pop_latest().unwrap().frame_id, 2);
+    }
+
+    #[test]
+    fn cpu_bgra_frames_validate_buffer_length() {
+        let frame = CaptureFrame::cpu_bgra(1, 2, 2, 10, vec![0; 16]).unwrap();
+        assert_eq!(frame.format, CapturePixelFormat::Bgra8);
+        assert!(matches!(frame.storage, CaptureFrameStorage::CpuBytes(_)));
+
+        let error = CaptureFrame::cpu_bgra(1, 2, 2, 10, vec![0; 15]).unwrap_err();
+        assert!(error.to_string().contains("does not match"));
     }
 }

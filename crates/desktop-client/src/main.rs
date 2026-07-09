@@ -59,6 +59,12 @@ enum MediaKindArg {
     Voice,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ScreenInputArg {
+    Synthetic,
+    Live,
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about = "TeamView native desktop client scaffold")]
 struct Args {
@@ -88,6 +94,9 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = MediaKindArg::Screen)]
     media_kind: MediaKindArg,
+
+    #[arg(long, value_enum, default_value_t = ScreenInputArg::Synthetic)]
+    screen_input: ScreenInputArg,
 
     #[arg(long, default_value_t = 0)]
     media_frames: u32,
@@ -138,12 +147,18 @@ async fn main() -> anyhow::Result<()> {
         local = %local_addr,
         capture_supported,
         ?args.capture_source,
+        ?args.screen_input,
         cursor_visible = args.cursor_visible,
         "desktop client endpoint and capture foundation ready"
     );
     println!(
-        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?}",
-        args.mode, args.relay, local_addr, capture_supported, args.capture_source
+        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?}",
+        args.mode,
+        args.relay,
+        local_addr,
+        capture_supported,
+        args.capture_source,
+        args.screen_input
     );
 
     let mut control = connect_control_client(&endpoint, &args.relay).await?;
@@ -222,7 +237,7 @@ async fn run_broadcaster_control_flow(
     print_control_response("publish-stream", &published);
     ensure_not_error("publish stream", &published)?;
 
-    let stream_config = args.synthetic_stream_config(room_id);
+    let stream_config = args.stream_config(room_id)?;
     let configured = control
         .send(ClientControl::SetStreamConfig(stream_config.clone()))
         .await?;
@@ -518,10 +533,11 @@ async fn run_synthetic_screen_broadcaster_media(
     let mut next_sequence_number = 1_u32;
     for frame_id in 1..=media_frames {
         ticker.tick().await;
-        capture.push_test_frame(1280, 720, unix_time_micros());
-        let Some(captured) = capture.next_frame()? else {
+        let Some(captured) = capture_screen_frame(&mut capture, args)? else {
             continue;
         };
+        let captured_width = captured.width;
+        let captured_height = captured.height;
         let Some(frame) = encoder.encode(captured, args.stream_id)? else {
             continue;
         };
@@ -536,11 +552,14 @@ async fn run_synthetic_screen_broadcaster_media(
             sent_packets += 1;
         }
         println!(
-            "media-send frame_id={} fragments={} bytes={} target_bytes={}",
+            "media-send frame_id={} fragments={} bytes={} target_bytes={} screen_input={:?} capture_width={} capture_height={}",
             frame.frame_id,
             packets.len(),
             frame.bytes.len(),
-            args.media_frame_bytes
+            args.media_frame_bytes,
+            args.screen_input,
+            captured_width,
+            captured_height
         );
         if args.feedback_interval_frames > 0
             && frame_id.is_multiple_of(args.feedback_interval_frames)
@@ -579,6 +598,19 @@ async fn run_synthetic_screen_broadcaster_media(
         tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
     }
     Ok(())
+}
+
+fn capture_screen_frame(
+    capture: &mut windows::WindowsGraphicsCapture,
+    args: &Args,
+) -> anyhow::Result<Option<capture::CaptureFrame>> {
+    match args.screen_input {
+        ScreenInputArg::Synthetic => {
+            capture.push_test_frame(1280, 720, unix_time_micros());
+            capture.next_frame()
+        }
+        ScreenInputArg::Live => capture.next_frame(),
+    }
 }
 
 async fn run_synthetic_voice_broadcaster_media(
@@ -1148,18 +1180,21 @@ impl Args {
         }
     }
 
-    fn synthetic_stream_config(&self, room_id: RoomId) -> StreamConfig {
+    fn stream_config(&self, room_id: RoomId) -> anyhow::Result<StreamConfig> {
         match self.media_kind {
-            MediaKindArg::Screen => StreamConfig {
-                room_id,
-                stream_id: self.stream_id,
-                codec: CodecId::H264,
-                width: H264Encoder::default().config.width,
-                height: H264Encoder::default().config.height,
-                frames_per_second: self.media_fps.max(1),
-                timebase_hz: 90_000,
-            },
-            MediaKindArg::Voice => StreamConfig {
+            MediaKindArg::Screen => {
+                let (width, height) = self.screen_capture_dimensions()?;
+                Ok(StreamConfig {
+                    room_id,
+                    stream_id: self.stream_id,
+                    codec: CodecId::H264,
+                    width,
+                    height,
+                    frames_per_second: self.media_fps.max(1),
+                    timebase_hz: 90_000,
+                })
+            }
+            MediaKindArg::Voice => Ok(StreamConfig {
                 room_id,
                 stream_id: self.stream_id,
                 codec: CodecId::Opus,
@@ -1167,7 +1202,18 @@ impl Args {
                 height: 0,
                 frames_per_second: self.media_fps.max(1),
                 timebase_hz: 48_000,
-            },
+            }),
+        }
+    }
+
+    fn screen_capture_dimensions(&self) -> anyhow::Result<(u32, u32)> {
+        match self.screen_input {
+            ScreenInputArg::Synthetic => {
+                let config = H264Encoder::default().config;
+                Ok((config.width, config.height))
+            }
+            ScreenInputArg::Live => windows::primary_monitor_size()
+                .context("failed to query primary monitor size for live screen stream"),
         }
     }
 }

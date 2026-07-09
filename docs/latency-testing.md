@@ -63,7 +63,7 @@ sample-forward frames=3 fragments=18 reassembled=3 delivered=36 dropped=0
 
 Stage 4 validates capture-side latency policy without requiring interactive screen selection.
 
-The key invariant is that the capture queue keeps only the newest frame by default. If three frames arrive before encode/network consumes them, the first two are dropped and only the latest frame is returned.
+The key invariant is that the capture queue keeps only the newest frame by default. If three frames arrive before encode/network consumes them, the first two are dropped and only the latest frame is returned. On Windows, the live primary-monitor path can also acquire CPU BGRA pixels for the current desktop; hardware encoding uses that frame storage in a later stage.
 
 Covered by unit tests:
 
@@ -71,6 +71,7 @@ Covered by unit tests:
 - `latest_frame_queue_capacity_is_never_zero`
 - `capture_returns_latest_queued_frame`
 - `support_detection_matches_target_os`
+- `primary_monitor_size_is_available_on_windows`
 
 Smoke test:
 
@@ -80,9 +81,18 @@ cargo run -p desktop-client -- --mode broadcaster --capture-source primary-monit
 
 On Windows, expected output includes `capture_supported=true`.
 
+Live primary-monitor smoke test:
+
+```bash
+cargo run -p relay-server -- --listen 127.0.0.1:4433
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --screen-input live --media-frames 1 --media-fps 1
+```
+
+Expected output includes `screen_input=Live` and the captured `capture_width` / `capture_height`. The live frame currently feeds the synthetic H.264-like encoder so transport, stream config, timestamps, and relay metrics can be validated before hardware H.264 is added.
+
 ## Synthetic QUIC forwarding checks
 
-The current relay/client smoke path validates QUIC datagram media forwarding with synthetic H.264-like frames before live capture, hardware encoding, native decoding, or rendering exists.
+The current relay/client smoke path validates QUIC datagram media forwarding with synthetic H.264-like frames before hardware encoding, native decoding, or window rendering exists.
 
 Run:
 
@@ -112,7 +122,7 @@ Run in separate terminals:
 ```bash
 cargo run -p relay-server -- --listen 127.0.0.1:4433
 cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 5 --media-frame-bytes 800 --max-datagram-payload 700 --feedback-interval-frames 2
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-id 1 --media-run-ms 1000 --media-fps 5 --max-datagram-payload 700
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-run-ms 1000 --media-fps 5 --max-datagram-payload 700
 ```
 
 If the relay is started with `--access-token`, pass the same `--access-token` to both desktop-client commands.
@@ -141,7 +151,7 @@ Run in separate terminals after starting the relay:
 
 ```bash
 cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind voice --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --media-frame-bytes 96 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-id 1 --media-kind voice --media-run-ms 1000 --media-fps 50
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
 ```
 
 Expected behavior:
@@ -153,6 +163,6 @@ Expected behavior:
 
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, and synthetic capture-to-viewer latency. Later milestones add real capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
+Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, live primary-monitor acquisition, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, and synthetic capture-to-viewer latency. Later milestones add hardware encode, calibrated server receive/send, viewer receive, decode, and render timestamps.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.
