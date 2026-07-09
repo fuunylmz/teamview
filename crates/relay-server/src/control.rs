@@ -32,6 +32,7 @@ const MIN_TARGET_HEIGHT: u32 = 180;
 const MAX_TARGET_WIDTH: u32 = 7680;
 const MAX_TARGET_HEIGHT: u32 = 4320;
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
+const MAX_ROOM_NAME_CHARS: usize = 64;
 pub const DEFAULT_MAX_ROOMS: usize = 128;
 pub const DEFAULT_MAX_PARTICIPANTS_PER_ROOM: usize = 64;
 pub const DEFAULT_MAX_STREAMS_PER_ROOM: usize = 8;
@@ -220,13 +221,14 @@ impl ControlState {
                     }
                     let room_id = self.next_room_id;
                     self.next_room_id += 1;
-                    let mut room = Room::new(room_id, &create.name);
+                    let room_name = sanitize_room_name(&create.name, room_id);
+                    let mut room = Room::new(room_id, &room_name);
                     room.join(user_id);
                     self.rooms.insert(room_id, room);
                     self.ensure_voice_state(room_id, user_id);
                     ServerControl::RoomCreated(RoomCreated {
                         room_id,
-                        name: create.name,
+                        name: room_name,
                     })
                 }
                 None => {
@@ -1199,18 +1201,32 @@ fn clamp_target_resolution(width: u32, height: u32) -> (u32, u32) {
 }
 
 fn sanitize_display_name(raw_name: &str, user_id: UserId) -> String {
+    sanitize_human_name(raw_name, MAX_DISPLAY_NAME_CHARS, || {
+        format!("user-{user_id}")
+    })
+}
+
+fn sanitize_room_name(raw_name: &str, room_id: RoomId) -> String {
+    sanitize_human_name(raw_name, MAX_ROOM_NAME_CHARS, || format!("room-{room_id}"))
+}
+
+fn sanitize_human_name(
+    raw_name: &str,
+    max_chars: usize,
+    fallback: impl FnOnce() -> String,
+) -> String {
     let mut name = String::new();
     let mut previous_was_space = false;
     let mut char_count = 0;
 
     for ch in raw_name.trim().chars() {
-        if char_count >= MAX_DISPLAY_NAME_CHARS {
+        if char_count >= max_chars {
             break;
         }
-        let next = if ch.is_control() {
-            continue;
-        } else if ch.is_whitespace() {
+        let next = if ch.is_whitespace() {
             ' '
+        } else if ch.is_control() {
+            continue;
         } else {
             ch
         };
@@ -1224,7 +1240,7 @@ fn sanitize_display_name(raw_name: &str, user_id: UserId) -> String {
 
     let name = name.trim();
     if name.is_empty() {
-        format!("user-{user_id}")
+        fallback()
     } else {
         name.to_owned()
     }
@@ -1566,6 +1582,54 @@ mod tests {
         let room = state.room(room_id).unwrap();
         assert!(room.participants.contains(&session.user_id.unwrap()));
         assert_eq!(room.participants.len(), 1);
+    }
+
+    #[test]
+    fn create_room_sanitizes_room_name() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+        authenticate(&mut state, &mut session, "creator");
+
+        let response = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                2,
+                ClientControl::CreateRoom(CreateRoom {
+                    name: "  Stage\t\tOne\nRoom  ".to_owned(),
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::RoomCreated(room) => {
+                assert_eq!(room.room_id, 1);
+                assert_eq!(room.name, "Stage One Room");
+                assert_eq!(state.room(room.room_id).unwrap().name, "Stage One Room");
+            }
+            other => panic!("unexpected create room response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blank_room_name_falls_back_to_room_id() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+        authenticate(&mut state, &mut session, "creator");
+
+        let room_id = create_room(&mut state, &mut session, " \t\n ");
+
+        assert_eq!(room_id, 1);
+        assert_eq!(state.room(room_id).unwrap().name, "room-1");
+    }
+
+    #[test]
+    fn room_name_is_bounded() {
+        let long_name = "a".repeat(MAX_ROOM_NAME_CHARS + 8);
+
+        assert_eq!(
+            sanitize_room_name(&long_name, 7).chars().count(),
+            MAX_ROOM_NAME_CHARS
+        );
     }
 
     #[test]
