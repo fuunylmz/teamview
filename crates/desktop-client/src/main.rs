@@ -65,6 +65,7 @@ const MIN_SYNTHETIC_PAYLOAD_BYTES: usize = 64;
 const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_TIME_SYNC_SAMPLES: u8 = 5;
 const DEFAULT_TIME_SYNC_SPACING_MS: u64 = 20;
+const DEFAULT_CHANNEL_NAME: &str = "stage1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -185,6 +186,12 @@ struct Args {
 
     #[arg(long, default_value = "stage1")]
     room_name: String,
+
+    #[arg(long)]
+    channel_id: Option<RoomId>,
+
+    #[arg(long)]
+    channel_name: Option<String>,
 
     #[arg(long, default_value_t = 1)]
     stream_id: StreamId,
@@ -665,12 +672,12 @@ async fn run_broadcaster_control_flow(
     args: &Args,
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
-    let room_id = match args.room_id {
+    let room_id = match args.selected_room_id()? {
         Some(room_id) => room_id,
         None => {
             let response = control
                 .send(ClientControl::CreateRoom(CreateRoom {
-                    name: args.room_name.clone(),
+                    name: args.selected_channel_name()?.to_owned(),
                 }))
                 .await?;
             print_control_response("create-room", &response);
@@ -881,18 +888,19 @@ async fn resolve_viewer_room_id(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<RoomId> {
-    if let Some(room_id) = args.room_id {
+    if let Some(room_id) = args.selected_room_id()? {
         return Ok(room_id);
     }
 
     let rooms = list_rooms(control).await?;
     if rooms.is_empty() {
-        bail!("no rooms are available; start a broadcaster first or pass --room-id");
+        bail!("no channels are available; start a broadcaster first or pass --channel-id");
     }
-    let selected = select_viewer_room(&rooms, &args.room_name).with_context(|| {
+    let channel_name = args.selected_channel_name()?;
+    let selected = select_viewer_room(&rooms, channel_name).with_context(|| {
         format!(
-            "no room matched name {:?}; available rooms: {}",
-            args.room_name,
+            "no channel matched name {:?}; available channels: {}",
+            channel_name,
             format_room_summaries(&rooms)
         )
     })?;
@@ -2811,6 +2819,29 @@ impl Args {
             .unwrap_or_else(|| format!("desktop-client/{:?}", self.mode))
     }
 
+    fn selected_room_id(&self) -> anyhow::Result<Option<RoomId>> {
+        match (self.room_id, self.channel_id) {
+            (Some(room_id), Some(channel_id)) if room_id != channel_id => {
+                bail!("--room-id and --channel-id must match when both are set")
+            }
+            (Some(room_id), _) => Ok(Some(room_id)),
+            (_, Some(channel_id)) => Ok(Some(channel_id)),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn selected_channel_name(&self) -> anyhow::Result<&str> {
+        match self.channel_name.as_deref() {
+            Some(channel_name)
+                if self.room_name != DEFAULT_CHANNEL_NAME && self.room_name != channel_name =>
+            {
+                bail!("--room-name and --channel-name must match when both are set")
+            }
+            Some(channel_name) => Ok(channel_name),
+            None => Ok(&self.room_name),
+        }
+    }
+
     fn synthetic_media_enabled(&self) -> bool {
         self.media_frames > 0 || self.media_run_ms > 0
     }
@@ -3176,6 +3207,48 @@ mod tests {
 
         assert_eq!(named.control_display_name(), "Alice Screenshare");
         assert_eq!(default.control_display_name(), "desktop-client/Viewer");
+    }
+
+    #[test]
+    fn channel_aliases_select_room_options() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--channel-id",
+            "42",
+            "--channel-name",
+            "ops-live",
+        ])
+        .unwrap();
+
+        assert_eq!(args.selected_room_id().unwrap(), Some(42));
+        assert_eq!(args.selected_channel_name().unwrap(), "ops-live");
+    }
+
+    #[test]
+    fn room_and_channel_ids_must_match() {
+        let args =
+            Args::try_parse_from(["desktop-client", "--room-id", "41", "--channel-id", "42"])
+                .unwrap();
+
+        let error = args.selected_room_id().unwrap_err();
+
+        assert!(error.to_string().contains("--channel-id"));
+    }
+
+    #[test]
+    fn room_and_channel_names_must_match_when_room_name_is_overridden() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--room-name",
+            "stage1-old",
+            "--channel-name",
+            "stage1",
+        ])
+        .unwrap();
+
+        let error = args.selected_channel_name().unwrap_err();
+
+        assert!(error.to_string().contains("--channel-name"));
     }
 
     #[test]

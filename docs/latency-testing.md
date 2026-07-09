@@ -163,7 +163,7 @@ Run in separate terminals:
 ```bash
 cargo run -p relay-server -- --listen 127.0.0.1:4433
 cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 5 --media-frame-bytes 800 --max-datagram-payload 700 --feedback-interval-frames 2
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-run-ms 1000 --media-fps 5 --max-datagram-payload 700
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-run-ms 1000 --media-fps 5 --max-datagram-payload 700
 ```
 
 For a visible preview, add `--render-output window` to the viewer command.
@@ -202,7 +202,7 @@ Run in separate terminals after starting the relay:
 
 ```bash
 cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind voice --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --media-frame-bytes 96 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
 ```
 
 For audible local playback, add `--audio-output speaker` to the viewer command. The default `sink` mode keeps smoke tests quiet and records only the latest played-frame summary.
@@ -213,8 +213,8 @@ To inspect the current room presence and voice state without subscribing to medi
 
 ```bash
 cargo run -p desktop-client -- --list-rooms
-cargo run -p desktop-client -- --list-streams --room-name stage1
-cargo run -p desktop-client -- --list-participants --room-name stage1 --display-name Alice
+cargo run -p desktop-client -- --list-streams --channel-name stage1
+cargo run -p desktop-client -- --list-participants --channel-name stage1 --display-name Alice
 ```
 
 Expected behavior:
@@ -231,13 +231,13 @@ Expected behavior:
 
 ## Desktop dual-stream broadcaster/viewer checks
 
-The broadcaster can publish screen and voice streams together from one QUIC connection with `--media-kind both`. The screen stream uses `--stream-id`; the voice stream uses `--voice-stream-id` or defaults to the next stream id. A viewer can subscribe to both selected streams from one process and demux forwarded media packets by stream id.
+The broadcaster can publish channel screen sharing and channel voice together from one QUIC connection with `--channel-name` and `--media-kind both`. The screen stream uses `--stream-id`; the voice stream uses `--voice-stream-id` or defaults to the next stream id. A viewer can subscribe to both selected streams from one process and demux forwarded media packets by stream id.
 
 Run in separate terminals after starting the relay:
 
 ```bash
-cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 30 --media-frame-bytes 800 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-fps 30
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 30 --media-frame-bytes 800 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --stream-id 1 --voice-stream-id 2 --media-run-ms 1000 --media-fps 30
 ```
 
 Expected behavior:
@@ -253,8 +253,8 @@ On Windows, the broadcaster can use a real microphone source instead of syntheti
 Run in separate terminals after starting the relay and choosing an id from `--list-audio-sources`:
 
 ```bash
-cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind voice --voice-input microphone --microphone-id 0 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --voice-input microphone --microphone-id 0 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --channel-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
 ```
 
 Add `--audio-output speaker` to the viewer to hear the decoded microphone PCM through the default Windows speaker.
