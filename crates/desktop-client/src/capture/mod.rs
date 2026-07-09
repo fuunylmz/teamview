@@ -57,6 +57,77 @@ impl CaptureFrame {
             .and_then(|pixels| pixels.checked_mul(4))
             .ok_or_else(|| anyhow::anyhow!("BGRA frame dimensions are too large"))
     }
+
+    pub fn resize_bgra_nearest(self, width: u32, height: u32) -> anyhow::Result<Self> {
+        if width == 0 || height == 0 {
+            anyhow::bail!("resize target dimensions must be non-zero");
+        }
+        if self.width == width && self.height == height {
+            return Ok(self);
+        }
+
+        let Self {
+            frame_id,
+            width: source_width,
+            height: source_height,
+            capture_time_micros,
+            format,
+            storage,
+        } = self;
+
+        let CaptureFrameStorage::CpuBytes(source_pixels) = storage else {
+            return Ok(Self::metadata_only(
+                frame_id,
+                width,
+                height,
+                capture_time_micros,
+            ));
+        };
+        if format != CapturePixelFormat::Bgra8 {
+            return Ok(Self::metadata_only(
+                frame_id,
+                width,
+                height,
+                capture_time_micros,
+            ));
+        }
+        let expected_len = Self::bgra_byte_len(source_width, source_height)?;
+        if source_pixels.len() != expected_len {
+            anyhow::bail!(
+                "BGRA frame buffer length {} does not match {}x{}x4 ({})",
+                source_pixels.len(),
+                source_width,
+                source_height,
+                expected_len
+            );
+        }
+        let bytes =
+            resize_bgra_nearest(&source_pixels, source_width, source_height, width, height)?;
+        Self::cpu_bgra(frame_id, width, height, capture_time_micros, bytes)
+    }
+}
+
+fn resize_bgra_nearest(
+    source_pixels: &[u8],
+    source_width: u32,
+    source_height: u32,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<Vec<u8>> {
+    let byte_len = CaptureFrame::bgra_byte_len(width, height)?;
+    let mut resized = Vec::with_capacity(byte_len);
+    for y in 0..height {
+        let source_y = y as u64 * source_height as u64 / height as u64;
+        for x in 0..width {
+            let source_x = x as u64 * source_width as u64 / width as u64;
+            let offset = ((source_y * source_width as u64 + source_x) * 4) as usize;
+            let Some(pixel) = source_pixels.get(offset..offset + 4) else {
+                anyhow::bail!("BGRA frame buffer is shorter than expected");
+            };
+            resized.extend_from_slice(pixel);
+        }
+    }
+    Ok(resized)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,5 +261,40 @@ mod tests {
 
         let error = CaptureFrame::cpu_bgra(1, 2, 2, 10, vec![0; 15]).unwrap_err();
         assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn cpu_bgra_frames_resize_with_nearest_neighbor() {
+        let frame = CaptureFrame::cpu_bgra(
+            7,
+            2,
+            2,
+            10,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        )
+        .unwrap();
+
+        let resized = frame.resize_bgra_nearest(1, 1).unwrap();
+
+        assert_eq!(resized.frame_id, 7);
+        assert_eq!(resized.width, 1);
+        assert_eq!(resized.height, 1);
+        assert_eq!(resized.capture_time_micros, 10);
+        assert_eq!(
+            resized.storage,
+            CaptureFrameStorage::CpuBytes(vec![1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn metadata_frames_resize_by_updating_dimensions() {
+        let frame = CaptureFrame::metadata_only(7, 1280, 720, 10);
+
+        let resized = frame.resize_bgra_nearest(640, 360).unwrap();
+
+        assert_eq!(resized.frame_id, 7);
+        assert_eq!(resized.width, 640);
+        assert_eq!(resized.height, 360);
+        assert_eq!(resized.storage, CaptureFrameStorage::MetadataOnly);
     }
 }

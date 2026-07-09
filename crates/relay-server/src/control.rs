@@ -26,6 +26,10 @@ const MAX_TARGET_BITRATE_BPS: u32 = 16_000_000;
 const MIN_TARGET_FRAMES_PER_SECOND: u16 = 5;
 const MAX_TARGET_FRAMES_PER_SECOND: u16 = 120;
 const DEGRADED_BITRATE_PERCENT: u32 = 80;
+const MIN_TARGET_WIDTH: u32 = 320;
+const MIN_TARGET_HEIGHT: u32 = 180;
+const MAX_TARGET_WIDTH: u32 = 7680;
+const MAX_TARGET_HEIGHT: u32 = 4320;
 
 #[derive(Debug, Default)]
 pub struct ControlState {
@@ -42,6 +46,8 @@ pub struct ControlState {
 struct StreamTarget {
     bitrate_bps: u32,
     frames_per_second: u16,
+    width: u32,
+    height: u32,
 }
 
 impl ControlState {
@@ -187,6 +193,8 @@ impl ControlState {
                                     config: None,
                                     target_bitrate_bps: DEFAULT_TARGET_BITRATE_BPS,
                                     target_frames_per_second: DEFAULT_TARGET_FRAMES_PER_SECOND,
+                                    target_width: 0,
+                                    target_height: 0,
                                 });
                                 ServerControl::StreamPublished(StreamPublished {
                                     room_id: publish.room_id,
@@ -478,6 +486,8 @@ impl ControlState {
             stream_id,
             aggregate_available_bitrate_bps: target.bitrate_bps,
             target_frames_per_second: target.frames_per_second,
+            target_width: target.width,
+            target_height: target.height,
             degraded_viewer_count,
             total_viewer_count,
             keyframe_requested,
@@ -497,6 +507,8 @@ impl ControlState {
             let reduced_bitrate = target.bitrate_bps.saturating_mul(DEGRADED_BITRATE_PERCENT) / 100;
             let new_bitrate = reduced_bitrate.max(MIN_TARGET_BITRATE_BPS);
             let mut new_fps = target.frames_per_second;
+            let mut new_width = target.width;
+            let mut new_height = target.height;
             if new_bitrate == target.bitrate_bps
                 && target.frames_per_second > MIN_TARGET_FRAMES_PER_SECOND
             {
@@ -506,9 +518,18 @@ impl ControlState {
                     / 100;
                 new_fps = new_fps.max(MIN_TARGET_FRAMES_PER_SECOND);
             }
-            self.update_stream_target(stream_id, new_bitrate, new_fps);
+            if new_bitrate == target.bitrate_bps && new_fps == target.frames_per_second {
+                (new_width, new_height) = reduce_resolution(target.width, target.height);
+            }
+            self.update_stream_target(stream_id, new_bitrate, new_fps, new_width, new_height);
             feedback.aggregate_available_bitrate_bps = new_bitrate;
             feedback.target_frames_per_second = new_fps;
+            feedback.target_width = new_width;
+            feedback.target_height = new_height;
+            if (new_width, new_height) != (target.width, target.height) {
+                self.register_keyframe_request(stream_id, KeyframeReason::StreamConfigChanged);
+                feedback.keyframe_requested = true;
+            }
         }
         feedback
     }
@@ -518,10 +539,14 @@ impl ControlState {
             .map(|stream| StreamTarget {
                 bitrate_bps: stream.target_bitrate_bps,
                 frames_per_second: stream.target_frames_per_second,
+                width: stream.target_width,
+                height: stream.target_height,
             })
             .unwrap_or(StreamTarget {
                 bitrate_bps: DEFAULT_TARGET_BITRATE_BPS,
                 frames_per_second: DEFAULT_TARGET_FRAMES_PER_SECOND,
+                width: 0,
+                height: 0,
             })
     }
 
@@ -530,6 +555,8 @@ impl ControlState {
         stream_id: StreamId,
         bitrate_bps: u32,
         frames_per_second: u16,
+        width: u32,
+        height: u32,
     ) {
         let Some(stream) = self
             .rooms
@@ -542,8 +569,13 @@ impl ControlState {
             bitrate_bps.clamp(MIN_TARGET_BITRATE_BPS, MAX_TARGET_BITRATE_BPS);
         stream.target_frames_per_second =
             frames_per_second.clamp(MIN_TARGET_FRAMES_PER_SECOND, MAX_TARGET_FRAMES_PER_SECOND);
+        let (width, height) = clamp_target_resolution(width, height);
+        stream.target_width = width;
+        stream.target_height = height;
         if let Some(config) = &mut stream.config {
             config.frames_per_second = stream.target_frames_per_second;
+            config.width = stream.target_width;
+            config.height = stream.target_height;
         }
     }
 
@@ -616,7 +648,7 @@ impl ControlState {
         }
     }
 
-    fn set_stream_config(&mut self, session: &Session, config: StreamConfig) -> ServerControl {
+    fn set_stream_config(&mut self, session: &Session, mut config: StreamConfig) -> ServerControl {
         let Some(user_id) = session.user_id else {
             return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
         };
@@ -647,6 +679,12 @@ impl ControlState {
         stream.target_frames_per_second = config
             .frames_per_second
             .clamp(MIN_TARGET_FRAMES_PER_SECOND, MAX_TARGET_FRAMES_PER_SECOND);
+        let (target_width, target_height) = clamp_target_resolution(config.width, config.height);
+        stream.target_width = target_width;
+        stream.target_height = target_height;
+        config.frames_per_second = stream.target_frames_per_second;
+        config.width = stream.target_width;
+        config.height = stream.target_height;
         stream.config = Some(config.clone());
         ServerControl::StreamConfig(config)
     }
@@ -659,7 +697,13 @@ impl ControlState {
             let bitrate_bps = target
                 .bitrate_bps
                 .clamp(MIN_TARGET_BITRATE_BPS, MAX_TARGET_BITRATE_BPS);
-            self.update_stream_target(target.stream_id, bitrate_bps, current.frames_per_second);
+            self.update_stream_target(
+                target.stream_id,
+                bitrate_bps,
+                current.frames_per_second,
+                current.width,
+                current.height,
+            );
             return ServerControl::PublisherFeedback(
                 self.aggregate_publisher_feedback(target.room_id, target.stream_id),
             );
@@ -679,7 +723,13 @@ impl ControlState {
             let frames_per_second = target
                 .frames_per_second
                 .clamp(MIN_TARGET_FRAMES_PER_SECOND, MAX_TARGET_FRAMES_PER_SECOND);
-            self.update_stream_target(target.stream_id, current.bitrate_bps, frames_per_second);
+            self.update_stream_target(
+                target.stream_id,
+                current.bitrate_bps,
+                frames_per_second,
+                current.width,
+                current.height,
+            );
             return ServerControl::PublisherFeedback(
                 self.aggregate_publisher_feedback(target.room_id, target.stream_id),
             );
@@ -870,6 +920,34 @@ fn viewer_latency_ms(report: &ViewerStatsReport) -> u16 {
     } else {
         report.estimated_latency_ms
     }
+}
+
+fn reduce_resolution(width: u32, height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (width, height);
+    }
+    let reduced_width = width.saturating_mul(DEGRADED_BITRATE_PERCENT) / 100;
+    let mut new_width = reduced_width.max(MIN_TARGET_WIDTH).min(width);
+    let mut new_height = (new_width as u64 * height as u64 / width.max(1) as u64) as u32;
+    new_height = new_height.max(MIN_TARGET_HEIGHT).min(height);
+    if new_height == height && new_width == width {
+        return (width, height);
+    }
+    if new_height == height {
+        new_width = (new_height as u64 * width as u64 / height.max(1) as u64) as u32;
+        new_width = new_width.max(MIN_TARGET_WIDTH).min(width);
+    }
+    clamp_target_resolution(new_width, new_height)
+}
+
+fn clamp_target_resolution(width: u32, height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (0, 0);
+    }
+    (
+        width.clamp(MIN_TARGET_WIDTH, MAX_TARGET_WIDTH),
+        height.clamp(MIN_TARGET_HEIGHT, MAX_TARGET_HEIGHT),
+    )
 }
 
 #[cfg(test)]
@@ -1157,6 +1235,9 @@ mod tests {
                     stream.target_frames_per_second,
                     DEFAULT_TARGET_FRAMES_PER_SECOND
                 );
+                let published = state.published_stream(9).unwrap();
+                assert_eq!(published.target_width, 1280);
+                assert_eq!(published.target_height, 720);
             }
             other => panic!("unexpected stream list response: {other:?}"),
         }
@@ -1568,6 +1649,8 @@ mod tests {
             ServerControl::PublisherFeedback(feedback) => {
                 assert_eq!(feedback.aggregate_available_bitrate_bps, 96_000);
                 assert_eq!(feedback.target_frames_per_second, 30);
+                assert_eq!(feedback.target_width, 0);
+                assert_eq!(feedback.target_height, 0);
             }
             other => panic!("unexpected target bitrate response: {other:?}"),
         }
@@ -1587,6 +1670,8 @@ mod tests {
             ServerControl::PublisherFeedback(feedback) => {
                 assert_eq!(feedback.aggregate_available_bitrate_bps, 96_000);
                 assert_eq!(feedback.target_frames_per_second, 12);
+                assert_eq!(feedback.target_width, 0);
+                assert_eq!(feedback.target_height, 0);
             }
             other => panic!("unexpected target framerate response: {other:?}"),
         }
@@ -1679,6 +1764,97 @@ mod tests {
                 assert_eq!(feedback.aggregate_available_bitrate_bps, 80_000);
                 assert_eq!(feedback.degraded_viewer_count, 1);
                 assert!(feedback.keyframe_requested);
+            }
+            other => panic!("unexpected degraded feedback response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn degraded_majority_reduces_resolution_after_bitrate_and_fps_floor() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                6,
+                ClientControl::SetStreamConfig(sample_stream_config(room_id, 9)),
+            ),
+        );
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+        state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                7,
+                ClientControl::SetTargetBitrate(SetTargetBitrate {
+                    room_id,
+                    stream_id: 9,
+                    bitrate_bps: MIN_TARGET_BITRATE_BPS,
+                }),
+            ),
+        );
+        state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                8,
+                ClientControl::SetTargetFramerate(SetTargetFramerate {
+                    room_id,
+                    stream_id: 9,
+                    frames_per_second: MIN_TARGET_FRAMES_PER_SECOND,
+                }),
+            ),
+        );
+        state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                9,
+                ClientControl::ViewerStats(ViewerStatsReport {
+                    room_id,
+                    stream_id: 9,
+                    received_packets: 10,
+                    lost_packets: 0,
+                    decoded_frames: 4,
+                    dropped_frames: 0,
+                    jitter_buffer_ms: 160,
+                    estimated_latency_ms: 240,
+                    ..viewer_stats_report(room_id, 9)
+                }),
+            ),
+        );
+
+        let feedback = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                10,
+                ClientControl::PollPublisherFeedback(PollPublisherFeedback {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        match feedback.message {
+            ServerControl::PublisherFeedback(feedback) => {
+                assert_eq!(
+                    feedback.aggregate_available_bitrate_bps,
+                    MIN_TARGET_BITRATE_BPS
+                );
+                assert_eq!(
+                    feedback.target_frames_per_second,
+                    MIN_TARGET_FRAMES_PER_SECOND
+                );
+                assert_eq!(feedback.target_width, 1024);
+                assert_eq!(feedback.target_height, 576);
+                assert!(feedback.keyframe_requested);
+                let config = state.published_stream(9).unwrap().config.as_ref().unwrap();
+                assert_eq!(config.width, 1024);
+                assert_eq!(config.height, 576);
             }
             other => panic!("unexpected degraded feedback response: {other:?}"),
         }

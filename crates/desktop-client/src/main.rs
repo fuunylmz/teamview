@@ -690,6 +690,7 @@ async fn run_synthetic_screen_broadcaster_media(
     }
     let media_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
+    let (mut target_width, mut target_height) = args.screen_capture_dimensions()?;
 
     let mut capture =
         windows::WindowsGraphicsCapture::new(args.capture_source()?, args.capture_config())?;
@@ -697,6 +698,8 @@ async fn run_synthetic_screen_broadcaster_media(
     encoder.config.synthetic_payload_bytes = args.media_frame_bytes;
     encoder.config.bitrate_bps = args.synthetic_bitrate_bps();
     encoder.config.frames_per_second = args.media_fps;
+    encoder.config.width = target_width;
+    encoder.config.height = target_height;
     encoder.request_keyframe();
 
     let mut ticker = tokio::time::interval(frame_interval);
@@ -708,7 +711,8 @@ async fn run_synthetic_screen_broadcaster_media(
     for frame_id in 1..=media_frames {
         ticker.tick().await;
         let capture_start = Instant::now();
-        let Some(captured) = capture_screen_frame(&mut capture, args)? else {
+        let Some(captured) = capture_screen_frame(&mut capture, args, target_width, target_height)?
+        else {
             continue;
         };
         let capture_duration = capture_start.elapsed();
@@ -762,7 +766,25 @@ async fn run_synthetic_screen_broadcaster_media(
             if feedback.keyframe_requested {
                 encoder.request_keyframe();
             }
-            apply_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
+            let resolution_changed = apply_publisher_feedback(
+                &feedback,
+                &mut encoder,
+                &mut active_fps,
+                &mut target_width,
+                &mut target_height,
+                &mut ticker,
+            );
+            if resolution_changed {
+                set_screen_stream_config(
+                    control,
+                    room_id,
+                    args,
+                    target_width,
+                    target_height,
+                    active_fps,
+                )
+                .await?;
+            }
         }
     }
     let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
@@ -772,7 +794,25 @@ async fn run_synthetic_screen_broadcaster_media(
             feedback.stream_id, feedback.degraded_viewer_count, feedback.total_viewer_count
         );
     }
-    apply_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
+    let resolution_changed = apply_publisher_feedback(
+        &feedback,
+        &mut encoder,
+        &mut active_fps,
+        &mut target_width,
+        &mut target_height,
+        &mut ticker,
+    );
+    if resolution_changed {
+        set_screen_stream_config(
+            control,
+            room_id,
+            args,
+            target_width,
+            target_height,
+            active_fps,
+        )
+        .await?;
+    }
     let stream_metrics = poll_stream_metrics(control, room_id, args.stream_id).await?;
     println!(
         "stream-metrics stream_id={} ingress_packets={} ingress_bytes={} egress_queued={} egress_dropped={} egress_queue_packets={} egress_queue_media_ms={} subscribers={} last_ingress_time_micros={} server_route_ms_p50={} server_route_ms_p95={}",
@@ -813,14 +853,34 @@ async fn run_synthetic_screen_broadcaster_media(
 fn capture_screen_frame(
     capture: &mut windows::WindowsGraphicsCapture,
     args: &Args,
+    target_width: u32,
+    target_height: u32,
 ) -> anyhow::Result<Option<capture::CaptureFrame>> {
     match args.screen_input {
         ScreenInputArg::Synthetic => {
-            capture.push_test_frame(1280, 720, unix_time_micros());
+            capture.push_test_frame(
+                target_width.max(1),
+                target_height.max(1),
+                unix_time_micros(),
+            );
             capture.next_frame()
         }
-        ScreenInputArg::Live => capture.next_frame(),
+        ScreenInputArg::Live => capture
+            .next_frame()?
+            .map(|frame| resize_capture_frame(frame, target_width, target_height))
+            .transpose(),
     }
+}
+
+fn resize_capture_frame(
+    frame: capture::CaptureFrame,
+    target_width: u32,
+    target_height: u32,
+) -> anyhow::Result<capture::CaptureFrame> {
+    if target_width == 0 || target_height == 0 {
+        return Ok(frame);
+    }
+    frame.resize_bgra_nearest(target_width, target_height)
 }
 
 async fn run_synthetic_voice_broadcaster_media(
@@ -959,13 +1019,44 @@ async fn set_publisher_target_media(
     Ok(())
 }
 
+async fn set_screen_stream_config(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    args: &Args,
+    width: u32,
+    height: u32,
+    frames_per_second: u16,
+) -> anyhow::Result<()> {
+    let config = StreamConfig {
+        room_id,
+        stream_id: args.stream_id,
+        codec: CodecId::H264,
+        width,
+        height,
+        frames_per_second,
+        timebase_hz: 90_000,
+    };
+    let response = control
+        .send(ClientControl::SetStreamConfig(config.clone()))
+        .await?;
+    print_control_response("set-stream-config", &response);
+    match response.message {
+        ServerControl::StreamConfig(returned) if returned == config => Ok(()),
+        ServerControl::Error(error) => bail!("set stream config failed: {}", error.message),
+        other => bail!("unexpected stream config response: {other:?}"),
+    }
+}
+
 fn apply_publisher_feedback(
     feedback: &PublisherFeedback,
     encoder: &mut H264Encoder,
     active_fps: &mut u16,
+    target_width: &mut u32,
+    target_height: &mut u32,
     ticker: &mut tokio::time::Interval,
-) {
+) -> bool {
     let mut adapted = false;
+    let mut resolution_changed = false;
     let target_bitrate = feedback.aggregate_available_bitrate_bps;
     if target_bitrate > 0 && target_bitrate != encoder.config.bitrate_bps {
         encoder.update_bitrate(target_bitrate);
@@ -982,15 +1073,30 @@ fn apply_publisher_feedback(
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         adapted = true;
     }
+    if feedback.target_width > 0
+        && feedback.target_height > 0
+        && (feedback.target_width != *target_width || feedback.target_height != *target_height)
+    {
+        *target_width = feedback.target_width;
+        *target_height = feedback.target_height;
+        encoder.config.width = *target_width;
+        encoder.config.height = *target_height;
+        encoder.request_keyframe();
+        adapted = true;
+        resolution_changed = true;
+    }
     if adapted {
         println!(
-            "publisher-adapt stream_id={} bitrate_bps={} fps={} frame_bytes={}",
+            "publisher-adapt stream_id={} bitrate_bps={} fps={} width={} height={} frame_bytes={}",
             feedback.stream_id,
             encoder.config.bitrate_bps,
             *active_fps,
+            *target_width,
+            *target_height,
             encoder.config.synthetic_payload_bytes
         );
     }
+    resolution_changed
 }
 
 fn apply_audio_publisher_feedback(
@@ -1733,6 +1839,46 @@ mod tests {
             select_best_clock_sync_estimate(&samples),
             Some((2, samples[1].1))
         );
+    }
+
+    #[tokio::test]
+    async fn publisher_feedback_updates_screen_resolution_target() {
+        let feedback = PublisherFeedback {
+            room_id: 1,
+            stream_id: 9,
+            aggregate_available_bitrate_bps: 2_000_000,
+            target_frames_per_second: 24,
+            target_width: 1024,
+            target_height: 576,
+            degraded_viewer_count: 1,
+            total_viewer_count: 1,
+            keyframe_requested: true,
+        };
+        let mut encoder = H264Encoder::default();
+        encoder.config.bitrate_bps = 4_000_000;
+        encoder.config.synthetic_payload_bytes = 512;
+        let mut active_fps = 30;
+        let mut target_width = 1280;
+        let mut target_height = 720;
+        let mut ticker = tokio::time::interval(Duration::from_millis(33));
+
+        let resolution_changed = apply_publisher_feedback(
+            &feedback,
+            &mut encoder,
+            &mut active_fps,
+            &mut target_width,
+            &mut target_height,
+            &mut ticker,
+        );
+
+        assert!(resolution_changed);
+        assert_eq!(encoder.config.bitrate_bps, 2_000_000);
+        assert_eq!(active_fps, 24);
+        assert_eq!(target_width, 1024);
+        assert_eq!(target_height, 576);
+        assert_eq!(encoder.config.width, 1024);
+        assert_eq!(encoder.config.height, 576);
+        assert!(encoder.keyframe_requested);
     }
 
     #[test]

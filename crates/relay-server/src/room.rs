@@ -94,6 +94,8 @@ pub struct PublishedStream {
     pub config: Option<StreamConfig>,
     pub target_bitrate_bps: u32,
     pub target_frames_per_second: u16,
+    pub target_width: u32,
+    pub target_height: u32,
 }
 
 #[cfg(test)]
@@ -111,6 +113,8 @@ mod tests {
             config: None,
             target_bitrate_bps: 4_000_000,
             target_frames_per_second: 30,
+            target_width: 1280,
+            target_height: 720,
         });
         room.publish_stream(PublishedStream {
             stream_id: 7,
@@ -120,6 +124,8 @@ mod tests {
             config: None,
             target_bitrate_bps: 4_000_000,
             target_frames_per_second: 30,
+            target_width: 1280,
+            target_height: 720,
         });
 
         assert_eq!(room.published_streams.len(), 1);
@@ -138,6 +144,8 @@ mod tests {
             config: None,
             target_bitrate_bps: 4_000_000,
             target_frames_per_second: 30,
+            target_width: 1280,
+            target_height: 720,
         });
         assert!(room.subscribe(9, 2));
     }
@@ -154,6 +162,8 @@ mod tests {
             config: None,
             target_bitrate_bps: 4_000_000,
             target_frames_per_second: 30,
+            target_width: 1280,
+            target_height: 720,
         });
         assert!(room.subscribe(9, 2));
 
@@ -179,6 +189,8 @@ mod tests {
             config: None,
             target_bitrate_bps: 4_000_000,
             target_frames_per_second: 30,
+            target_width: 1280,
+            target_height: 720,
         });
 
         assert!(!room.is_empty());

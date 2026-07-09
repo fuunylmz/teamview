@@ -177,7 +177,7 @@ Expected behavior:
 - New subscribers, packet loss, and decoder recovery can register keyframe requests with the relay.
 - The broadcaster polls aggregated `PublisherFeedback`; when feedback requests a keyframe, the synthetic encoder marks the next frame as a keyframe.
 - The broadcaster polls relay `StreamMetrics` at the end of the run to report server-observed ingress, cumulative queued/dropped egress datagrams, current egress queue packet/media depth, and server route p50/p95 timing.
-- When most viewers are degraded by packet loss, dropped frames, excessive jitter/latency, slow reassembly/decode/render p95, or low render FPS, relay feedback lowers the synthetic target bitrate, and the broadcaster shrinks subsequent synthetic frame payloads.
+- When most viewers are degraded by packet loss, dropped frames, excessive jitter/latency, slow reassembly/decode/render p95, or low render FPS, relay feedback lowers the synthetic target bitrate, then framerate, then screen resolution when the earlier targets are already at their floor. The broadcaster shrinks subsequent synthetic frame payloads, rescales screen frames when needed, emits a keyframe after a resolution change, and updates `StreamConfig`.
 - The viewer unsubscribes and leaves on normal exit; when the last participant leaves, the relay removes the empty room from subsequent discovery.
 - The final viewer summary reports zero loss and drops on a healthy local run.
 

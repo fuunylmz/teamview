@@ -279,6 +279,8 @@ pub struct PublisherFeedback {
     pub stream_id: StreamId,
     pub aggregate_available_bitrate_bps: u32,
     pub target_frames_per_second: u16,
+    pub target_width: u32,
+    pub target_height: u32,
     pub degraded_viewer_count: u32,
     pub total_viewer_count: u32,
     pub keyframe_requested: bool,
@@ -478,6 +480,28 @@ mod tests {
 
         assert_eq!(decode_client_envelope(&encoded_request).unwrap(), request);
         assert_eq!(decode_server_envelope(&encoded_response).unwrap(), response);
+    }
+
+    #[test]
+    fn publisher_feedback_round_trips_from_server() {
+        let envelope = ServerEnvelope::new(
+            8,
+            ServerControl::PublisherFeedback(PublisherFeedback {
+                room_id: 1,
+                stream_id: 9,
+                aggregate_available_bitrate_bps: 1_200_000,
+                target_frames_per_second: 24,
+                target_width: 1280,
+                target_height: 720,
+                degraded_viewer_count: 1,
+                total_viewer_count: 3,
+                keyframe_requested: true,
+            }),
+        );
+
+        let encoded = encode_server_envelope(&envelope).unwrap();
+
+        assert_eq!(decode_server_envelope(&encoded).unwrap(), envelope);
     }
 
     #[test]

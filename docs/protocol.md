@@ -47,7 +47,7 @@ Current control messages cover:
 - stream metrics
 - publisher feedback
 - viewer stats
-- target bitrate/framerate updates
+- target bitrate/framerate/resolution updates
 
 JSON-line framing is intentionally a Stage 1 choice. Later stages can replace it with a compact binary serializer or length-prefixed binary envelope without changing the room/control state machine.
 
@@ -55,13 +55,13 @@ When the relay is started with an access token, clients must send `Authenticate`
 
 `TimeSync` echoes the client's send timestamp and returns relay receive/send Unix microsecond timestamps. The desktop client takes multiple startup samples, uses the client send/receive midpoint and relay receive/send midpoint for each sample, logs per-sample RTT and `clock_offset_micros`, and selects the lowest-RTT sample as the clock offset used by media timing. Later stages should add continuous filtering before treating capture-to-viewer values as production-grade calibrated latency.
 
-Viewers can discover active sessions before subscribing. `ListRooms` returns room ids, names, participant counts, and published stream counts. After joining a room, `ListStreams` returns stream ids, publisher ids, codec/media kind, subscriber counts, config availability, and current target bitrate/FPS. The desktop viewer uses these messages to select a room by `--room-name` when `--room-id` is not provided.
+Viewers can discover active sessions before subscribing. `ListRooms` returns room ids, names, participant counts, and published stream counts. After joining a room, `ListStreams` returns stream ids, publisher ids, codec/media kind, subscriber counts, config availability, and current target bitrate/FPS. The desktop viewer uses these messages to select a room by `--room-name` when `--room-id` is not provided, then polls `StreamConfig` for the current width/height.
 
 Room creators are automatically added as participants. `LeaveRoom` removes the user from participants and subscriptions; if the leaving user published streams, those streams and their viewer stats, metrics, keyframe requests, and subscriptions are removed too. Empty rooms are removed from discovery. The desktop client sends `UnsubscribeStream` and `LeaveRoom` during normal viewer shutdown, sends `LeaveRoom` during normal broadcaster shutdown, and the relay applies the same cleanup when a connection disconnects unexpectedly.
 
 Keyframe requests are accepted from subscribed viewers and are also registered automatically when a viewer first subscribes to a stream. The relay exposes those requests to the publisher through `PublisherFeedback.keyframe_requested`; the publisher consumes the pending request when it polls feedback and should make the next encoded video frame a keyframe.
 
-Publishers can set their current target bitrate and framerate. `PublisherFeedback` returns the relay's current bitrate/FPS target; if most subscribed viewers report degraded stats, the relay lowers the bitrate target before returning feedback so the publisher can adapt future encoded frames.
+Publishers can set their current target bitrate and framerate. `PublisherFeedback` returns the relay's current bitrate/FPS/resolution target; if most subscribed viewers report degraded stats, the relay lowers bitrate first, then framerate, then screen resolution once the earlier targets are already at their floor. The desktop publisher adapts future encoded frames and sends an updated `StreamConfig` when feedback changes width/height.
 
 `ViewerStats` carries packet counts, decoded/dropped frame counts, jitter, estimated capture-to-viewer latency, reassembly/decode/render p50 and p95 milliseconds, and render FPS. The relay treats packet loss, dropped frames, excessive jitter/latency, slow reassembly/decode/render p95, or low nonzero render FPS as degraded viewer signals for publisher feedback.
 
