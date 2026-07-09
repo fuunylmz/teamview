@@ -143,7 +143,7 @@ Add `--render-output window` to the viewer to display decoded BGRA frames in a n
 Expected output includes the broadcaster publishing `StreamConfig`, setting target bitrate/framerate, printing `media-send` lines with capture/encode/packetize/send timing, the viewer polling config before media, publisher feedback polling, relay `stream-metrics`, received frames with `latency_ms`, `media-render` lines, periodic `viewer-stats` responses, final `unsubscribe-stream` / `leave-room` responses, and a final viewer summary similar to:
 
 ```text
-stream-metrics stream_id=1 ingress_packets=10 ingress_bytes=... server_route_ms_p50=0 server_route_ms_p95=1
+stream-metrics stream_id=1 ingress_packets=10 ingress_bytes=... egress_queue_packets=0 egress_queue_media_ms=0 server_route_ms_p50=0 server_route_ms_p95=1
 media-summary role=broadcaster frames=5 packets=10 fps=5 run_ms=1000 capture_ms_p50=0 capture_ms_p95=1 encode_ms_p50=0 encode_ms_p95=1 packetize_ms_p50=0 packetize_ms_p95=0 send_ms_p50=0 send_ms_p95=0
 media-summary role=viewer frames=5 decoded=5 rendered=5 packets=10 lost=0 dropped=0 latency_ms=1 reassembly_ms_p50=0 reassembly_ms_p95=1 decode_ms_p50=0 decode_ms_p95=1 render_ms_p50=0 render_ms_p95=1 render_fps=5
 ```

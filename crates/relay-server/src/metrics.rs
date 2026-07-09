@@ -56,6 +56,8 @@ impl StreamForwardingMetrics {
             ingress_bytes: self.ingress_bytes,
             egress_queued_packets: self.egress_queued_packets,
             egress_dropped_packets: self.egress_dropped_packets,
+            egress_queue_packets: 0,
+            egress_queue_media_ms: 0,
             subscriber_count,
             last_ingress_time_micros: self.last_ingress_time_micros,
             server_route_ms_p50: self.server_route_samples_ms.percentile(50),

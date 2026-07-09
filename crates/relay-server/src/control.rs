@@ -1277,6 +1277,8 @@ mod tests {
                 assert_eq!(metrics.ingress_bytes, ingress_bytes as u64);
                 assert_eq!(metrics.egress_queued_packets, 1);
                 assert_eq!(metrics.egress_dropped_packets, 1);
+                assert_eq!(metrics.egress_queue_packets, 0);
+                assert_eq!(metrics.egress_queue_media_ms, 0);
                 assert_eq!(metrics.subscriber_count, 1);
                 assert_eq!(metrics.last_ingress_time_micros, 1_700_000);
                 assert_eq!(metrics.server_route_ms_p50, 4);

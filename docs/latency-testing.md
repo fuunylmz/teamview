@@ -175,7 +175,7 @@ Expected behavior:
 - The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.
 - New subscribers, packet loss, and decoder recovery can register keyframe requests with the relay.
 - The broadcaster polls aggregated `PublisherFeedback`; when feedback requests a keyframe, the synthetic encoder marks the next frame as a keyframe.
-- The broadcaster polls relay `StreamMetrics` at the end of the run to report server-observed ingress, queued/dropped egress datagrams, and server route p50/p95 timing.
+- The broadcaster polls relay `StreamMetrics` at the end of the run to report server-observed ingress, cumulative queued/dropped egress datagrams, current egress queue packet/media depth, and server route p50/p95 timing.
 - When most viewers are degraded by packet loss, dropped frames, excessive jitter/latency, slow reassembly/decode/render p95, or low render FPS, relay feedback lowers the synthetic target bitrate, and the broadcaster shrinks subsequent synthetic frame payloads.
 - The viewer unsubscribes and leaves on normal exit; when the last participant leaves, the relay removes the empty room from subsequent discovery.
 - The final viewer summary reports zero loss and drops on a healthy local run.
@@ -195,7 +195,7 @@ Expected behavior:
 
 - The broadcaster publishes an Opus voice stream config and prints `audio-send` lines with capture/encode/packetize/send timing.
 - The viewer prints `audio-recv` and `audio-play` lines for each decoded frame, including reassembly, decode/play timing, and playback FPS.
-- The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams with zero drops and server route timing percentiles.
+- The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams, zero drops, current egress queue depth, and server route timing percentiles.
 - The final viewer summary reports `kind=voice`, matching decoded and played frame counts, and zero loss on a healthy local run.
 
 ## Measurement plan

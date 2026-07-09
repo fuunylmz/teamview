@@ -217,11 +217,21 @@ impl ControlRuntime {
 
     async fn handle_control_bytes(&self, session: &mut Session, bytes: &[u8]) -> ServerEnvelope {
         match decode_client_envelope(bytes) {
-            Ok(envelope) => self
-                .state
-                .lock()
-                .await
-                .handle_client_envelope(session, envelope),
+            Ok(envelope) => {
+                let mut response = self
+                    .state
+                    .lock()
+                    .await
+                    .handle_client_envelope(session, envelope);
+                if let ServerControl::StreamMetrics(metrics) = &mut response.message {
+                    let state = self.state.lock().await;
+                    let media = self.media.lock().await;
+                    let depth = media.stream_egress_depth(&state, metrics.stream_id);
+                    metrics.egress_queue_packets = depth.queued_packets;
+                    metrics.egress_queue_media_ms = depth.queued_media_ms;
+                }
+                response
+            }
             Err(error) => {
                 error!(%error, "failed to decode control request");
                 ServerEnvelope::new(
@@ -655,6 +665,8 @@ mod tests {
                 assert_eq!(metrics.ingress_packets, 1);
                 assert_eq!(metrics.egress_queued_packets, 1);
                 assert_eq!(metrics.egress_dropped_packets, 0);
+                assert_eq!(metrics.egress_queue_packets, 0);
+                assert_eq!(metrics.egress_queue_media_ms, 0);
                 assert_eq!(metrics.subscriber_count, 1);
                 assert!(metrics.ingress_bytes > 0);
                 assert!(metrics.last_ingress_time_micros > 0);
