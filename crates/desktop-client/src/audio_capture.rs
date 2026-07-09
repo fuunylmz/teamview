@@ -1,10 +1,17 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(target_os = "windows")]
-use std::{mem, ptr};
+use std::{fmt, mem, ptr};
 
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Media::Audio::{WAVEINCAPSW, waveInGetDevCapsW, waveInGetNumDevs};
+use windows_sys::Win32::Media::Audio::{
+    CALLBACK_NULL, HWAVEIN, WAVE_FORMAT_PCM, WAVE_MAPPER, WAVEFORMATEX, WAVEHDR, WAVEINCAPSW,
+    WHDR_DONE, waveInAddBuffer, waveInClose, waveInGetDevCapsW, waveInGetNumDevs, waveInOpen,
+    waveInPrepareHeader, waveInReset, waveInStart, waveInStop, waveInUnprepareHeader,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MicrophoneSource {
@@ -136,16 +143,36 @@ pub struct WindowsMicrophoneCapture {
     config: AudioCaptureConfig,
     queue: LatestAudioCaptureQueue,
     next_frame_id: u64,
+    #[cfg(target_os = "windows")]
+    device: Option<Win32WaveInCapture>,
 }
 
 impl WindowsMicrophoneCapture {
     pub fn new(source: MicrophoneSource, config: AudioCaptureConfig) -> anyhow::Result<Self> {
         ensure_supported()?;
+        validate_capture_config(config)?;
         Ok(Self {
             source,
             config,
             queue: LatestAudioCaptureQueue::new(config.queue_capacity),
             next_frame_id: 1,
+            #[cfg(target_os = "windows")]
+            device: None,
+        })
+    }
+
+    pub fn open(source: MicrophoneSource, config: AudioCaptureConfig) -> anyhow::Result<Self> {
+        ensure_supported()?;
+        validate_capture_config(config)?;
+        #[cfg(target_os = "windows")]
+        let device = Some(Win32WaveInCapture::open(&source, config)?);
+        Ok(Self {
+            source,
+            config,
+            queue: LatestAudioCaptureQueue::new(config.queue_capacity),
+            next_frame_id: 1,
+            #[cfg(target_os = "windows")]
+            device,
         })
     }
 
@@ -184,7 +211,27 @@ impl WindowsMicrophoneCapture {
 
 impl MicrophoneCapture for WindowsMicrophoneCapture {
     fn next_frame(&mut self) -> anyhow::Result<Option<CapturedAudioFrame>> {
-        Ok(self.queue.pop_latest())
+        if let Some(frame) = self.queue.pop_latest() {
+            return Ok(Some(frame));
+        }
+
+        #[cfg(target_os = "windows")]
+        if let Some(device) = &mut self.device {
+            let Some(samples) = device.next_pcm_samples()? else {
+                return Ok(None);
+            };
+            let frame = CapturedAudioFrame::pcm_i16(
+                self.next_frame_id,
+                unix_time_micros(),
+                self.config.sample_rate_hz,
+                self.config.channel_count,
+                samples,
+            )?;
+            self.next_frame_id = self.next_frame_id.saturating_add(1);
+            return Ok(Some(frame));
+        }
+
+        Ok(None)
     }
 }
 
@@ -200,9 +247,228 @@ pub fn ensure_supported() -> anyhow::Result<()> {
     }
 }
 
+fn validate_capture_config(config: AudioCaptureConfig) -> anyhow::Result<()> {
+    if config.sample_rate_hz == 0 {
+        anyhow::bail!("audio capture sample rate must be non-zero");
+    }
+    if config.channel_count == 0 {
+        anyhow::bail!("audio capture channel count must be non-zero");
+    }
+    if config.frame_duration_ms == 0 {
+        anyhow::bail!("audio capture frame duration must be non-zero");
+    }
+    Ok(())
+}
+
 pub fn list_microphone_sources() -> anyhow::Result<Vec<MicrophoneSourceInfo>> {
     ensure_supported()?;
     list_microphone_sources_impl()
+}
+
+#[cfg(target_os = "windows")]
+struct Win32WaveInCapture {
+    handle: HWAVEIN,
+    buffers: Vec<WaveInBuffer>,
+    header_size: u32,
+    started: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl Win32WaveInCapture {
+    fn open(source: &MicrophoneSource, config: AudioCaptureConfig) -> anyhow::Result<Self> {
+        let device_id = wave_in_device_id(source)?;
+        let format = wave_format(config)?;
+        let mut handle: HWAVEIN = ptr::null_mut();
+        mm_result("waveInOpen", unsafe {
+            waveInOpen(&mut handle, device_id, &format, 0, 0, CALLBACK_NULL)
+        })?;
+
+        let mut capture = Self {
+            handle,
+            buffers: wave_in_buffers(config)?,
+            header_size: mem::size_of::<WAVEHDR>() as u32,
+            started: false,
+        };
+        capture.prepare_and_queue_buffers()?;
+        mm_result("waveInStart", unsafe { waveInStart(capture.handle) })?;
+        capture.started = true;
+        Ok(capture)
+    }
+
+    fn prepare_and_queue_buffers(&mut self) -> anyhow::Result<()> {
+        for buffer in &mut self.buffers {
+            mm_result("waveInPrepareHeader", unsafe {
+                waveInPrepareHeader(self.handle, &mut buffer.header, self.header_size)
+            })?;
+            buffer.prepared = true;
+            mm_result("waveInAddBuffer", unsafe {
+                waveInAddBuffer(self.handle, &mut buffer.header, self.header_size)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn next_pcm_samples(&mut self) -> anyhow::Result<Option<Vec<i16>>> {
+        for buffer_index in 0..self.buffers.len() {
+            let header_flags = self.buffers[buffer_index].header.dwFlags;
+            if header_flags & WHDR_DONE == 0 {
+                continue;
+            }
+
+            let recorded_bytes = self.buffers[buffer_index]
+                .header
+                .dwBytesRecorded
+                .min(self.buffers[buffer_index].data.len() as u32)
+                as usize;
+            let aligned_bytes = recorded_bytes - recorded_bytes % mem::size_of::<i16>();
+            let samples = self.buffers[buffer_index].data[..aligned_bytes]
+                .chunks_exact(mem::size_of::<i16>())
+                .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+                .collect::<Vec<_>>();
+            self.requeue_buffer(buffer_index)?;
+            if !samples.is_empty() {
+                return Ok(Some(samples));
+            }
+        }
+        Ok(None)
+    }
+
+    fn requeue_buffer(&mut self, buffer_index: usize) -> anyhow::Result<()> {
+        let buffer = &mut self.buffers[buffer_index];
+        buffer.header.dwBytesRecorded = 0;
+        buffer.header.dwFlags &= !WHDR_DONE;
+        mm_result("waveInAddBuffer", unsafe {
+            waveInAddBuffer(self.handle, &mut buffer.header, self.header_size)
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Win32WaveInCapture {
+    fn drop(&mut self) {
+        if self.started {
+            unsafe {
+                waveInStop(self.handle);
+            }
+        }
+        unsafe {
+            waveInReset(self.handle);
+        }
+        for buffer in &mut self.buffers {
+            if buffer.prepared {
+                unsafe {
+                    waveInUnprepareHeader(self.handle, &mut buffer.header, self.header_size);
+                }
+            }
+        }
+        unsafe {
+            waveInClose(self.handle);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl fmt::Debug for Win32WaveInCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Win32WaveInCapture")
+            .field("handle", &self.handle)
+            .field("buffers", &self.buffers.len())
+            .field("started", &self.started)
+            .finish()
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WaveInBuffer {
+    data: Vec<u8>,
+    header: WAVEHDR,
+    prepared: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn wave_in_buffers(config: AudioCaptureConfig) -> anyhow::Result<Vec<WaveInBuffer>> {
+    let bytes_per_sample = mem::size_of::<i16>();
+    let frame_samples = config
+        .sample_rate_hz
+        .saturating_mul(config.frame_duration_ms as u32)
+        .saturating_div(1_000)
+        .max(1) as usize;
+    let buffer_bytes = frame_samples
+        .checked_mul(config.channel_count as usize)
+        .and_then(|samples| samples.checked_mul(bytes_per_sample))
+        .ok_or_else(|| anyhow::anyhow!("audio capture buffer size overflow"))?;
+
+    let mut buffers = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let mut data = vec![0_u8; buffer_bytes];
+        let header = WAVEHDR {
+            lpData: data.as_mut_ptr(),
+            dwBufferLength: buffer_bytes.min(u32::MAX as usize) as u32,
+            dwBytesRecorded: 0,
+            dwUser: 0,
+            dwFlags: 0,
+            dwLoops: 0,
+            lpNext: ptr::null_mut(),
+            reserved: 0,
+        };
+        buffers.push(WaveInBuffer {
+            data,
+            header,
+            prepared: false,
+        });
+    }
+    Ok(buffers)
+}
+
+#[cfg(target_os = "windows")]
+fn wave_format(config: AudioCaptureConfig) -> anyhow::Result<WAVEFORMATEX> {
+    let bytes_per_sample = mem::size_of::<i16>() as u16;
+    let block_align = config
+        .channel_count
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| anyhow::anyhow!("audio block align overflow"))?;
+    let avg_bytes_per_sec = config
+        .sample_rate_hz
+        .checked_mul(block_align as u32)
+        .ok_or_else(|| anyhow::anyhow!("audio average bytes per second overflow"))?;
+
+    Ok(WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_PCM as u16,
+        nChannels: config.channel_count,
+        nSamplesPerSec: config.sample_rate_hz,
+        nAvgBytesPerSec: avg_bytes_per_sec,
+        nBlockAlign: block_align,
+        wBitsPerSample: bytes_per_sample * 8,
+        cbSize: 0,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn wave_in_device_id(source: &MicrophoneSource) -> anyhow::Result<u32> {
+    match source {
+        MicrophoneSource::Default => Ok(WAVE_MAPPER),
+        MicrophoneSource::Device { id } => id
+            .parse::<u32>()
+            .map_err(|error| anyhow::anyhow!("invalid microphone device id {id:?}: {error}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn mm_result(action: &str, result: u32) -> anyhow::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        anyhow::bail!("{action} failed with MMRESULT {}", result)
+    }
+}
+
+fn unix_time_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_micros()
+        .min(u64::MAX as u128) as u64
 }
 
 #[cfg(target_os = "windows")]

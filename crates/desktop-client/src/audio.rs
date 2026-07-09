@@ -2,6 +2,7 @@ use bytes::Bytes;
 use teamview_protocol::{codec::CodecId, frame::EncodedFrame};
 
 const SYNTHETIC_OPUS_MAGIC: &[u8; 4] = b"TVO1";
+const PCM_PAYLOAD_MAGIC: &[u8; 4] = b"TVP1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticOpusEncoderConfig {
@@ -48,6 +49,82 @@ impl SyntheticOpusEncoder {
             bytes.push(
                 frame_id
                     .wrapping_mul(31)
+                    .wrapping_add(bytes.len() as u32)
+                    .to_le_bytes()[0],
+            );
+        }
+
+        Ok(EncodedFrame {
+            room_stream_id: stream_id,
+            frame_id,
+            media_timestamp: frame_id.saturating_mul(sample_count as u32) as u64,
+            sender_capture_time_micros: capture_time_micros,
+            sender_clock_offset_micros: 0,
+            sender_encode_done_time_micros: 0,
+            sender_send_time_micros: 0,
+            server_receive_time_micros: 0,
+            server_send_time_micros: 0,
+            codec: CodecId::Opus,
+            is_keyframe: false,
+            bytes: Bytes::from(bytes),
+        })
+    }
+
+    pub fn encode_pcm_i16(
+        &self,
+        frame_id: u32,
+        capture_time_micros: u64,
+        sample_rate_hz: u32,
+        channel_count: u16,
+        samples: &[i16],
+        stream_id: u32,
+    ) -> anyhow::Result<EncodedFrame> {
+        if sample_rate_hz == 0 {
+            anyhow::bail!("audio sample rate must be non-zero");
+        }
+        if channel_count == 0 {
+            anyhow::bail!("audio channel count must be non-zero");
+        }
+        if !samples.len().is_multiple_of(channel_count as usize) {
+            anyhow::bail!(
+                "audio sample buffer length {} is not divisible by channel count {}",
+                samples.len(),
+                channel_count
+            );
+        }
+        let sample_count_per_channel = samples.len().saturating_div(channel_count as usize);
+        if sample_count_per_channel == 0 {
+            anyhow::bail!("audio sample count must be non-zero");
+        }
+        if sample_count_per_channel > u16::MAX as usize {
+            anyhow::bail!("audio sample count exceeds protocol field");
+        }
+        let sample_count = sample_count_per_channel as u16;
+
+        let pcm_bytes = samples
+            .len()
+            .checked_mul(std::mem::size_of::<i16>())
+            .ok_or_else(|| anyhow::anyhow!("audio PCM payload size overflow"))?;
+        if pcm_bytes > u32::MAX as usize {
+            anyhow::bail!("audio PCM payload exceeds protocol length field");
+        }
+        let mut bytes =
+            Vec::with_capacity(self.config.synthetic_payload_bytes.max(24 + 8 + pcm_bytes));
+        bytes.extend_from_slice(SYNTHETIC_OPUS_MAGIC);
+        bytes.extend_from_slice(&frame_id.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate_hz.to_le_bytes());
+        bytes.extend_from_slice(&channel_count.to_le_bytes());
+        bytes.extend_from_slice(&sample_count.to_le_bytes());
+        bytes.extend_from_slice(&capture_time_micros.to_le_bytes());
+        bytes.extend_from_slice(PCM_PAYLOAD_MAGIC);
+        bytes.extend_from_slice(&(pcm_bytes as u32).to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        while bytes.len() < self.config.synthetic_payload_bytes {
+            bytes.push(
+                frame_id
+                    .wrapping_mul(17)
                     .wrapping_add(bytes.len() as u32)
                     .to_le_bytes()[0],
             );
@@ -119,7 +196,8 @@ impl SyntheticOpusDecoder {
             channel_count,
             sample_count,
             capture_time_micros,
-            pcm: synthetic_pcm(frame_id, sample_count, channel_count),
+            pcm: embedded_pcm(&encoded[24..], sample_count, channel_count)?
+                .unwrap_or_else(|| synthetic_pcm(frame_id, sample_count, channel_count)),
         }))
     }
 }
@@ -203,6 +281,37 @@ fn synthetic_pcm(frame_id: u32, sample_count: u16, channel_count: u16) -> Vec<i1
         .collect()
 }
 
+fn embedded_pcm(
+    payload: &[u8],
+    sample_count: u16,
+    channel_count: u16,
+) -> anyhow::Result<Option<Vec<i16>>> {
+    let Some(header) = payload.get(..8) else {
+        return Ok(None);
+    };
+    if &header[..4] != PCM_PAYLOAD_MAGIC {
+        return Ok(None);
+    }
+    let pcm_byte_len = u32::from_le_bytes(header[4..8].try_into()?) as usize;
+    let expected_pcm_bytes = sample_count as usize * channel_count as usize * 2;
+    if pcm_byte_len != expected_pcm_bytes {
+        anyhow::bail!(
+            "embedded PCM length mismatch: expected {}, got {}",
+            expected_pcm_bytes,
+            pcm_byte_len
+        );
+    }
+    let pcm_bytes = payload
+        .get(8..8 + pcm_byte_len)
+        .ok_or_else(|| anyhow::anyhow!("embedded PCM payload is truncated"))?;
+    Ok(Some(
+        pcm_bytes
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+            .collect(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +331,22 @@ mod tests {
         assert_eq!(decoded.sample_count, 960);
         assert_eq!(decoded.capture_time_micros, 123_456);
         assert_eq!(decoded.pcm.len(), 960);
+    }
+
+    #[test]
+    fn synthetic_opus_embeds_pcm_payload_when_available() {
+        let encoder = SyntheticOpusEncoder::default();
+        let pcm = vec![-100, 0, 100, 200];
+        let encoded = encoder.encode_pcm_i16(3, 42, 48_000, 2, &pcm, 7).unwrap();
+        let mut decoder = SyntheticOpusDecoder;
+
+        let decoded = decoder.decode(&encoded.bytes).unwrap().unwrap();
+
+        assert_eq!(decoded.frame_id, 3);
+        assert_eq!(decoded.channel_count, 2);
+        assert_eq!(decoded.sample_count, 2);
+        assert_eq!(decoded.capture_time_micros, 42);
+        assert_eq!(decoded.pcm, pcm);
     }
 
     #[test]

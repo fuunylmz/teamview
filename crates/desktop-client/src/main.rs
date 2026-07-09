@@ -33,7 +33,10 @@ use tracing::info;
 
 use crate::{
     audio::{LatestAudioPlayback, SyntheticOpusDecoder, SyntheticOpusEncoder},
-    audio_capture::{MicrophoneSource, MicrophoneSourceInfo},
+    audio_capture::{
+        AudioCaptureConfig, MicrophoneCapture, MicrophoneSource, MicrophoneSourceInfo,
+        WindowsMicrophoneCapture,
+    },
     capture::{
         CaptureConfig, CaptureSource, CaptureSourceInfo, CaptureSourceKind, ScreenCapture, windows,
     },
@@ -72,6 +75,12 @@ enum MediaKindArg {
 enum ScreenInputArg {
     Synthetic,
     Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VoiceInputArg {
+    Synthetic,
+    Microphone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -124,6 +133,12 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = ScreenInputArg::Synthetic)]
     screen_input: ScreenInputArg,
+
+    #[arg(long, value_enum, default_value_t = VoiceInputArg::Synthetic)]
+    voice_input: VoiceInputArg,
+
+    #[arg(long)]
+    microphone_id: Option<String>,
 
     #[arg(long, value_enum, default_value_t = RenderOutputArg::Sink)]
     render_output: RenderOutputArg,
@@ -193,18 +208,20 @@ async fn main() -> anyhow::Result<()> {
         capture_supported,
         ?args.capture_source,
         ?args.screen_input,
+        ?args.voice_input,
         ?args.render_output,
         cursor_visible = args.cursor_visible,
         "desktop client endpoint and capture foundation ready"
     );
     println!(
-        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} render_output={:?}",
+        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} voice_input={:?} render_output={:?}",
         args.mode,
         args.relay,
         local_addr,
         capture_supported,
         args.capture_source,
         args.screen_input,
+        args.voice_input,
         args.render_output
     );
 
@@ -907,21 +924,70 @@ async fn run_synthetic_voice_broadcaster_media(
     encoder.config.synthetic_payload_bytes = args.media_frame_bytes;
     encoder.config.bitrate_bps = args.synthetic_bitrate_bps();
     encoder.set_frames_per_second(args.media_fps.max(1));
+    let mut microphone_capture = match args.voice_input {
+        VoiceInputArg::Synthetic => None,
+        VoiceInputArg::Microphone => {
+            let capture = WindowsMicrophoneCapture::open(
+                args.microphone_source()?,
+                args.audio_capture_config(),
+            )
+            .context("failed to open microphone capture")?;
+            let capture_config = capture.config();
+            encoder.config.sample_rate_hz = capture_config.sample_rate_hz;
+            encoder.config.channel_count = capture_config.channel_count;
+            encoder.config.frame_duration_ms = capture_config.frame_duration_ms;
+            Some(capture)
+        }
+    };
 
     let mut ticker = tokio::time::interval(frame_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut active_fps = args.media_fps;
+    let mut sent_frames = 0_u32;
     let mut sent_packets = 0_u64;
     let mut next_sequence_number = 1_u32;
+    let mut empty_capture_ticks = 0_u32;
     let mut timing = ClientBroadcasterStats::default();
-    for frame_id in 1..=media_frames {
+    while sent_frames < media_frames {
         ticker.tick().await;
+        let frame_id = sent_frames.saturating_add(1);
         let capture_start = Instant::now();
-        let capture_time_micros = unix_time_micros();
+        let captured_audio = if let Some(capture) = microphone_capture.as_mut() {
+            match capture.next_frame()? {
+                Some(frame) => Some(frame),
+                None => {
+                    empty_capture_ticks = empty_capture_ticks.saturating_add(1);
+                    if empty_capture_ticks > active_fps.max(1) as u32 {
+                        bail!(
+                            "microphone capture produced no audio frames for {} ticks",
+                            empty_capture_ticks
+                        );
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        empty_capture_ticks = 0;
+        let capture_time_micros = captured_audio
+            .as_ref()
+            .map(|frame| frame.capture_time_micros)
+            .unwrap_or_else(unix_time_micros);
         let capture_duration = capture_start.elapsed();
         timing.record_capture_duration(capture_duration);
         let encode_start = Instant::now();
-        let mut frame = encoder.encode(frame_id, capture_time_micros, args.stream_id)?;
+        let mut frame = match captured_audio {
+            Some(audio) => encoder.encode_pcm_i16(
+                audio.frame_id.min(u32::MAX as u64) as u32,
+                audio.capture_time_micros,
+                audio.sample_rate_hz,
+                audio.channel_count,
+                &audio.samples,
+                args.stream_id,
+            )?,
+            None => encoder.encode(frame_id, capture_time_micros, args.stream_id)?,
+        };
         frame.sender_clock_offset_micros = clock_sync.clock_offset_micros;
         frame.sender_encode_done_time_micros = unix_time_micros();
         let encode_duration = encode_start.elapsed();
@@ -944,19 +1010,21 @@ async fn run_synthetic_voice_broadcaster_media(
         }
         let send_duration = send_start.elapsed();
         timing.record_send_duration(send_duration);
+        sent_frames = sent_frames.saturating_add(1);
         println!(
-            "audio-send frame_id={} fragments={} bytes={} target_bytes={} capture_ms={} encode_ms={} packetize_ms={} send_ms={}",
+            "audio-send frame_id={} fragments={} bytes={} target_bytes={} voice_input={:?} capture_ms={} encode_ms={} packetize_ms={} send_ms={}",
             frame.frame_id,
             packets.len(),
             frame.bytes.len(),
             encoder.config.synthetic_payload_bytes,
+            args.voice_input,
             millis_for_log(capture_duration),
             millis_for_log(encode_duration),
             millis_for_log(packetize_duration),
             millis_for_log(send_duration)
         );
         if args.feedback_interval_frames > 0
-            && frame_id.is_multiple_of(args.feedback_interval_frames)
+            && sent_frames.is_multiple_of(args.feedback_interval_frames)
         {
             let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
             apply_audio_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
@@ -982,7 +1050,7 @@ async fn run_synthetic_voice_broadcaster_media(
     let timing = timing.timing_snapshot();
     println!(
         "media-summary role=broadcaster kind=voice frames={} packets={} fps={} run_ms={} capture_ms_p50={} capture_ms_p95={} encode_ms_p50={} encode_ms_p95={} packetize_ms_p50={} packetize_ms_p95={} send_ms_p50={} send_ms_p95={}",
-        media_frames,
+        sent_frames,
         sent_packets,
         args.media_fps,
         args.media_run_ms,
@@ -1146,6 +1214,10 @@ fn synthetic_payload_bytes_for_bitrate(bitrate_bps: u32, frames_per_second: u16)
 
 fn media_interval_micros(frames_per_second: u16) -> u64 {
     1_000_000 / frames_per_second.max(1) as u64
+}
+
+fn audio_frame_duration_ms(frames_per_second: u16) -> u16 {
+    (1_000 / frames_per_second.max(1)).max(1)
 }
 
 fn millis_for_log(duration: Duration) -> u16 {
@@ -1782,6 +1854,22 @@ impl Args {
         }
     }
 
+    fn microphone_source(&self) -> anyhow::Result<MicrophoneSource> {
+        match self.microphone_id.as_deref().map(str::trim) {
+            Some(id) if !id.is_empty() => Ok(MicrophoneSource::Device { id: id.to_owned() }),
+            _ => Ok(MicrophoneSource::Default),
+        }
+    }
+
+    fn audio_capture_config(&self) -> AudioCaptureConfig {
+        AudioCaptureConfig {
+            sample_rate_hz: 48_000,
+            channel_count: 1,
+            frame_duration_ms: audio_frame_duration_ms(self.media_fps),
+            queue_capacity: 1,
+        }
+    }
+
     fn video_playback(&self) -> anyhow::Result<FramePlayback> {
         match self.render_output {
             RenderOutputArg::Sink => Ok(FramePlayback::latest()),
@@ -1808,6 +1896,43 @@ mod tests {
         let args = Args::try_parse_from(["desktop-client", "--list-audio-sources"]).unwrap();
 
         assert!(args.list_audio_sources);
+    }
+
+    #[test]
+    fn voice_input_microphone_flag_selects_microphone_source() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "voice",
+            "--voice-input",
+            "microphone",
+            "--microphone-id",
+            "1",
+            "--media-fps",
+            "50",
+        ])
+        .unwrap();
+
+        assert_eq!(args.voice_input, VoiceInputArg::Microphone);
+        assert_eq!(
+            args.microphone_source().unwrap(),
+            MicrophoneSource::Device { id: "1".to_owned() }
+        );
+        assert_eq!(args.audio_capture_config().frame_duration_ms, 20);
+    }
+
+    #[test]
+    fn voice_input_uses_default_microphone_without_device_id() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "voice",
+            "--voice-input",
+            "microphone",
+        ])
+        .unwrap();
+
+        assert_eq!(args.microphone_source().unwrap(), MicrophoneSource::Default);
     }
 
     #[test]

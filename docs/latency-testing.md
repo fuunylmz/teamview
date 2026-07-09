@@ -103,7 +103,8 @@ Microphone source listing smoke test:
 cargo run -p desktop-client -- --list-audio-sources
 ```
 
-Expected output includes `audio-source kind=device` lines on Windows systems with microphone input devices. This validates the local voice-device discovery path before real microphone capture and Opus encoding are wired into the media loop.
+Expected output includes `audio-source kind=device` lines on Windows systems with microphone input devices. This validates the local voice-device discovery path before choosing a live microphone input for the voice media loop.
+The broadcaster can also use one of those devices with `--voice-input microphone`; the current path captures WinMM PCM and embeds it in the temporary Opus-like payload until real Opus is integrated.
 
 Live primary-monitor smoke test:
 
@@ -207,8 +208,25 @@ Expected behavior:
 - The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams, zero drops, current egress queue depth, and server route timing percentiles.
 - The final viewer summary reports `kind=voice`, matching decoded and played frame counts, and zero loss on a healthy local run.
 
+## Desktop microphone voice checks
+
+On Windows, the broadcaster can use a real microphone source instead of synthetic samples. The payload is still the temporary Opus-like test container, but it now carries captured PCM so the receive/playback path sees the original microphone samples.
+
+Run in separate terminals after starting the relay and choosing an id from `--list-audio-sources`:
+
+```bash
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind voice --voice-input microphone --microphone-id 0 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
+```
+
+Expected behavior:
+
+- The broadcaster prints `audio-send` lines with `voice_input=Microphone`.
+- The viewer prints `audio-play` lines whose sample count matches the microphone frame duration, usually 960 samples per channel at 48 kHz and 50 fps.
+- The final summaries should still report matching sent, decoded, and played voice frames on a healthy local run.
+
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, live primary-monitor acquisition, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, synthetic capture-to-viewer latency, multi-sample relay clock offset estimates, TimeSync-derived calibrated capture-to-viewer latency, broadcaster capture/encode/packetize/send timing, publisher stamped capture-to-encode/send timing, server receive-to-route timing, relay receive-to-send queue timing, viewer receive-to-reassembly timing, viewer decode/render timing, and render/playback FPS. Later milestones add hardware encode, continuous calibrated cross-machine clock offset filtering, viewer receive, decode, and render timestamp calibration.
+Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, live primary-monitor acquisition, microphone PCM capture handoff, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, microphone voice forwarding behavior, synthetic capture-to-viewer latency, multi-sample relay clock offset estimates, TimeSync-derived calibrated capture-to-viewer latency, broadcaster capture/encode/packetize/send timing, publisher stamped capture-to-encode/send timing, server receive-to-route timing, relay receive-to-send queue timing, viewer receive-to-reassembly timing, viewer decode/render timing, and render/playback FPS. Later milestones add hardware encode, real Opus, continuous calibrated cross-machine clock offset filtering, viewer receive, decode, and render timestamp calibration.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.
