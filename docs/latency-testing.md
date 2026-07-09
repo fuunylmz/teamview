@@ -97,6 +97,14 @@ cargo run -p desktop-client -- --list-capture-sources
 
 Expected output includes at least one `capture-source kind=monitor` line. Visible windows with titles are listed as `capture-source kind=window` lines.
 
+Microphone source listing smoke test:
+
+```bash
+cargo run -p desktop-client -- --list-audio-sources
+```
+
+Expected output includes `audio-source kind=device` lines on Windows systems with microphone input devices. This validates the local voice-device discovery path before real microphone capture and Opus encoding are wired into the media loop.
+
 Live primary-monitor smoke test:
 
 ```bash

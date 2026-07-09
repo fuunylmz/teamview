@@ -2,6 +2,7 @@
 
 mod app;
 mod audio;
+mod audio_capture;
 mod capture;
 mod decode;
 mod encode;
@@ -32,6 +33,7 @@ use tracing::info;
 
 use crate::{
     audio::{LatestAudioPlayback, SyntheticOpusDecoder, SyntheticOpusEncoder},
+    audio_capture::{MicrophoneSource, MicrophoneSourceInfo},
     capture::{
         CaptureConfig, CaptureSource, CaptureSourceInfo, CaptureSourceKind, ScreenCapture, windows,
     },
@@ -92,6 +94,9 @@ struct Args {
 
     #[arg(long)]
     list_capture_sources: bool,
+
+    #[arg(long)]
+    list_audio_sources: bool,
 
     #[arg(long, value_enum, default_value_t = CaptureSourceArg::PrimaryMonitor)]
     capture_source: CaptureSourceArg,
@@ -170,6 +175,10 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     if args.list_capture_sources {
         print_capture_sources()?;
+        return Ok(());
+    }
+    if args.list_audio_sources {
+        print_audio_sources()?;
         return Ok(());
     }
 
@@ -1595,6 +1604,15 @@ fn print_capture_sources() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_audio_sources() -> anyhow::Result<()> {
+    let sources = audio_capture::list_microphone_sources()?;
+    println!("audio-sources count={}", sources.len());
+    for source in sources {
+        println!("{}", format_audio_source(&source));
+    }
+    Ok(())
+}
+
 fn format_capture_source(source: &CaptureSourceInfo) -> String {
     match (&source.kind, &source.source) {
         (CaptureSourceKind::Monitor, CaptureSource::Monitor { id }) => format!(
@@ -1617,6 +1635,19 @@ fn format_capture_source(source: &CaptureSourceInfo) -> String {
             source.width,
             source.height,
             source.label
+        ),
+    }
+}
+
+fn format_audio_source(source: &MicrophoneSourceInfo) -> String {
+    match &source.source {
+        MicrophoneSource::Default => format!(
+            "audio-source kind=default default={} sample_rate_hz={} channels={} label={:?}",
+            source.is_default, source.sample_rate_hz, source.channel_count, source.label
+        ),
+        MicrophoneSource::Device { id } => format!(
+            "audio-source kind=device id={} default={} sample_rate_hz={} channels={} label={:?}",
+            id, source.is_default, source.sample_rate_hz, source.channel_count, source.label
         ),
     }
 }
@@ -1773,6 +1804,13 @@ mod tests {
     }
 
     #[test]
+    fn list_audio_sources_flag_parses_without_relay_options() {
+        let args = Args::try_parse_from(["desktop-client", "--list-audio-sources"]).unwrap();
+
+        assert!(args.list_audio_sources);
+    }
+
+    #[test]
     fn clock_sync_estimate_uses_midpoints_and_excludes_server_processing() {
         let sync = TimeSyncResponse {
             client_send_time_micros: 1_000,
@@ -1915,6 +1953,22 @@ mod tests {
         assert_eq!(
             format_capture_source(&source),
             "capture-source kind=window title=\"Untitled - Notepad\" width=800 height=600 label=\"Untitled - Notepad\""
+        );
+    }
+
+    #[test]
+    fn format_audio_source_prints_device_metadata() {
+        let source = MicrophoneSourceInfo {
+            source: MicrophoneSource::Device { id: "0".to_owned() },
+            label: "Microphone Array".to_owned(),
+            sample_rate_hz: 48_000,
+            channel_count: 2,
+            is_default: true,
+        };
+
+        assert_eq!(
+            format_audio_source(&source),
+            "audio-source kind=device id=0 default=true sample_rate_hz=48000 channels=2 label=\"Microphone Array\""
         );
     }
 
