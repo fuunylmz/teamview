@@ -2,6 +2,7 @@ pub mod h264;
 
 use std::collections::BTreeMap;
 
+use bytes::Bytes;
 use teamview_protocol::{
     frame::{EncodedFrame, reassemble_frame},
     packet::MediaPacket,
@@ -9,9 +10,16 @@ use teamview_protocol::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedFrame {
+    pub frame_id: u32,
     pub width: u32,
     pub height: u32,
-    pub render_time_micros: u64,
+    pub pixel_format: DecodedPixelFormat,
+    pub pixels: Bytes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodedPixelFormat {
+    Bgra8,
 }
 
 pub trait VideoDecoder {

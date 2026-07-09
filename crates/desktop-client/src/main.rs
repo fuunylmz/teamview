@@ -32,7 +32,7 @@ use crate::{
     capture::{CaptureConfig, CaptureSource, ScreenCapture, windows},
     decode::{FrameReassemblyBuffer, VideoDecoder, h264::H264Decoder},
     encode::{VideoEncoder, h264::H264Encoder},
-    playback::{NullPlayback, VideoPlayback},
+    playback::{LatestFramePlayback, VideoPlayback},
     stats::ClientMediaStats,
     transport::quic::{build_client_endpoint, connect_control_client},
 };
@@ -494,7 +494,7 @@ async fn run_synthetic_viewer_media(
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
     let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
     let mut decoder = H264Decoder::default();
-    let mut playback = NullPlayback;
+    let mut playback = LatestFramePlayback::new();
     let mut stats = ClientMediaStats::default();
     let mut reassembled_frames = 0_u32;
     let mut decoded_frames = 0_u32;
@@ -540,6 +540,16 @@ async fn run_synthetic_viewer_media(
             );
             if let Some(decoded) = decoder.decode(&frame.bytes)? {
                 playback.render(decoded)?;
+                if let Some(rendered) = playback.latest() {
+                    println!(
+                        "media-render frame_id={} width={} height={} pixel_bytes={} render_time_micros={}",
+                        rendered.frame_id,
+                        rendered.width,
+                        rendered.height,
+                        rendered.pixel_bytes,
+                        rendered.render_time_micros
+                    );
+                }
                 stats.record_decoded_frame();
                 decoded_frames += 1;
                 if frame.is_keyframe {
@@ -571,9 +581,10 @@ async fn run_synthetic_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer frames={} decoded={} packets={} lost={} dropped={} latency_ms={}",
+        "media-summary role=viewer frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={}",
         reassembled_frames,
         decoded_frames,
+        playback.rendered_frames(),
         received_packets,
         stats.lost_packets,
         stats.dropped_frames,

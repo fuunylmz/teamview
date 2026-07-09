@@ -105,7 +105,7 @@ quic-sample-forward frames=2 fragments=14 reassembled=4 delivered=28 dropped=0
 
 ## Desktop synthetic session checks
 
-The desktop client can run a paced synthetic media session over the relay. The broadcaster uses a frame interval derived from `--media-fps`, stamps synthetic captures with Unix epoch microseconds, keeps sequence numbers continuous across fragments, and lingers briefly after finite sends so in-flight datagrams can drain. The viewer reassembles frames, parses synthetic Annex B H.264-like NAL units, estimates capture-to-viewer latency from `sender_capture_time_micros`, tracks packet loss from sequence gaps, periodically sends `ViewerStats` over the control stream, and sends control-plane keepalives while waiting for delayed media.
+The desktop client can run a paced synthetic media session over the relay. The broadcaster uses a frame interval derived from `--media-fps`, stamps synthetic captures with Unix epoch microseconds, keeps sequence numbers continuous across fragments, and lingers briefly after finite sends so in-flight datagrams can drain. The viewer reassembles frames, parses synthetic Annex B H.264-like NAL units into BGRA preview frames, renders them into a latest-frame playback sink, estimates capture-to-viewer latency from `sender_capture_time_micros`, tracks packet loss from sequence gaps, periodically sends `ViewerStats` over the control stream, and sends control-plane keepalives while waiting for delayed media.
 
 Run in separate terminals:
 
@@ -120,7 +120,8 @@ Expected behavior:
 - The broadcaster prints five `media-send` lines at 5 fps for a 1000 ms run.
 - The broadcaster publishes `StreamConfig`, sets target bitrate/framerate, and the viewer polls config before media receive.
 - Long `--media-start-delay-ms` and `--media-idle-timeout-ms` windows are kept alive with `Ping`/`Pong` control messages.
-- The viewer receives and decodes five frames split across ten packets with `--max-datagram-payload 700`.
+- The viewer receives, decodes, and renders five frames split across ten packets with `--max-datagram-payload 700`.
+- Each decoded frame prints a `media-render` line with render timestamp and BGRA buffer size.
 - Each received frame prints `latency_ms`, and the final viewer summary includes the latest estimated latency.
 - The viewer reassembly buffer drops stale incomplete frames after `--reassembly-window-frames` to avoid accumulating latency.
 - The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.

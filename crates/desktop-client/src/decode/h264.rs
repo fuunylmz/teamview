@@ -1,10 +1,14 @@
-use super::{DecodedFrame, VideoDecoder};
+use bytes::Bytes;
+
+use super::{DecodedFrame, DecodedPixelFormat, VideoDecoder};
 
 const SYNTHETIC_SPS_MAGIC: &[u8; 4] = b"TVS1";
+const SYNTHETIC_FRAME_MAGIC: &[u8; 4] = b"TVF1";
 const NAL_NON_IDR_SLICE: u8 = 1;
 const NAL_IDR_SLICE: u8 = 5;
 const NAL_SPS: u8 = 7;
 const NAL_PPS: u8 = 8;
+const MAX_SYNTHETIC_DECODED_PIXELS: u64 = 3840 * 2160;
 
 #[derive(Debug, Default)]
 pub struct H264Decoder {
@@ -13,6 +17,13 @@ pub struct H264Decoder {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SyntheticStreamConfig {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyntheticFrameInfo {
+    frame_id: u32,
     width: u32,
     height: u32,
 }
@@ -27,6 +38,7 @@ impl VideoDecoder for H264Decoder {
         let mut saw_pps = false;
         let mut saw_idr = false;
         let mut saw_slice = false;
+        let mut frame_info = None;
 
         for nal in annex_b_nals(encoded) {
             let Some((&header, payload)) = nal.split_first() else {
@@ -43,8 +55,12 @@ impl VideoDecoder for H264Decoder {
                 NAL_IDR_SLICE => {
                     saw_idr = true;
                     saw_slice = true;
+                    frame_info = parse_synthetic_frame(payload).or(frame_info);
                 }
-                NAL_NON_IDR_SLICE => saw_slice = true,
+                NAL_NON_IDR_SLICE => {
+                    saw_slice = true;
+                    frame_info = parse_synthetic_frame(payload).or(frame_info);
+                }
                 _ => {}
             }
         }
@@ -59,10 +75,22 @@ impl VideoDecoder for H264Decoder {
         let Some(config) = self.config else {
             return Ok(None);
         };
-        Ok(Some(DecodedFrame {
+        let frame_info = frame_info.unwrap_or(SyntheticFrameInfo {
+            frame_id: 0,
             width: config.width,
             height: config.height,
-            render_time_micros: 0,
+        });
+        let width = frame_info.width.max(1);
+        let height = frame_info.height.max(1);
+        if width as u64 * height as u64 > MAX_SYNTHETIC_DECODED_PIXELS {
+            anyhow::bail!("synthetic decoded frame exceeds maximum preview size");
+        }
+        Ok(Some(DecodedFrame {
+            frame_id: frame_info.frame_id,
+            width,
+            height,
+            pixel_format: DecodedPixelFormat::Bgra8,
+            pixels: synthetic_bgra_pixels(width, height, frame_info.frame_id, saw_idr),
         }))
     }
 }
@@ -78,6 +106,40 @@ fn parse_synthetic_sps(payload: &[u8]) -> Option<SyntheticStreamConfig> {
         return None;
     }
     Some(SyntheticStreamConfig { width, height })
+}
+
+fn parse_synthetic_frame(payload: &[u8]) -> Option<SyntheticFrameInfo> {
+    let bytes = payload.get(..16)?;
+    if &bytes[..4] != SYNTHETIC_FRAME_MAGIC {
+        return None;
+    }
+    let frame_id = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let width = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let height = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(SyntheticFrameInfo {
+        frame_id,
+        width,
+        height,
+    })
+}
+
+fn synthetic_bgra_pixels(width: u32, height: u32, frame_id: u32, is_keyframe: bool) -> Bytes {
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let mut pixels = Vec::with_capacity(pixel_count.saturating_mul(4));
+    let keyframe_bias = if is_keyframe { 0x40 } else { 0x10 };
+    for y in 0..height {
+        for x in 0..width {
+            let pattern = ((x / 32) ^ (y / 32) ^ frame_id) as u8;
+            pixels.push(pattern.wrapping_mul(3));
+            pixels.push(pattern.wrapping_mul(5).wrapping_add(keyframe_bias));
+            pixels.push(pattern.wrapping_mul(7).wrapping_add(frame_id as u8));
+            pixels.push(0xff);
+        }
+    }
+    Bytes::from(pixels)
 }
 
 fn annex_b_nals(encoded: &[u8]) -> AnnexBNals<'_> {
@@ -147,9 +209,11 @@ mod tests {
         assert_eq!(
             decoded,
             Some(DecodedFrame {
+                frame_id: 1,
                 width: 1920,
                 height: 1080,
-                render_time_micros: 0,
+                pixel_format: DecodedPixelFormat::Bgra8,
+                pixels: synthetic_bgra_pixels(1920, 1080, 1, true),
             })
         );
     }
@@ -179,11 +243,26 @@ mod tests {
         assert_eq!(
             decoder.decode(&delta).unwrap(),
             Some(DecodedFrame {
+                frame_id: 2,
                 width: 1280,
                 height: 720,
-                render_time_micros: 0,
+                pixel_format: DecodedPixelFormat::Bgra8,
+                pixels: synthetic_bgra_pixels(1280, 720, 2, false),
             })
         );
+    }
+
+    #[test]
+    fn synthetic_decoder_outputs_bgra_pixels() {
+        let mut decoder = H264Decoder::default();
+        let encoded = encode_frame(1, 64, 36).bytes;
+
+        let decoded = decoder.decode(&encoded).unwrap().unwrap();
+
+        assert_eq!(decoded.frame_id, 1);
+        assert_eq!(decoded.pixel_format, DecodedPixelFormat::Bgra8);
+        assert_eq!(decoded.pixels.len(), 64 * 36 * 4);
+        assert_eq!(decoded.pixels[3], 0xff);
     }
 
     #[test]
