@@ -16,13 +16,13 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     codec::CodecId,
     control::{
-        ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind,
+        ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind, Ping,
         PollPublisherFeedback, PollStreamConfig, PublishStream, PublisherFeedback, RequestKeyframe,
         RoomId, ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig,
         StreamId, SubscribeStream, ViewerStatsReport,
     },
     frame::packetize_frame_for_datagram_target,
-    packet::DEFAULT_DATAGRAM_PAYLOAD_TARGET,
+    packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket},
 };
 use tokio::time::MissedTickBehavior;
 use tracing::info;
@@ -37,6 +37,7 @@ use crate::{
 };
 
 const MIN_SYNTHETIC_PAYLOAD_BYTES: usize = 64;
+const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -276,7 +277,7 @@ async fn run_synthetic_broadcaster_media(
     room_id: RoomId,
 ) -> anyhow::Result<()> {
     if args.media_start_delay_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(args.media_start_delay_ms)).await;
+        sleep_with_keepalive(control, Duration::from_millis(args.media_start_delay_ms)).await?;
     }
     let media_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
@@ -470,19 +471,18 @@ async fn run_synthetic_viewer_media(
     let mut awaiting_recovery_keyframe = false;
 
     while reassembled_frames < target_frames {
-        let packet = match tokio::time::timeout(
+        let packet = match recv_media_packet_with_keepalive(
+            control,
             Duration::from_millis(args.media_idle_timeout_ms),
-            control.recv_media_packet(),
         )
-        .await
+        .await?
         {
-            Ok(Ok(packet)) => packet,
-            Ok(Err(error)) => return Err(error),
-            Err(error) => {
+            Some(packet) => packet,
+            None => {
                 if args.media_frames == 0 && received_packets > 0 {
                     break;
                 }
-                return Err(error).context("timed out waiting for media packet");
+                bail!("timed out waiting for media packet");
             }
         };
         let lost_packets_before = stats.lost_packets;
@@ -569,6 +569,52 @@ async fn request_keyframe(
         ServerControl::RequestKeyframe(_) => Ok(()),
         ServerControl::Error(error) => bail!("request keyframe failed: {}", error.message),
         other => bail!("unexpected request keyframe response: {other:?}"),
+    }
+}
+
+async fn sleep_with_keepalive(
+    control: &mut crate::transport::quic::ControlClient,
+    duration: Duration,
+) -> anyhow::Result<()> {
+    let mut remaining = duration;
+    while remaining > Duration::ZERO {
+        let chunk = remaining.min(CONTROL_KEEPALIVE_INTERVAL);
+        tokio::time::sleep(chunk).await;
+        remaining = remaining.saturating_sub(chunk);
+        if remaining > Duration::ZERO {
+            send_keepalive(control).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn recv_media_packet_with_keepalive(
+    control: &mut crate::transport::quic::ControlClient,
+    idle_timeout: Duration,
+) -> anyhow::Result<Option<MediaPacket>> {
+    let mut remaining = idle_timeout;
+    while remaining > Duration::ZERO {
+        let chunk = remaining.min(CONTROL_KEEPALIVE_INTERVAL);
+        match tokio::time::timeout(chunk, control.recv_media_packet()).await {
+            Ok(packet) => return packet.map(Some),
+            Err(_) => {
+                remaining = remaining.saturating_sub(chunk);
+                if remaining > Duration::ZERO {
+                    send_keepalive(control).await?;
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn send_keepalive(control: &mut crate::transport::quic::ControlClient) -> anyhow::Result<()> {
+    let nonce = unix_time_micros();
+    let response = control.send(ClientControl::Ping(Ping { nonce })).await?;
+    match response.message {
+        ServerControl::Pong(pong) if pong.nonce == nonce => Ok(()),
+        ServerControl::Error(error) => bail!("keepalive failed: {}", error.message),
+        other => bail!("unexpected keepalive response: {other:?}"),
     }
 }
 

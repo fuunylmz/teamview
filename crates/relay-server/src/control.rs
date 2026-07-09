@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use teamview_protocol::{
     PROTOCOL_VERSION,
     control::{
-        ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason,
+        ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason, Pong,
         RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, ServerControl, ServerEnvelope,
         SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId, StreamPublished,
         StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
@@ -77,6 +77,12 @@ impl ControlState {
                     })
                 }
             }
+            ClientControl::Ping(ping) => match session.user_id {
+                Some(_) => ServerControl::Pong(Pong { nonce: ping.nonce }),
+                None => {
+                    ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"))
+                }
+            },
             ClientControl::Authenticate(_) => match session.user_id {
                 Some(user_id) => {
                     ServerControl::Authenticated(teamview_protocol::control::Authenticated {
@@ -625,7 +631,7 @@ mod tests {
         PROTOCOL_VERSION,
         codec::CodecId,
         control::{
-            ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind,
+            ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind, Ping,
             PollPublisherFeedback, PollStreamConfig, PublishStream, RequestKeyframe,
             SetTargetBitrate, SetTargetFramerate, StreamConfig, SubscribeStream, ViewerStatsReport,
         },
@@ -653,6 +659,36 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
         assert!(state.room(1).is_none());
+    }
+
+    #[test]
+    fn ping_requires_hello() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+
+        let response = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(1, ClientControl::Ping(Ping { nonce: 7 })),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "unauthenticated"),
+            other => panic!("unexpected ping response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_returns_pong_after_hello() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+        authenticate(&mut state, &mut session, "client");
+
+        let response = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(2, ClientControl::Ping(Ping { nonce: 99 })),
+        );
+
+        assert_eq!(response.message, ServerControl::Pong(Pong { nonce: 99 }));
     }
 
     #[test]

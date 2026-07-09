@@ -32,6 +32,7 @@ Every control envelope includes:
 Current control messages cover:
 
 - hello / hello accepted
+- ping / pong keepalive
 - placeholder authentication
 - create room
 - join room

@@ -27,6 +27,7 @@ impl<T> ControlEnvelope<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientControl {
     Hello(Hello),
+    Ping(Ping),
     Authenticate(Authenticate),
     CreateRoom(CreateRoom),
     JoinRoom(JoinRoom),
@@ -46,6 +47,7 @@ pub enum ClientControl {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerControl {
     HelloAccepted(HelloAccepted),
+    Pong(Pong),
     Authenticated(Authenticated),
     RoomCreated(RoomCreated),
     RoomJoined(RoomJoined),
@@ -72,6 +74,16 @@ pub struct Hello {
 pub struct HelloAccepted {
     pub protocol_version: u8,
     pub server_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ping {
+    pub nonce: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pong {
+    pub nonce: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +354,15 @@ mod tests {
 
         let encoded = encode_client_envelope(&envelope).unwrap();
         assert_eq!(encoded.last(), Some(&b'\n'));
+        assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn ping_round_trips_as_json_line() {
+        let envelope = ClientEnvelope::new(8, ClientControl::Ping(Ping { nonce: 42 }));
+
+        let encoded = encode_client_envelope(&envelope).unwrap();
+
         assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
     }
 
