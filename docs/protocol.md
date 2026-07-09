@@ -79,6 +79,8 @@ Media packets travel over QUIC datagrams. Each datagram carries one packet with 
 
 The relay uses the stream framerate and fragment count to estimate queued media time for each datagram. If forwarding a datagram would push a viewer's queue for that stream beyond its configured egress media budget, only that viewer/stream datagram is dropped; other subscribed streams for the same viewer keep their own budget.
 
+The relay enforces a configurable maximum ingress datagram size before decoding media packets. Datagrams larger than `--max-datagram-payload` are dropped at ingress and are not counted as accepted stream metrics.
+
 Encoded frames may be fragmented into multiple datagrams for MTU safety. Fragmentation is only a transport concern; the relay never decodes or transforms media content.
 
 The packet header is defined in `crates/protocol/src/packet.rs` and includes:

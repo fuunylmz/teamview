@@ -169,6 +169,7 @@ cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name 
 For a visible preview, add `--render-output window` to the viewer command.
 
 If the relay is started with `--access-token`, pass the same `--access-token` to both desktop-client commands.
+If the relay is started with a custom `--max-datagram-payload`, use the same or lower `--max-datagram-payload` on the desktop broadcaster so packetized media stays below the relay ingress limit.
 
 Expected behavior:
 

@@ -20,4 +20,9 @@ impl ServerConfig {
         self.access_token = access_token;
         self
     }
+
+    pub fn with_max_datagram_payload(mut self, max_datagram_payload: usize) -> Self {
+        self.max_datagram_payload = max_datagram_payload.max(1);
+        self
+    }
 }

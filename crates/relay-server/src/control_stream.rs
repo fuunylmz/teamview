@@ -33,6 +33,7 @@ pub struct ControlRuntime {
     state: Arc<Mutex<ControlState>>,
     media: Arc<Mutex<MediaRelay>>,
     next_session_id: Arc<AtomicU64>,
+    max_datagram_payload: usize,
 }
 
 impl ControlRuntime {
@@ -41,6 +42,7 @@ impl ControlRuntime {
             state: Arc::new(Mutex::new(ControlState::new())),
             media: Arc::new(Mutex::new(MediaRelay::new())),
             next_session_id: Arc::new(AtomicU64::new(1)),
+            max_datagram_payload: teamview_protocol::packet::DEFAULT_DATAGRAM_PAYLOAD_TARGET,
         }
     }
 
@@ -55,6 +57,7 @@ impl ControlRuntime {
                 config.viewer_queue_budget_ms,
             ))),
             next_session_id: Arc::new(AtomicU64::new(1)),
+            max_datagram_payload: config.max_datagram_payload.max(1),
         }
     }
 
@@ -170,6 +173,14 @@ impl ControlRuntime {
         bytes: &[u8],
         received_at_micros: u64,
     ) {
+        if bytes.len() > self.max_datagram_payload {
+            debug!(
+                datagram_bytes = bytes.len(),
+                max_datagram_payload = self.max_datagram_payload,
+                "dropping oversized media datagram"
+            );
+            return;
+        }
         let session = session.lock().await;
         let Some(user_id) = session.user_id else {
             debug!(
@@ -685,6 +696,146 @@ mod tests {
                 assert!(metrics.ingress_bytes > 0);
                 assert!(metrics.last_ingress_time_micros > 0);
                 assert!(metrics.server_route_ms_p95 >= metrics.server_route_ms_p50);
+            }
+            other => panic!("unexpected metrics response: {other:?}"),
+        }
+
+        publisher.close(0_u32.into(), b"done");
+        viewer.close(0_u32.into(), b"done");
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn control_runtime_drops_oversized_media_datagram() {
+        let server = build_server_endpoint("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let runtime = ControlRuntime::from_config(
+            ServerConfig::new("127.0.0.1:0".to_owned()).with_max_datagram_payload(8),
+        );
+        let server_task = tokio::spawn(async move {
+            while let Some(incoming) = server.accept().await {
+                let runtime = runtime.clone();
+                tokio::spawn(async move {
+                    let connection = incoming.await.expect("accepted connection");
+                    runtime.serve_connection(connection).await;
+                });
+            }
+        });
+
+        let mut publisher_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        publisher_endpoint.set_default_client_config(build_insecure_local_client_config());
+        let publisher = publisher_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .expect("publisher connects");
+
+        let mut viewer_endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        viewer_endpoint.set_default_client_config(build_insecure_local_client_config());
+        let viewer = viewer_endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .expect("viewer connects");
+
+        send_control_request(
+            &publisher,
+            ClientEnvelope::new(
+                1,
+                ClientControl::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_name: "publisher".to_owned(),
+                }),
+            ),
+        )
+        .await;
+        send_control_request(
+            &viewer,
+            ClientEnvelope::new(
+                1,
+                ClientControl::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_name: "viewer".to_owned(),
+                }),
+            ),
+        )
+        .await;
+        let created = send_control_request(
+            &publisher,
+            ClientEnvelope::new(
+                2,
+                ClientControl::CreateRoom(CreateRoom {
+                    name: "stage1".to_owned(),
+                }),
+            ),
+        )
+        .await;
+        let room_id = match created.message {
+            ServerControl::RoomCreated(room) => room.room_id,
+            other => panic!("unexpected create room response: {other:?}"),
+        };
+        send_control_request(
+            &publisher,
+            ClientEnvelope::new(3, ClientControl::JoinRoom(JoinRoom { room_id })),
+        )
+        .await;
+        send_control_request(
+            &viewer,
+            ClientEnvelope::new(2, ClientControl::JoinRoom(JoinRoom { room_id })),
+        )
+        .await;
+        send_control_request(
+            &publisher,
+            ClientEnvelope::new(
+                4,
+                ClientControl::PublishStream(PublishStream {
+                    room_id,
+                    stream_id: 9,
+                    codec: CodecId::H264,
+                    media_kind: MediaKind::Screen,
+                }),
+            ),
+        )
+        .await;
+        send_control_request(
+            &viewer,
+            ClientEnvelope::new(
+                3,
+                ClientControl::SubscribeStream(SubscribeStream {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        )
+        .await;
+
+        let packet = synthetic_media_packet(9);
+        let encoded = packet.encode().unwrap();
+        assert!(encoded.len() > 8);
+        publisher
+            .send_datagram(encoded)
+            .expect("publisher sends oversized datagram");
+
+        let read = tokio::time::timeout(Duration::from_millis(150), viewer.read_datagram()).await;
+        assert!(read.is_err(), "oversized datagram should not be forwarded");
+
+        let metrics = send_control_request(
+            &publisher,
+            ClientEnvelope::new(
+                5,
+                ClientControl::PollStreamMetrics(PollStreamMetrics {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        )
+        .await;
+        match metrics.message {
+            ServerControl::StreamMetrics(metrics) => {
+                assert_eq!(metrics.ingress_packets, 0);
+                assert_eq!(metrics.egress_queued_packets, 0);
+                assert_eq!(metrics.egress_dropped_packets, 0);
+                assert_eq!(metrics.ingress_bytes, 0);
             }
             other => panic!("unexpected metrics response: {other:?}"),
         }
