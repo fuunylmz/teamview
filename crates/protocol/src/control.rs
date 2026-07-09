@@ -38,6 +38,7 @@ pub enum ClientControl {
     SubscribeStream(SubscribeStream),
     UnsubscribeStream(UnsubscribeStream),
     LeaveRoom(LeaveRoom),
+    SetVoiceState(SetVoiceState),
     SetStreamConfig(StreamConfig),
     PollStreamConfig(PollStreamConfig),
     PollStreamMetrics(PollStreamMetrics),
@@ -62,6 +63,7 @@ pub enum ServerControl {
     StreamSubscribed(StreamSubscribed),
     StreamUnsubscribed(StreamUnsubscribed),
     RoomLeft(RoomLeft),
+    VoiceStateUpdated(VoiceState),
     RequestKeyframe(RequestKeyframe),
     StreamConfig(StreamConfig),
     StreamMetrics(StreamMetricsSnapshot),
@@ -225,6 +227,21 @@ pub struct LeaveRoom {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomLeft {
     pub room_id: RoomId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetVoiceState {
+    pub room_id: RoomId,
+    pub muted: bool,
+    pub deafened: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceState {
+    pub room_id: RoomId,
+    pub user_id: UserId,
+    pub muted: bool,
+    pub deafened: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,6 +564,33 @@ mod tests {
         let encoded = encode_client_envelope(&envelope).unwrap();
 
         assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn voice_state_round_trips_as_control_messages() {
+        let request = ClientEnvelope::new(
+            9,
+            ClientControl::SetVoiceState(SetVoiceState {
+                room_id: 1,
+                muted: true,
+                deafened: false,
+            }),
+        );
+        let response = ServerEnvelope::new(
+            9,
+            ServerControl::VoiceStateUpdated(VoiceState {
+                room_id: 1,
+                user_id: 7,
+                muted: true,
+                deafened: false,
+            }),
+        );
+
+        let encoded_request = encode_client_envelope(&request).unwrap();
+        let encoded_response = encode_server_envelope(&response).unwrap();
+
+        assert_eq!(decode_client_envelope(&encoded_request).unwrap(), request);
+        assert_eq!(decode_server_envelope(&encoded_response).unwrap(), response);
     }
 
     #[test]

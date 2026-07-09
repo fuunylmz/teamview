@@ -21,9 +21,9 @@ use teamview_protocol::{
         Authenticate, ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, LeaveRoom,
         ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
         PollStreamMetrics, PublishStream, PublisherFeedback, RequestKeyframe, RoomId, RoomSummary,
-        ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig,
-        StreamId, StreamMetricsSnapshot, StreamSummary, SubscribeStream, TimeSyncRequest,
-        TimeSyncResponse, UnsubscribeStream, ViewerStatsReport,
+        ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, SetVoiceState,
+        StreamConfig, StreamId, StreamMetricsSnapshot, StreamSummary, SubscribeStream,
+        TimeSyncRequest, TimeSyncResponse, UnsubscribeStream, ViewerStatsReport,
     },
     frame::{packetize_frame_for_datagram_target, packetize_frame_with_type_for_datagram_target},
     packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, PacketType},
@@ -156,6 +156,12 @@ struct Args {
     #[arg(long, value_enum, default_value_t = AudioOutputArg::Sink)]
     audio_output: AudioOutputArg,
 
+    #[arg(long)]
+    muted: bool,
+
+    #[arg(long)]
+    deafened: bool,
+
     #[arg(long, default_value_t = 0)]
     media_frames: u32,
 
@@ -228,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
         "desktop client endpoint and capture foundation ready"
     );
     println!(
-        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} voice_input={:?} render_output={:?} audio_output={:?}",
+        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} voice_input={:?} render_output={:?} audio_output={:?} muted={} deafened={}",
         args.mode,
         args.relay,
         local_addr,
@@ -237,7 +243,9 @@ async fn main() -> anyhow::Result<()> {
         args.screen_input,
         args.voice_input,
         args.render_output,
-        args.audio_output
+        args.audio_output,
+        args.muted,
+        args.deafened
     );
 
     let control = connect_control_client(&endpoint, &args.relay).await?;
@@ -375,6 +383,35 @@ async fn authenticate_control(
     }
 }
 
+async fn set_voice_state_if_requested(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+) -> anyhow::Result<()> {
+    if !args.muted && !args.deafened {
+        return Ok(());
+    }
+    let response = control
+        .send(ClientControl::SetVoiceState(SetVoiceState {
+            room_id,
+            muted: args.muted,
+            deafened: args.deafened,
+        }))
+        .await?;
+    print_control_response("set-voice-state", &response);
+    match response.message {
+        ServerControl::VoiceStateUpdated(state) => {
+            println!(
+                "voice-state room_id={} user_id={} muted={} deafened={}",
+                state.room_id, state.user_id, state.muted, state.deafened
+            );
+            Ok(())
+        }
+        ServerControl::Error(error) => bail!("set voice state failed: {}", error.message),
+        other => bail!("unexpected set voice state response: {other:?}"),
+    }
+}
+
 async fn run_broadcaster_control_flow(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
@@ -402,6 +439,7 @@ async fn run_broadcaster_control_flow(
         .await?;
     print_control_response("join-room", &joined);
     ensure_not_error("join room", &joined)?;
+    set_voice_state_if_requested(control, args, room_id).await?;
 
     if args.media_kind == MediaKindArg::Both {
         run_broadcaster_dual_stream_control_flow(control, args, room_id, clock_sync).await?;
@@ -498,6 +536,7 @@ async fn run_viewer_control_flow(
         .await?;
     print_control_response("join-room", &joined);
     ensure_not_error("join room", &joined)?;
+    set_voice_state_if_requested(control, args, room_id).await?;
 
     let available_streams = list_room_streams(control, room_id).await?;
     if args.media_kind == MediaKindArg::Both {
@@ -1106,6 +1145,16 @@ async fn run_synthetic_voice_broadcaster_media(
     room_id: RoomId,
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
+    if args.muted {
+        println!(
+            "voice-muted role=broadcaster room_id={} stream_id={}",
+            room_id, args.stream_id
+        );
+        println!(
+            "media-summary role=broadcaster kind=voice muted=true frames=0 packets=0 fps=0 run_ms=0 capture_ms_p50=0 capture_ms_p95=0 encode_ms_p50=0 encode_ms_p95=0 packetize_ms_p50=0 packetize_ms_p95=0 send_ms_p50=0 send_ms_p95=0"
+        );
+        return Ok(());
+    }
     if args.media_start_delay_ms > 0 {
         sleep_with_keepalive(control, Duration::from_millis(args.media_start_delay_ms)).await?;
     }
@@ -1491,6 +1540,7 @@ async fn run_synthetic_dual_viewer_media(
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     let target_frames = args.synthetic_media_frames()?;
+    let target_voice_frames = if args.deafened { 0 } else { target_frames };
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
 
@@ -1505,13 +1555,23 @@ async fn run_synthetic_dual_viewer_media(
 
     let mut voice_buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
     let mut voice_decoder = SyntheticOpusDecoder;
-    let mut voice_playback = args.audio_playback()?;
+    let mut voice_playback = (!args.deafened)
+        .then(|| args.audio_playback())
+        .transpose()?;
     let mut voice_stats = ClientMediaStats::default();
     let mut voice_reassembled_frames = 0_u32;
     let mut voice_decoded_frames = 0_u32;
     let mut voice_received_packets = 0_u64;
+    if args.deafened {
+        println!(
+            "voice-deafened role=viewer room_id={} stream_id={}",
+            room_id, voice_stream_id
+        );
+    }
 
-    while screen_reassembled_frames < target_frames || voice_reassembled_frames < target_frames {
+    while screen_reassembled_frames < target_frames
+        || voice_reassembled_frames < target_voice_frames
+    {
         let packet = match recv_media_packet_with_keepalive(
             control,
             Duration::from_millis(args.media_idle_timeout_ms),
@@ -1634,7 +1694,9 @@ async fn run_synthetic_dual_viewer_media(
                     send_viewer_stats(control, room_id, screen_stream_id, screen_stats).await?;
                 }
             }
-        } else if packet_stream_id == voice_stream_id && voice_reassembled_frames < target_frames {
+        } else if packet_stream_id == voice_stream_id
+            && voice_reassembled_frames < target_voice_frames
+        {
             voice_stats.record_packet(&packet);
             voice_received_packets += 1;
             let outcome = voice_buffer.push_with_stats_at(packet, packet_receive_time_micros)?;
@@ -1681,6 +1743,9 @@ async fn run_synthetic_dual_viewer_media(
                     let decode_duration = decode_start.elapsed();
                     voice_stats.record_decode_duration(decode_duration);
                     let play_start = Instant::now();
+                    let voice_playback = voice_playback
+                        .as_mut()
+                        .context("voice playback is disabled while deafened")?;
                     voice_playback.play(decoded)?;
                     let play_duration = play_start.elapsed();
                     voice_stats.record_render_duration(play_duration, unix_time_micros());
@@ -1761,7 +1826,10 @@ async fn run_synthetic_dual_viewer_media(
         voice_stream_id,
         voice_reassembled_frames,
         voice_decoded_frames,
-        voice_playback.played_frames(),
+        voice_playback
+            .as_ref()
+            .map(|playback| playback.played_frames())
+            .unwrap_or_default(),
         voice_received_packets,
         voice_stats.lost_packets,
         voice_stats.dropped_frames,
@@ -1957,6 +2025,16 @@ async fn run_synthetic_voice_viewer_media(
     stream_id: StreamId,
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
+    if args.deafened {
+        println!(
+            "voice-deafened role=viewer room_id={} stream_id={}",
+            room_id, stream_id
+        );
+        println!(
+            "media-summary role=viewer kind=voice deafened=true frames=0 decoded=0 played=0 packets=0 lost=0 dropped=0 latency_ms=0 calibrated_latency_ms=0 sender_encode_ms_p50=0 sender_encode_ms_p95=0 sender_send_ms_p50=0 sender_send_ms_p95=0 server_queue_ms_p50=0 server_queue_ms_p95=0 reassembly_ms_p50=0 reassembly_ms_p95=0 decode_ms_p50=0 decode_ms_p95=0 play_ms_p50=0 play_ms_p95=0 play_fps=0"
+        );
+        return Ok(());
+    }
     let target_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
@@ -2502,6 +2580,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.audio_output, AudioOutputArg::Speaker);
+    }
+
+    #[test]
+    fn voice_state_flags_parse() {
+        let args = Args::try_parse_from(["desktop-client", "--muted", "--deafened"]).unwrap();
+
+        assert!(args.muted);
+        assert!(args.deafened);
     }
 
     #[test]

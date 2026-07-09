@@ -5,9 +5,9 @@ use teamview_protocol::{
     control::{
         ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason, MediaKind,
         Pong, RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, RoomList, RoomSummary,
-        ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig,
-        StreamId, StreamList, StreamPublished, StreamSubscribed, StreamSummary, StreamUnsubscribed,
-        TimeSyncResponse, UserId, ViewerStatsReport,
+        ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, SetVoiceState,
+        StreamConfig, StreamId, StreamList, StreamPublished, StreamSubscribed, StreamSummary,
+        StreamUnsubscribed, TimeSyncResponse, UserId, ViewerStatsReport, VoiceState,
     },
     packet::MediaPacket,
 };
@@ -35,6 +35,7 @@ const MAX_TARGET_HEIGHT: u32 = 4320;
 pub struct ControlState {
     rooms: BTreeMap<RoomId, Room>,
     viewer_stats: BTreeMap<StreamId, BTreeMap<UserId, ViewerStatsReport>>,
+    voice_states: BTreeMap<RoomId, BTreeMap<UserId, VoiceState>>,
     pending_keyframe_requests: BTreeMap<StreamId, KeyframeReason>,
     stream_metrics: BTreeMap<StreamId, StreamForwardingMetrics>,
     access_token: Option<String>,
@@ -55,6 +56,7 @@ impl ControlState {
         Self {
             rooms: BTreeMap::new(),
             viewer_stats: BTreeMap::new(),
+            voice_states: BTreeMap::new(),
             pending_keyframe_requests: BTreeMap::new(),
             stream_metrics: BTreeMap::new(),
             access_token: None,
@@ -147,6 +149,7 @@ impl ControlState {
                     let mut room = Room::new(room_id, &create.name);
                     room.join(user_id);
                     self.rooms.insert(room_id, room);
+                    self.ensure_voice_state(room_id, user_id);
                     ServerControl::RoomCreated(RoomCreated {
                         room_id,
                         name: create.name,
@@ -161,6 +164,7 @@ impl ControlState {
                 Some(room) => match session.user_id {
                     Some(user_id) => {
                         let participant_count = room.join(user_id);
+                        self.ensure_voice_state(join.room_id, user_id);
                         ServerControl::RoomJoined(RoomJoined {
                             room_id: join.room_id,
                             participant_count,
@@ -283,6 +287,7 @@ impl ControlState {
                     room_id: leave.room_id,
                 })
             }
+            ClientControl::SetVoiceState(voice_state) => self.set_voice_state(session, voice_state),
             ClientControl::SetStreamConfig(config) => self.set_stream_config(session, config),
             ClientControl::PollStreamConfig(poll) => {
                 self.poll_stream_config(session, poll.room_id, poll.stream_id)
@@ -373,6 +378,23 @@ impl ControlState {
             .collect()
     }
 
+    pub fn voice_state_for_stream(
+        &self,
+        stream_id: StreamId,
+        user_id: UserId,
+    ) -> Option<&VoiceState> {
+        self.rooms
+            .iter()
+            .find(|(_, room)| room.published_streams.contains_key(&stream_id))
+            .and_then(|(room_id, _)| self.voice_state(*room_id, user_id))
+    }
+
+    pub fn voice_state(&self, room_id: RoomId, user_id: UserId) -> Option<&VoiceState> {
+        self.voice_states
+            .get(&room_id)
+            .and_then(|room_voice_states| room_voice_states.get(&user_id))
+    }
+
     pub fn disconnect_user(&mut self, user_id: UserId) {
         let affected_rooms = self
             .rooms
@@ -420,6 +442,7 @@ impl ControlState {
         for stream_id in subscribed_streams {
             self.remove_viewer_stats(stream_id, user_id);
         }
+        self.remove_voice_state(room_id, user_id);
         for stream_id in removed_streams {
             self.remove_stream_state(stream_id);
         }
@@ -435,7 +458,60 @@ impl ControlState {
     fn remove_room_if_empty(&mut self, room_id: RoomId) {
         if self.rooms.get(&room_id).is_some_and(Room::is_empty) {
             self.rooms.remove(&room_id);
+            self.voice_states.remove(&room_id);
         }
+    }
+
+    fn ensure_voice_state(&mut self, room_id: RoomId, user_id: UserId) {
+        self.voice_states
+            .entry(room_id)
+            .or_default()
+            .entry(user_id)
+            .or_insert_with(|| VoiceState {
+                room_id,
+                user_id,
+                muted: false,
+                deafened: false,
+            });
+    }
+
+    fn remove_voice_state(&mut self, room_id: RoomId, user_id: UserId) {
+        let Some(room_voice_states) = self.voice_states.get_mut(&room_id) else {
+            return;
+        };
+        room_voice_states.remove(&user_id);
+        if room_voice_states.is_empty() {
+            self.voice_states.remove(&room_id);
+        }
+    }
+
+    fn set_voice_state(&mut self, session: &Session, request: SetVoiceState) -> ServerControl {
+        let Some(user_id) = session.user_id else {
+            return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
+        };
+        let Some(room) = self.rooms.get(&request.room_id) else {
+            return ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            ));
+        };
+        if !room.participants.contains(&user_id) {
+            return ServerControl::Error(ControlError::new(
+                "not_in_room",
+                "join room before updating voice state",
+            ));
+        }
+        let voice_state = VoiceState {
+            room_id: request.room_id,
+            user_id,
+            muted: request.muted,
+            deafened: request.deafened,
+        };
+        self.voice_states
+            .entry(request.room_id)
+            .or_default()
+            .insert(user_id, voice_state.clone());
+        ServerControl::VoiceStateUpdated(voice_state)
     }
 
     pub fn record_media_forward_summary(
@@ -959,7 +1035,8 @@ mod tests {
             Authenticate, ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, LeaveRoom,
             ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
             PollStreamMetrics, PublishStream, RequestKeyframe, SetTargetBitrate,
-            SetTargetFramerate, StreamConfig, SubscribeStream, TimeSyncRequest, ViewerStatsReport,
+            SetTargetFramerate, SetVoiceState, StreamConfig, SubscribeStream, TimeSyncRequest,
+            ViewerStatsReport,
         },
         packet::{MediaPacket, MediaPacketHeader, PacketFlags, PacketType},
     };
@@ -2226,6 +2303,104 @@ mod tests {
         assert_eq!(room.participants.len(), 2);
         assert_eq!(room.published_streams.len(), 1);
         assert_eq!(room.subscriptions.get(&9).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn voice_state_update_requires_room_participant() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                4,
+                ClientControl::SetVoiceState(SetVoiceState {
+                    room_id,
+                    muted: true,
+                    deafened: false,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_in_room"),
+            other => panic!("unexpected voice state response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn voice_state_update_is_stored() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        authenticate(&mut state, &mut publisher, "publisher");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        let user_id = publisher.user_id.unwrap();
+
+        let response = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                4,
+                ClientControl::SetVoiceState(SetVoiceState {
+                    room_id,
+                    muted: true,
+                    deafened: true,
+                }),
+            ),
+        );
+
+        assert_eq!(
+            response.message,
+            ServerControl::VoiceStateUpdated(VoiceState {
+                room_id,
+                user_id,
+                muted: true,
+                deafened: true,
+            })
+        );
+        assert_eq!(
+            state.voice_state(room_id, user_id),
+            Some(&VoiceState {
+                room_id,
+                user_id,
+                muted: true,
+                deafened: true,
+            })
+        );
+    }
+
+    #[test]
+    fn leaving_room_removes_voice_state() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        authenticate(&mut state, &mut publisher, "publisher");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        let user_id = publisher.user_id.unwrap();
+
+        state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                4,
+                ClientControl::SetVoiceState(SetVoiceState {
+                    room_id,
+                    muted: true,
+                    deafened: false,
+                }),
+            ),
+        );
+        assert!(state.voice_state(room_id, user_id).is_some());
+
+        state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(5, ClientControl::LeaveRoom(LeaveRoom { room_id })),
+        );
+
+        assert!(state.voice_state(room_id, user_id).is_none());
     }
 
     fn authenticate(state: &mut ControlState, session: &mut Session, client_name: &str) {

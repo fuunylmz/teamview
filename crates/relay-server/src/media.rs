@@ -131,6 +131,18 @@ impl MediaRelay {
                 summary.dropped += 1;
                 continue;
             };
+            if published.media_kind == MediaKind::Voice
+                && state
+                    .voice_state_for_stream(stream_id, subscriber_id)
+                    .is_some_and(|voice_state| voice_state.deafened)
+            {
+                summary.dropped += 1;
+                debug!(
+                    subscriber_id,
+                    stream_id, "dropping voice datagram for deafened viewer"
+                );
+                continue;
+            }
             if !egress.try_reserve_media(stream_id, media_duration_ms, self.viewer_queue_budget_ms)
             {
                 summary.dropped += 1;
@@ -424,7 +436,7 @@ mod tests {
         codec::CodecId,
         control::{
             ClientControl, ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind, PublishStream,
-            SubscribeStream,
+            SetVoiceState, SubscribeStream,
         },
         packet::{MediaPacketHeader, PacketFlags, PacketType},
     };
@@ -603,6 +615,32 @@ mod tests {
         assert!(viewer_rx.try_recv().is_err());
     }
 
+    #[test]
+    fn deafened_viewer_does_not_receive_voice_datagrams() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        let room_id = setup_published_stream(&mut state, &mut publisher, &mut viewer);
+        publish_voice_stream(&mut state, &mut publisher, room_id, 10);
+        subscribe_stream(&mut state, &mut viewer, room_id, 10);
+        set_voice_state(&mut state, &mut viewer, room_id, false, true);
+
+        let mut relay = MediaRelay::with_egress_limits(8, 100);
+        let mut viewer_rx = relay.register_paused_for_test(viewer.user_id.unwrap());
+        let voice = synthetic_audio_packet_with_sequence(10, 1);
+
+        let summary =
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &voice, 123_000);
+
+        assert_eq!(summary.queued, 0);
+        assert_eq!(summary.dropped, 1);
+        assert_eq!(
+            relay.stream_egress_depth(&state, 10),
+            EgressQueueDepth::default()
+        );
+        assert!(viewer_rx.try_recv().is_err());
+    }
+
     fn setup_published_stream(
         state: &mut ControlState,
         publisher: &mut Session,
@@ -734,6 +772,26 @@ mod tests {
             ClientEnvelope::new(
                 7,
                 ClientControl::SubscribeStream(SubscribeStream { room_id, stream_id }),
+            ),
+        );
+    }
+
+    fn set_voice_state(
+        state: &mut ControlState,
+        viewer: &mut Session,
+        room_id: u64,
+        muted: bool,
+        deafened: bool,
+    ) {
+        state.handle_client_envelope(
+            viewer,
+            ClientEnvelope::new(
+                8,
+                ClientControl::SetVoiceState(SetVoiceState {
+                    room_id,
+                    muted,
+                    deafened,
+                }),
             ),
         );
     }

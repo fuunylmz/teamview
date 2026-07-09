@@ -42,6 +42,7 @@ Current control messages cover:
 - list streams
 - subscribe / unsubscribe stream
 - leave room
+- voice state updates for mute/deafen
 - keyframe request
 - stream config
 - stream metrics
@@ -58,6 +59,8 @@ When the relay is started with an access token, clients must send `Authenticate`
 Viewers can discover active sessions before subscribing. `ListRooms` returns room ids, names, participant counts, and published stream counts. After joining a room, `ListStreams` returns stream ids, publisher ids, codec/media kind, subscriber counts, config availability, and current target bitrate/FPS. The desktop viewer uses these messages to select a room by `--room-name` when `--room-id` is not provided, then polls `StreamConfig` for the current width/height.
 
 Room creators are automatically added as participants. `LeaveRoom` removes the user from participants and subscriptions; if the leaving user published streams, those streams and their viewer stats, metrics, keyframe requests, and subscriptions are removed too. Empty rooms are removed from discovery. The desktop client sends `UnsubscribeStream` and `LeaveRoom` during normal viewer shutdown, sends `LeaveRoom` during normal broadcaster shutdown, and the relay applies the same cleanup when a connection disconnects unexpectedly.
+
+Room participants can send `SetVoiceState` with `muted` and `deafened` flags. The relay stores that room-scoped voice state, removes it when the participant leaves, and suppresses voice datagrams for deafened viewers. The desktop broadcaster uses `--muted` to stop sending voice frames, and the desktop viewer uses `--deafened` to avoid waiting for or playing voice media.
 
 Keyframe requests are accepted from subscribed viewers and are also registered automatically when a viewer first subscribes to a stream. The relay exposes those requests to the publisher through `PublisherFeedback.keyframe_requested`; the publisher consumes the pending request when it polls feedback and should make the next encoded video frame a keyframe.
 
