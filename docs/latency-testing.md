@@ -100,7 +100,7 @@ Expected output includes at least one `capture-source kind=monitor` line. Visibl
 Live primary-monitor smoke test:
 
 ```bash
-cargo run -p relay-server -- --listen 127.0.0.1:4433
+cargo run -p relay-server -- --listen 127.0.0.1:4433 --viewer-queue-budget-ms 100
 cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --screen-input live --media-frames 1 --media-fps 1
 ```
 
@@ -171,6 +171,7 @@ Expected behavior:
 - The final broadcaster summary includes capture/encode/packetize/send p50 and p95 timing.
 - Each received frame prints `latency_ms` and `reassembly_ms`, and the final viewer summary includes latest estimated latency plus reassembly/decode/render p50 and p95 timing.
 - The viewer reassembly buffer drops stale incomplete frames after `--reassembly-window-frames` to avoid accumulating latency.
+- The relay enforces each viewer egress queue's media-time budget, dropping over-budget datagrams for that viewer without blocking other viewers.
 - The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.
 - New subscribers, packet loss, and decoder recovery can register keyframe requests with the relay.
 - The broadcaster polls aggregated `PublisherFeedback`; when feedback requests a keyframe, the synthetic encoder marks the next frame as a keyframe.

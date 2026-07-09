@@ -68,6 +68,8 @@ Room participants can poll `StreamMetrics` for a published stream. The relay rep
 
 Media packets travel over QUIC datagrams. Each datagram carries one packet with a versioned binary header and an opaque encoded payload.
 
+The relay uses the stream framerate and fragment count to estimate queued media time for each datagram. If forwarding a datagram would push a viewer beyond its configured egress media budget, only that viewer's datagram is dropped.
+
 Encoded frames may be fragmented into multiple datagrams for MTU safety. Fragmentation is only a transport concern; the relay never decodes or transforms media content.
 
 The packet header is defined in `crates/protocol/src/packet.rs` and includes:

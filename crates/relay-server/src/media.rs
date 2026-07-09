@@ -1,4 +1,10 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+};
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -19,36 +25,58 @@ use tracing::{debug, warn};
 use crate::{
     control::ControlState,
     metrics::{micros_delta_to_millis, unix_time_micros},
+    room::PublishedStream,
 };
 
 const DEFAULT_EGRESS_QUEUE_CAPACITY: usize = 256;
+const DEFAULT_VIEWER_QUEUE_BUDGET_MS: u16 = 100;
 
 #[derive(Debug)]
 pub struct MediaRelay {
     egress: BTreeMap<UserId, ViewerEgress>,
     egress_queue_capacity: usize,
+    viewer_queue_budget_ms: u16,
 }
 
 impl MediaRelay {
     pub fn new() -> Self {
-        Self::with_egress_queue_capacity(DEFAULT_EGRESS_QUEUE_CAPACITY)
+        Self::with_egress_limits(
+            DEFAULT_EGRESS_QUEUE_CAPACITY,
+            DEFAULT_VIEWER_QUEUE_BUDGET_MS,
+        )
     }
 
     pub fn with_egress_queue_capacity(egress_queue_capacity: usize) -> Self {
+        Self::with_egress_limits(egress_queue_capacity, DEFAULT_VIEWER_QUEUE_BUDGET_MS)
+    }
+
+    pub fn with_viewer_queue_budget_ms(viewer_queue_budget_ms: u16) -> Self {
+        Self::with_egress_limits(DEFAULT_EGRESS_QUEUE_CAPACITY, viewer_queue_budget_ms)
+    }
+
+    pub fn with_egress_limits(egress_queue_capacity: usize, viewer_queue_budget_ms: u16) -> Self {
         Self {
             egress: BTreeMap::new(),
             egress_queue_capacity: egress_queue_capacity.max(1),
+            viewer_queue_budget_ms: viewer_queue_budget_ms.max(1),
         }
     }
 
     pub fn register(&mut self, user_id: UserId, connection: Connection) {
         self.unregister(user_id);
         let (sender, receiver) = mpsc::channel(self.egress_queue_capacity);
-        let send_task = tokio::spawn(send_viewer_egress(user_id, connection, receiver));
+        let queued_media_ms = Arc::new(AtomicU32::new(0));
+        let send_task = tokio::spawn(send_viewer_egress(
+            user_id,
+            connection,
+            receiver,
+            queued_media_ms.clone(),
+        ));
         self.egress.insert(
             user_id,
             ViewerEgress {
                 sender,
+                queued_media_ms,
                 send_task: Some(send_task),
             },
         );
@@ -90,6 +118,8 @@ impl MediaRelay {
                 dropped: 1,
             };
         };
+        let media_duration_ms =
+            packet_media_duration_ms(packet, published, self.viewer_queue_budget_ms);
 
         let mut summary = MediaForwardSummary {
             stream_id,
@@ -104,16 +134,32 @@ impl MediaRelay {
                 summary.dropped += 1;
                 continue;
             };
-            match egress.sender.try_send(encoded.clone()) {
+            if !egress.try_reserve_media(media_duration_ms, self.viewer_queue_budget_ms) {
+                summary.dropped += 1;
+                debug!(
+                    subscriber_id,
+                    queued_media_ms = egress.queued_media_ms.load(Ordering::Relaxed),
+                    budget_ms = self.viewer_queue_budget_ms,
+                    "dropping media datagram for over-budget viewer egress queue"
+                );
+                continue;
+            }
+            let datagram = EgressDatagram {
+                bytes: encoded.clone(),
+                media_duration_ms,
+            };
+            match egress.sender.try_send(datagram) {
                 Ok(()) => summary.queued += 1,
-                Err(TrySendError::Full(_)) => {
+                Err(TrySendError::Full(datagram)) => {
+                    egress.release_media(datagram.media_duration_ms);
                     summary.dropped += 1;
                     debug!(
                         subscriber_id,
                         "dropping media datagram for full viewer egress queue"
                     );
                 }
-                Err(TrySendError::Closed(_)) => {
+                Err(TrySendError::Closed(datagram)) => {
+                    egress.release_media(datagram.media_duration_ms);
                     summary.dropped += 1;
                     debug!(
                         subscriber_id,
@@ -126,13 +172,14 @@ impl MediaRelay {
     }
 
     #[cfg(test)]
-    fn register_paused_for_test(&mut self, user_id: UserId) -> mpsc::Receiver<Bytes> {
+    fn register_paused_for_test(&mut self, user_id: UserId) -> mpsc::Receiver<EgressDatagram> {
         self.unregister(user_id);
         let (sender, receiver) = mpsc::channel(self.egress_queue_capacity);
         self.egress.insert(
             user_id,
             ViewerEgress {
                 sender,
+                queued_media_ms: Arc::new(AtomicU32::new(0)),
                 send_task: None,
             },
         );
@@ -148,8 +195,38 @@ impl Default for MediaRelay {
 
 #[derive(Debug)]
 struct ViewerEgress {
-    sender: mpsc::Sender<Bytes>,
+    sender: mpsc::Sender<EgressDatagram>,
+    queued_media_ms: Arc<AtomicU32>,
     send_task: Option<JoinHandle<()>>,
+}
+
+impl ViewerEgress {
+    fn try_reserve_media(&self, media_duration_ms: u16, queue_budget_ms: u16) -> bool {
+        let media_duration_ms = media_duration_ms as u32;
+        let queue_budget_ms = queue_budget_ms as u32;
+        let mut current = self.queued_media_ms.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(media_duration_ms) else {
+                return false;
+            };
+            if next > queue_budget_ms {
+                return false;
+            }
+            match self.queued_media_ms.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_media(&self, media_duration_ms: u16) {
+        release_queued_media(&self.queued_media_ms, media_duration_ms);
+    }
 }
 
 impl Drop for ViewerEgress {
@@ -163,13 +240,51 @@ impl Drop for ViewerEgress {
 async fn send_viewer_egress(
     user_id: UserId,
     connection: Connection,
-    mut receiver: mpsc::Receiver<Bytes>,
+    mut receiver: mpsc::Receiver<EgressDatagram>,
+    queued_media_ms: Arc<AtomicU32>,
 ) {
-    while let Some(bytes) = receiver.recv().await {
-        if let Err(error) = connection.send_datagram(bytes) {
+    while let Some(datagram) = receiver.recv().await {
+        let media_duration_ms = datagram.media_duration_ms;
+        if let Err(error) = connection.send_datagram(datagram.bytes) {
             warn!(user_id, %error, "failed to send queued media datagram");
         }
+        release_queued_media(&queued_media_ms, media_duration_ms);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EgressDatagram {
+    bytes: Bytes,
+    media_duration_ms: u16,
+}
+
+fn release_queued_media(queued_media_ms: &AtomicU32, media_duration_ms: u16) {
+    let media_duration_ms = media_duration_ms as u32;
+    if media_duration_ms == 0 {
+        return;
+    }
+    let _ = queued_media_ms.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(media_duration_ms))
+    });
+}
+
+fn packet_media_duration_ms(
+    packet: &MediaPacket,
+    published: &PublishedStream,
+    queue_budget_ms: u16,
+) -> u16 {
+    let fps = published
+        .config
+        .as_ref()
+        .map(|config| config.frames_per_second)
+        .unwrap_or(published.target_frames_per_second)
+        .max(1) as u32;
+    let frame_duration_ms = 1_000_u32.div_ceil(fps).min(queue_budget_ms.max(1) as u32);
+    let fragment_count = packet.header.fragment_count.max(1) as u32;
+    frame_duration_ms
+        .saturating_div(fragment_count)
+        .max(1)
+        .min(u16::MAX as u32) as u16
 }
 
 fn media_kind_packet_type(media_kind: MediaKind) -> PacketType {
@@ -299,7 +414,7 @@ mod tests {
         assert_eq!(first_summary.dropped, 0);
 
         let fast_first = fast_rx.try_recv().unwrap();
-        assert_eq!(MediaPacket::decode(&fast_first).unwrap(), first);
+        assert_eq!(MediaPacket::decode(&fast_first.bytes).unwrap(), first);
 
         let second = synthetic_packet_with_sequence(9, 2);
         let second_summary =
@@ -308,10 +423,36 @@ mod tests {
         assert_eq!(second_summary.dropped, 1);
 
         let fast_second = fast_rx.try_recv().unwrap();
-        assert_eq!(MediaPacket::decode(&fast_second).unwrap(), second);
+        assert_eq!(MediaPacket::decode(&fast_second.bytes).unwrap(), second);
         let slow_first = slow_rx.try_recv().unwrap();
-        assert_eq!(MediaPacket::decode(&slow_first).unwrap(), first);
+        assert_eq!(MediaPacket::decode(&slow_first.bytes).unwrap(), first);
         assert!(slow_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn viewer_egress_media_budget_drops_before_channel_capacity() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        setup_published_stream(&mut state, &mut publisher, &mut viewer);
+
+        let mut relay = MediaRelay::with_egress_limits(8, 50);
+        let mut viewer_rx = relay.register_paused_for_test(viewer.user_id.unwrap());
+
+        let first = synthetic_packet_with_sequence(9, 1);
+        let first_summary = relay.forward_media_packet(&state, publisher.user_id.unwrap(), &first);
+        assert_eq!(first_summary.queued, 1);
+        assert_eq!(first_summary.dropped, 0);
+
+        let second = synthetic_packet_with_sequence(9, 2);
+        let second_summary =
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &second);
+        assert_eq!(second_summary.queued, 0);
+        assert_eq!(second_summary.dropped, 1);
+
+        let queued_first = viewer_rx.try_recv().unwrap();
+        assert_eq!(MediaPacket::decode(&queued_first.bytes).unwrap(), first);
+        assert!(viewer_rx.try_recv().is_err());
     }
 
     fn setup_published_stream(

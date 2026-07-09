@@ -51,7 +51,9 @@ impl ControlRuntime {
         };
         Self {
             state: Arc::new(Mutex::new(state)),
-            media: Arc::new(Mutex::new(MediaRelay::new())),
+            media: Arc::new(Mutex::new(MediaRelay::with_viewer_queue_budget_ms(
+                config.viewer_queue_budget_ms,
+            ))),
             next_session_id: Arc::new(AtomicU64::new(1)),
         }
     }

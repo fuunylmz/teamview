@@ -12,6 +12,9 @@ struct Args {
 
     #[arg(long)]
     access_token: Option<String>,
+
+    #[arg(long, default_value_t = 100)]
+    viewer_queue_budget_ms: u16,
 }
 
 #[tokio::main]
@@ -19,7 +22,8 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
-    let config = ServerConfig::new(args.listen).with_access_token(args.access_token);
+    let mut config = ServerConfig::new(args.listen).with_access_token(args.access_token);
+    config.viewer_queue_budget_ms = args.viewer_queue_budget_ms.max(1);
     let endpoint = build_server_endpoint(&config.listen_addr)?;
     let local_addr = endpoint.local_addr()?;
 
