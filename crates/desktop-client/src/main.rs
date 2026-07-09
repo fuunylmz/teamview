@@ -239,6 +239,9 @@ struct Args {
     #[arg(long, default_value_t = 6)]
     reassembly_window_frames: u32,
 
+    #[arg(long, default_value_t = 150)]
+    jitter_buffer_max_ms: u16,
+
     #[arg(long, default_value_t = 30)]
     stats_interval_frames: u32,
 
@@ -1827,7 +1830,7 @@ async fn run_synthetic_dual_viewer_media(
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
     let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
 
-    let mut screen_buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
+    let mut screen_buffer = args.frame_reassembly_buffer(frame_interval_ms);
     let mut screen_decoder = args.video_decoder()?;
     let mut screen_playback = args.video_playback()?;
     let mut screen_stats = ClientMediaStats::default();
@@ -1836,7 +1839,7 @@ async fn run_synthetic_dual_viewer_media(
     let mut screen_received_packets = 0_u64;
     let mut awaiting_recovery_keyframe = false;
 
-    let mut voice_buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
+    let mut voice_buffer = args.frame_reassembly_buffer(frame_interval_ms);
     let mut voice_decoder = SyntheticOpusDecoder;
     let mut voice_playback = (!args.deafened)
         .then(|| args.audio_playback())
@@ -2159,7 +2162,7 @@ async fn run_synthetic_screen_viewer_media(
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
     let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
-    let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
+    let mut buffer = args.frame_reassembly_buffer(frame_interval_ms);
     let mut decoder = args.video_decoder()?;
     let mut playback = args.video_playback()?;
     let mut stats = ClientMediaStats::default();
@@ -2325,7 +2328,7 @@ async fn run_synthetic_voice_viewer_media(
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
     let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
-    let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
+    let mut buffer = args.frame_reassembly_buffer(frame_interval_ms);
     let mut decoder = SyntheticOpusDecoder;
     let mut playback = args.audio_playback()?;
     let mut stats = ClientMediaStats::default();
@@ -2677,6 +2680,15 @@ impl Args {
 
     fn clock_sync_refresh_interval(&self) -> Option<Duration> {
         (self.time_sync_refresh_ms > 0).then(|| Duration::from_millis(self.time_sync_refresh_ms))
+    }
+
+    fn frame_reassembly_buffer(&self, frame_interval_ms: u16) -> FrameReassemblyBuffer {
+        FrameReassemblyBuffer::with_jitter_budget(
+            64,
+            self.reassembly_window_frames,
+            self.jitter_buffer_max_ms,
+            frame_interval_ms.max(1),
+        )
     }
 
     fn synthetic_bitrate_bps(&self) -> u32 {
@@ -3235,6 +3247,16 @@ mod tests {
             Some(Duration::from_millis(5_000))
         );
         assert_eq!(disabled_args.clock_sync_refresh_interval(), None);
+    }
+
+    #[test]
+    fn jitter_buffer_max_ms_defaults_to_low_latency_budget() {
+        let default_args = Args::try_parse_from(["desktop-client"]).unwrap();
+        let custom_args =
+            Args::try_parse_from(["desktop-client", "--jitter-buffer-max-ms", "80"]).unwrap();
+
+        assert_eq!(default_args.jitter_buffer_max_ms, 150);
+        assert_eq!(custom_args.jitter_buffer_max_ms, 80);
     }
 
     #[test]

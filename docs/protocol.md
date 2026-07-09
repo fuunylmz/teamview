@@ -79,7 +79,7 @@ Room participants can poll `StreamMetrics` for a published stream. The relay rep
 
 Media packets travel over QUIC datagrams. Each datagram carries one packet with a versioned binary header and an opaque encoded payload.
 
-The relay uses the stream framerate and fragment count to estimate queued media time for each datagram. If forwarding a datagram would push a viewer's queue for that stream beyond its configured egress media budget, only that viewer/stream datagram is dropped; other subscribed streams for the same viewer keep their own budget.
+The relay uses the stream framerate and fragment count to estimate queued media time for each datagram. If forwarding a datagram would push a viewer's queue for that stream beyond its configured egress media budget, only that viewer/stream datagram is dropped; other subscribed streams for the same viewer keep their own budget. On the receiving side, the desktop viewer also bounds incomplete-frame reassembly by media time with `--jitter-buffer-max-ms`, defaulting to 150 ms, and drops the oldest incomplete frames when the local jitter budget is exceeded.
 
 The relay enforces a configurable maximum ingress datagram size before decoding media packets. Datagrams larger than `--max-datagram-payload` are dropped at ingress and are not counted as accepted stream metrics.
 

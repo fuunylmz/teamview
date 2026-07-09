@@ -28,12 +28,15 @@ pub trait VideoDecoder {
 
 const MAX_PENDING_FRAMES: usize = 64;
 const MAX_FRAME_AGE_FRAMES: u32 = 64;
+const UNBOUNDED_PENDING_MEDIA_MS: u16 = u16::MAX;
 
 #[derive(Debug, Default)]
 pub struct FrameReassemblyBuffer {
     pending: BTreeMap<u32, PendingFrame>,
     max_pending_frames: usize,
     max_frame_age_frames: u32,
+    max_pending_media_ms: u16,
+    frame_interval_ms: u16,
 }
 
 impl FrameReassemblyBuffer {
@@ -46,6 +49,24 @@ impl FrameReassemblyBuffer {
             pending: BTreeMap::new(),
             max_pending_frames: max_pending_frames.max(1),
             max_frame_age_frames: max_frame_age_frames.max(1),
+            max_pending_media_ms: UNBOUNDED_PENDING_MEDIA_MS,
+            frame_interval_ms: 1,
+        }
+    }
+
+    pub fn with_jitter_budget(
+        max_pending_frames: usize,
+        max_frame_age_frames: u32,
+        max_pending_media_ms: u16,
+        frame_interval_ms: u16,
+    ) -> Self {
+        let frame_interval_ms = frame_interval_ms.max(1);
+        Self {
+            pending: BTreeMap::new(),
+            max_pending_frames: max_pending_frames.max(1),
+            max_frame_age_frames: max_frame_age_frames.max(1),
+            max_pending_media_ms: max_pending_media_ms.max(frame_interval_ms),
+            frame_interval_ms,
         }
     }
 
@@ -90,6 +111,7 @@ impl FrameReassemblyBuffer {
         }
         pending.packets.push(packet);
         if pending.packets.len() != fragment_count {
+            dropped_frames += self.evict_media_budget();
             return Ok(ReassemblyOutcome {
                 frame: None,
                 dropped_frames,
@@ -133,6 +155,24 @@ impl FrameReassemblyBuffer {
             self.pending.remove(&frame_id);
         }
         dropped_frames
+    }
+
+    fn evict_media_budget(&mut self) -> u64 {
+        let mut dropped_frames = 0_u64;
+        while self.pending_media_ms() > self.max_pending_media_ms && !self.pending.is_empty() {
+            let Some(oldest_frame_id) = self.pending.keys().next().copied() else {
+                break;
+            };
+            self.pending.remove(&oldest_frame_id);
+            dropped_frames = dropped_frames.saturating_add(1);
+        }
+        dropped_frames
+    }
+
+    fn pending_media_ms(&self) -> u16 {
+        (self.pending.len() as u64)
+            .saturating_mul(self.frame_interval_ms as u64)
+            .min(u16::MAX as u64) as u16
     }
 }
 
@@ -289,6 +329,38 @@ mod tests {
         let outcome = buffer.push_with_stats(new_packets.remove(0)).unwrap();
 
         assert_eq!(outcome.dropped_frames, 1);
+        assert_eq!(buffer.pending_frames(), 1);
+    }
+
+    #[test]
+    fn reassembly_buffer_drops_incomplete_frames_over_media_budget() {
+        let mut buffer = FrameReassemblyBuffer::with_jitter_budget(64, 64, 150, 50);
+        let mut last_outcome = ReassemblyOutcome {
+            frame: None,
+            dropped_frames: 0,
+            reassembly_ms: 0,
+        };
+
+        for frame_id in 1..=4 {
+            let mut packets = packetize_frame(&sample_frame_with_id(frame_id), 1, 8).unwrap();
+            packets.pop();
+            last_outcome = buffer.push_with_stats(packets.remove(0)).unwrap();
+        }
+
+        assert_eq!(last_outcome.dropped_frames, 1);
+        assert_eq!(buffer.pending_frames(), 3);
+        assert_eq!(buffer.estimated_jitter_ms(50), 150);
+    }
+
+    #[test]
+    fn reassembly_buffer_media_budget_allows_at_least_one_frame() {
+        let mut buffer = FrameReassemblyBuffer::with_jitter_budget(64, 64, 1, 50);
+        let mut packets = packetize_frame(&sample_frame_with_id(1), 1, 8).unwrap();
+        packets.pop();
+
+        let outcome = buffer.push_with_stats(packets.remove(0)).unwrap();
+
+        assert_eq!(outcome.dropped_frames, 0);
         assert_eq!(buffer.pending_frames(), 1);
     }
 
