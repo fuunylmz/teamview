@@ -92,11 +92,11 @@ For a local desktop-client synthetic media session, start the relay, then start 
 
 ```bash
 cargo run -p relay-server -- --listen 127.0.0.1:4433
-cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 5 --media-frame-bytes 800 --max-datagram-payload 700
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 5 --media-frame-bytes 800 --max-datagram-payload 700 --feedback-interval-frames 2
 cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-id 1 --media-run-ms 1000 --media-fps 5 --max-datagram-payload 700
 ```
 
-Expected viewer output includes received frames, periodic `viewer-stats` responses, and a final summary similar to:
+Expected output includes publisher feedback polling, received frames, periodic `viewer-stats` responses, and a final viewer summary similar to:
 
 ```text
 media-summary role=viewer frames=5 decoded=5 packets=10 lost=0 dropped=0
@@ -104,6 +104,6 @@ media-summary role=viewer frames=5 decoded=5 packets=10 lost=0 dropped=0
 
 ## Current stage
 
-Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers through independent bounded viewer egress queues, and the client/load-test paths can packetize, pace, send, receive, reassemble, mock-decode, and report stats for synthetic H.264-like frames.
+Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers through independent bounded viewer egress queues, aggregate viewer stats into publisher feedback, and the client/load-test paths can packetize, pace, send, receive, reassemble, mock-decode, report viewer stats, poll publisher feedback, and request a synthetic keyframe when needed.
 
 Actual Windows Graphics Capture frame acquisition, hardware encode, native decode, real rendering, and adaptive media feedback are later stages.

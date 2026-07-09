@@ -16,8 +16,9 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     codec::CodecId,
     control::{
-        ClientControl, CreateRoom, Hello, JoinRoom, MediaKind, PublishStream, RoomId,
-        ServerControl, ServerEnvelope, StreamId, SubscribeStream, ViewerStatsReport,
+        ClientControl, CreateRoom, Hello, JoinRoom, MediaKind, PollPublisherFeedback,
+        PublishStream, PublisherFeedback, RoomId, ServerControl, ServerEnvelope, StreamId,
+        SubscribeStream, ViewerStatsReport,
     },
     frame::packetize_frame_for_datagram_target,
     packet::DEFAULT_DATAGRAM_PAYLOAD_TARGET,
@@ -95,6 +96,9 @@ struct Args {
 
     #[arg(long, default_value_t = 30)]
     stats_interval_frames: u32,
+
+    #[arg(long, default_value_t = 30)]
+    feedback_interval_frames: u32,
 }
 
 #[tokio::main]
@@ -180,7 +184,7 @@ async fn run_broadcaster_control_flow(
         room_id, args.stream_id
     );
     if args.synthetic_media_enabled() {
-        run_synthetic_broadcaster_media(control, args).await?;
+        run_synthetic_broadcaster_media(control, args, room_id).await?;
     }
     Ok(())
 }
@@ -219,8 +223,9 @@ async fn run_viewer_control_flow(
 }
 
 async fn run_synthetic_broadcaster_media(
-    control: &crate::transport::quic::ControlClient,
+    control: &mut crate::transport::quic::ControlClient,
     args: &Args,
+    room_id: RoomId,
 ) -> anyhow::Result<()> {
     if args.media_start_delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(args.media_start_delay_ms)).await;
@@ -270,6 +275,21 @@ async fn run_synthetic_broadcaster_media(
             frame.bytes.len(),
             args.media_frame_bytes
         );
+        if args.feedback_interval_frames > 0
+            && frame_id.is_multiple_of(args.feedback_interval_frames)
+        {
+            let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
+            if feedback.keyframe_requested {
+                encoder.request_keyframe();
+            }
+        }
+    }
+    let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
+    if feedback.keyframe_requested {
+        println!(
+            "publisher-feedback stream_id={} keyframe_requested=true degraded_viewers={} total_viewers={}",
+            feedback.stream_id, feedback.degraded_viewer_count, feedback.total_viewer_count
+        );
     }
     println!(
         "media-summary role=broadcaster frames={} packets={} fps={} run_ms={}",
@@ -279,6 +299,24 @@ async fn run_synthetic_broadcaster_media(
         tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
     }
     Ok(())
+}
+
+async fn poll_publisher_feedback(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+) -> anyhow::Result<PublisherFeedback> {
+    let response = control
+        .send(ClientControl::PollPublisherFeedback(
+            PollPublisherFeedback { room_id, stream_id },
+        ))
+        .await?;
+    print_control_response("publisher-feedback", &response);
+    match response.message {
+        ServerControl::PublisherFeedback(feedback) => Ok(feedback),
+        ServerControl::Error(error) => bail!("poll publisher feedback failed: {}", error.message),
+        other => bail!("unexpected publisher feedback response: {other:?}"),
+    }
 }
 
 async fn run_synthetic_viewer_media(

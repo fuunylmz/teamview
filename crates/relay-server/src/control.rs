@@ -5,7 +5,7 @@ use teamview_protocol::{
     control::{
         ClientControl, ClientEnvelope, ControlError, HelloAccepted, RoomCreated, RoomId,
         RoomJoined, RoomLeft, ServerControl, ServerEnvelope, StreamId, StreamPublished,
-        StreamSubscribed, StreamUnsubscribed, UserId,
+        StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
     },
 };
 
@@ -17,6 +17,7 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct ControlState {
     rooms: BTreeMap<RoomId, Room>,
+    viewer_stats: BTreeMap<StreamId, BTreeMap<UserId, ViewerStatsReport>>,
     next_room_id: RoomId,
     next_user_id: UserId,
 }
@@ -25,6 +26,7 @@ impl ControlState {
     pub fn new() -> Self {
         Self {
             rooms: BTreeMap::new(),
+            viewer_stats: BTreeMap::new(),
             next_room_id: 1,
             next_user_id: 1,
         }
@@ -172,6 +174,7 @@ impl ControlState {
                     (self.rooms.get_mut(&unsubscribe.room_id), session.user_id)
                 {
                     room.unsubscribe(unsubscribe.stream_id, user_id);
+                    self.remove_viewer_stats(unsubscribe.stream_id, user_id);
                 }
                 ServerControl::StreamUnsubscribed(StreamUnsubscribed {
                     room_id: unsubscribe.room_id,
@@ -182,27 +185,47 @@ impl ControlState {
                 if let (Some(room), Some(user_id)) =
                     (self.rooms.get_mut(&leave.room_id), session.user_id)
                 {
+                    let subscribed_streams = room
+                        .subscriptions
+                        .iter()
+                        .filter_map(|(stream_id, subscribers)| {
+                            subscribers.contains(&user_id).then_some(*stream_id)
+                        })
+                        .collect::<Vec<_>>();
                     room.leave(user_id);
+                    for stream_id in subscribed_streams {
+                        self.remove_viewer_stats(stream_id, user_id);
+                    }
                 }
                 ServerControl::RoomLeft(RoomLeft {
                     room_id: leave.room_id,
                 })
             }
             ClientControl::ViewerStats(report) => {
-                let total_viewer_count = self.subscribers_for_stream(report.stream_id).len() as u32;
-                let viewer_is_degraded = report.lost_packets > 0
-                    || report.dropped_frames > 0
-                    || report.jitter_buffer_ms > 120
-                    || report.estimated_latency_ms > 200;
-                ServerControl::PublisherFeedback(teamview_protocol::control::PublisherFeedback {
-                    room_id: report.room_id,
-                    stream_id: report.stream_id,
-                    aggregate_available_bitrate_bps: 0,
-                    degraded_viewer_count: u32::from(viewer_is_degraded),
-                    total_viewer_count,
-                    keyframe_requested: report.lost_packets > 0 || report.dropped_frames > 0,
-                })
+                if let Some(user_id) = session.user_id {
+                    self.viewer_stats
+                        .entry(report.stream_id)
+                        .or_default()
+                        .insert(user_id, report.clone());
+                }
+                ServerControl::PublisherFeedback(
+                    self.aggregate_publisher_feedback(report.room_id, report.stream_id),
+                )
             }
+            ClientControl::PollPublisherFeedback(poll) => match session.user_id {
+                Some(user_id) if self.publisher_for_stream(poll.stream_id) == Some(user_id) => {
+                    ServerControl::PublisherFeedback(
+                        self.aggregate_publisher_feedback(poll.room_id, poll.stream_id),
+                    )
+                }
+                Some(_) => ServerControl::Error(ControlError::new(
+                    "not_publisher",
+                    "only the stream publisher can poll publisher feedback",
+                )),
+                None => {
+                    ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"))
+                }
+            },
             ClientControl::SetTargetBitrate(_) | ClientControl::SetTargetFramerate(_) => {
                 ServerControl::Error(ControlError::new(
                     "not_implemented",
@@ -255,9 +278,59 @@ impl ControlState {
             for stream_id in published_by_user {
                 room.published_streams.remove(&stream_id);
                 room.subscriptions.remove(&stream_id);
+                self.viewer_stats.remove(&stream_id);
+            }
+        }
+        for stream_viewer_stats in self.viewer_stats.values_mut() {
+            stream_viewer_stats.remove(&user_id);
+        }
+        self.viewer_stats
+            .retain(|_, stream_viewer_stats| !stream_viewer_stats.is_empty());
+    }
+
+    fn aggregate_publisher_feedback(
+        &self,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) -> teamview_protocol::control::PublisherFeedback {
+        let total_viewer_count = self.subscribers_for_stream(stream_id).len() as u32;
+        let mut degraded_viewer_count = 0_u32;
+        let mut keyframe_requested = false;
+
+        if let Some(stream_viewer_stats) = self.viewer_stats.get(&stream_id) {
+            for report in stream_viewer_stats.values() {
+                if viewer_is_degraded(report) {
+                    degraded_viewer_count = degraded_viewer_count.saturating_add(1);
+                }
+                keyframe_requested |= report.lost_packets > 0 || report.dropped_frames > 0;
+            }
+        }
+
+        teamview_protocol::control::PublisherFeedback {
+            room_id,
+            stream_id,
+            aggregate_available_bitrate_bps: 0,
+            degraded_viewer_count,
+            total_viewer_count,
+            keyframe_requested,
+        }
+    }
+
+    fn remove_viewer_stats(&mut self, stream_id: StreamId, user_id: UserId) {
+        if let Some(stream_viewer_stats) = self.viewer_stats.get_mut(&stream_id) {
+            stream_viewer_stats.remove(&user_id);
+            if stream_viewer_stats.is_empty() {
+                self.viewer_stats.remove(&stream_id);
             }
         }
     }
+}
+
+fn viewer_is_degraded(report: &ViewerStatsReport) -> bool {
+    report.lost_packets > 0
+        || report.dropped_frames > 0
+        || report.jitter_buffer_ms > 120
+        || report.estimated_latency_ms > 200
 }
 
 #[cfg(test)]
@@ -266,8 +339,8 @@ mod tests {
         PROTOCOL_VERSION,
         codec::CodecId,
         control::{
-            ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind, PublishStream, SubscribeStream,
-            ViewerStatsReport,
+            ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind, PollPublisherFeedback,
+            PublishStream, SubscribeStream, ViewerStatsReport,
         },
     };
 
@@ -387,6 +460,106 @@ mod tests {
                 assert!(feedback.keyframe_requested);
             }
             other => panic!("unexpected viewer stats response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publisher_can_poll_aggregated_viewer_feedback() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut first_viewer = Session::anonymous(2);
+        let mut second_viewer = Session::anonymous(3);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut first_viewer, "first-viewer");
+        authenticate(&mut state, &mut second_viewer, "second-viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut first_viewer, room_id);
+        join_room(&mut state, &mut second_viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut first_viewer, room_id, 9);
+        subscribe_stream(&mut state, &mut second_viewer, room_id, 9);
+
+        state.handle_client_envelope(
+            &mut first_viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::ViewerStats(ViewerStatsReport {
+                    room_id,
+                    stream_id: 9,
+                    received_packets: 10,
+                    lost_packets: 0,
+                    decoded_frames: 5,
+                    dropped_frames: 0,
+                    jitter_buffer_ms: 40,
+                    estimated_latency_ms: 90,
+                }),
+            ),
+        );
+        state.handle_client_envelope(
+            &mut second_viewer,
+            ClientEnvelope::new(
+                7,
+                ClientControl::ViewerStats(ViewerStatsReport {
+                    room_id,
+                    stream_id: 9,
+                    received_packets: 9,
+                    lost_packets: 1,
+                    decoded_frames: 4,
+                    dropped_frames: 1,
+                    jitter_buffer_ms: 130,
+                    estimated_latency_ms: 220,
+                }),
+            ),
+        );
+
+        let feedback = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                8,
+                ClientControl::PollPublisherFeedback(PollPublisherFeedback {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        match feedback.message {
+            ServerControl::PublisherFeedback(feedback) => {
+                assert_eq!(feedback.total_viewer_count, 2);
+                assert_eq!(feedback.degraded_viewer_count, 1);
+                assert!(feedback.keyframe_requested);
+            }
+            other => panic!("unexpected poll feedback response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_publisher_cannot_poll_publisher_feedback() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::PollPublisherFeedback(PollPublisherFeedback {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_publisher"),
+            other => panic!("unexpected non-publisher poll response: {other:?}"),
         }
     }
 

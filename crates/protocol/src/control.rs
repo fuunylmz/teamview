@@ -35,6 +35,7 @@ pub enum ClientControl {
     UnsubscribeStream(UnsubscribeStream),
     LeaveRoom(LeaveRoom),
     ViewerStats(ViewerStatsReport),
+    PollPublisherFeedback(PollPublisherFeedback),
     SetTargetBitrate(SetTargetBitrate),
     SetTargetFramerate(SetTargetFramerate),
 }
@@ -189,6 +190,12 @@ pub struct ViewerStatsReport {
     pub dropped_frames: u64,
     pub jitter_buffer_ms: u16,
     pub estimated_latency_ms: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollPublisherFeedback {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
