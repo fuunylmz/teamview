@@ -52,9 +52,10 @@ impl Room {
             .collect()
     }
 
-    pub fn remove_published_stream(&mut self, stream_id: StreamId) {
-        self.published_streams.remove(&stream_id);
+    pub fn remove_published_stream(&mut self, stream_id: StreamId) -> Option<PublishedStream> {
+        let removed = self.published_streams.remove(&stream_id);
         self.subscriptions.remove(&stream_id);
+        removed
     }
 
     pub fn subscribe(&mut self, stream_id: StreamId, user_id: UserId) -> bool {

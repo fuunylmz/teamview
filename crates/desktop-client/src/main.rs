@@ -33,8 +33,8 @@ use teamview_protocol::{
         PublishStream, PublisherFeedback, RemoteInputEvent, RemoteInputKind, RequestKeyframe,
         RoomId, RoomSummary, SendRemoteInput, ServerControl, ServerEnvelope, SetTargetBitrate,
         SetTargetFramerate, SetVoiceState, StreamConfig, StreamId, StreamMetricsSnapshot,
-        StreamSummary, SubscribeStream, TimeSyncRequest, TimeSyncResponse, UnsubscribeStream,
-        ViewerStatsReport,
+        StreamSummary, SubscribeStream, TimeSyncRequest, TimeSyncResponse, UnpublishStream,
+        UnsubscribeStream, ViewerStatsReport,
     },
     frame::{packetize_frame_for_datagram_target, packetize_frame_with_type_for_datagram_target},
     packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, PacketType},
@@ -1242,6 +1242,8 @@ async fn run_broadcaster_control_flow(
 
     if args.media_kind == MediaKindArg::Both {
         run_broadcaster_dual_stream_control_flow(control, args, room_id, clock_sync).await?;
+        unpublish_stream(control, room_id, args.stream_id).await?;
+        unpublish_stream(control, room_id, args.voice_stream_id()?).await?;
         leave_room(control, room_id).await?;
         return Ok(());
     }
@@ -1256,6 +1258,7 @@ async fn run_broadcaster_control_flow(
         set_publisher_target_media(control, room_id, args).await?;
         run_synthetic_broadcaster_media(control, args, room_id, clock_sync).await?;
     }
+    unpublish_stream(control, room_id, args.stream_id).await?;
     leave_room(control, room_id).await?;
     Ok(())
 }
@@ -1287,6 +1290,29 @@ async fn publish_configured_stream(
         other => bail!("unexpected stream config response: {other:?}"),
     }
     Ok(())
+}
+
+async fn unpublish_stream(
+    control: &crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
+    let response = control
+        .send(ClientControl::UnpublishStream(UnpublishStream {
+            room_id,
+            stream_id,
+        }))
+        .await?;
+    print_control_response("unpublish-stream", &response);
+    match response.message {
+        ServerControl::StreamUnpublished(unpublished)
+            if unpublished.room_id == room_id && unpublished.stream_id == stream_id =>
+        {
+            Ok(())
+        }
+        ServerControl::Error(error) => bail!("unpublish stream failed: {}", error.message),
+        other => bail!("unexpected unpublish response: {other:?}"),
+    }
 }
 
 async fn run_broadcaster_dual_stream_control_flow(

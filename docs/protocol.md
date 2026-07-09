@@ -39,7 +39,7 @@ Current control messages cover:
 - list rooms
 - join room
 - list participants
-- publish stream
+- publish / unpublish stream
 - list streams
 - subscribe / unsubscribe stream
 - leave room
@@ -62,7 +62,7 @@ When the relay is started with an access token, clients must send `Authenticate`
 
 Viewers can discover active sessions before subscribing. In the protocol these sessions are still named rooms; in the desktop CLI they are the backing object for user-facing channels, exposed through `--channel-name` and `--channel-id` with `--room-name` and `--room-id` kept as compatibility aliases. `ListRooms` returns room ids, names, participant counts, and published stream counts. `CreateRoom.name` is trimmed, whitespace-normalized, length-bounded, and returned as the final room name; blank names fall back to `room-{id}`. After joining a room, `ListParticipants` returns participant user ids, display names, mute/deafen/push-to-talk/speaking state, and published/subscribed stream counts. `ListStreams` returns stream ids, publisher ids, codec/media kind, subscriber counts, config availability, and current target bitrate/FPS. The desktop viewer uses these messages to select a channel by `--channel-name` when `--channel-id` is not provided, can print participant presence with `--list-participants`, then polls `StreamConfig` for the current width/height before media receive.
 
-Room creators are automatically added as participants. `LeaveRoom` removes the user from participants and subscriptions; if the leaving user published streams, those streams and their viewer stats, metrics, keyframe requests, and subscriptions are removed too. Empty rooms are removed from discovery. The desktop client sends `UnsubscribeStream` and `LeaveRoom` during normal viewer shutdown, sends `LeaveRoom` during normal broadcaster shutdown, and the relay applies the same cleanup when a connection disconnects unexpectedly.
+Room creators are automatically added as participants. `UnpublishStream` lets a publisher stop a single stream and removes that stream's subscriptions, viewer stats, metrics, keyframe requests, and pending remote input. `LeaveRoom` removes the user from participants and subscriptions; if the leaving user published streams, those streams and the same per-stream state are removed too. Empty rooms are removed from discovery. The desktop client sends `UnsubscribeStream` and `LeaveRoom` during normal viewer shutdown, explicitly sends `UnpublishStream` for published streams before normal broadcaster shutdown, and the relay applies the same cleanup when a connection disconnects unexpectedly.
 
 The relay can bound room state with `--max-rooms`, `--max-participants-per-room`, and `--max-streams-per-room`. Create/join/publish attempts that exceed those limits return `room_limit_reached`, `room_full`, or `stream_limit_reached`.
 

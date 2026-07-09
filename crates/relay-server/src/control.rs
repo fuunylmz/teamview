@@ -8,8 +8,9 @@ use teamview_protocol::{
         RemoteInputEvent, RemoteInputKind, RemoteInputQueued, RequestKeyframe, RoomCreated, RoomId,
         RoomJoined, RoomLeft, RoomList, RoomSummary, SendRemoteInput, ServerControl,
         ServerEnvelope, SetTargetBitrate, SetTargetFramerate, SetVoiceState, StreamConfig,
-        StreamId, StreamList, StreamPublished, StreamSubscribed, StreamSummary, StreamUnsubscribed,
-        TimeSyncResponse, UserId, ViewerStatsReport, VoiceState,
+        StreamId, StreamList, StreamPublished, StreamSubscribed, StreamSummary, StreamUnpublished,
+        StreamUnsubscribed, TimeSyncResponse, UnpublishStream, UserId, ViewerStatsReport,
+        VoiceState,
     },
     packet::MediaPacket,
 };
@@ -325,6 +326,7 @@ impl ControlState {
                     }
                 }
             }
+            ClientControl::UnpublishStream(unpublish) => self.unpublish_stream(session, unpublish),
             ClientControl::ListStreams(list) => self.list_streams(session, list.room_id),
             ClientControl::SubscribeStream(subscribe) => {
                 match self.rooms.get_mut(&subscribe.room_id) {
@@ -568,6 +570,48 @@ impl ControlState {
             self.remove_stream_state(stream_id);
         }
         self.remove_room_if_empty(room_id);
+    }
+
+    fn unpublish_stream(&mut self, session: &Session, request: UnpublishStream) -> ServerControl {
+        let Some(user_id) = session.user_id else {
+            return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
+        };
+
+        let removed = {
+            let Some(room) = self.rooms.get_mut(&request.room_id) else {
+                return ServerControl::Error(ControlError::new(
+                    "room_not_found",
+                    "room does not exist",
+                ));
+            };
+            let Some(stream) = room.published_streams.get(&request.stream_id) else {
+                return ServerControl::Error(ControlError::new(
+                    "stream_not_found",
+                    "stream does not exist",
+                ));
+            };
+            if stream.publisher_id != user_id {
+                return ServerControl::Error(ControlError::new(
+                    "not_publisher",
+                    "only the stream publisher can unpublish",
+                ));
+            }
+            room.remove_published_stream(request.stream_id)
+        };
+
+        if removed.is_none() {
+            return ServerControl::Error(ControlError::new(
+                "stream_not_found",
+                "stream does not exist",
+            ));
+        }
+
+        self.remove_stream_state(request.stream_id);
+        self.remove_room_if_empty(request.room_id);
+        ServerControl::StreamUnpublished(StreamUnpublished {
+            room_id: request.room_id,
+            stream_id: request.stream_id,
+        })
     }
 
     fn remove_stream_state(&mut self, stream_id: StreamId) {
@@ -1428,7 +1472,7 @@ mod tests {
             PollPublisherFeedback, PollRemoteInput, PollStreamConfig, PollStreamMetrics,
             PublishStream, RemoteInputKind, RequestKeyframe, SendRemoteInput, SetTargetBitrate,
             SetTargetFramerate, SetVoiceState, StreamConfig, SubscribeStream, TimeSyncRequest,
-            ViewerStatsReport,
+            UnpublishStream, ViewerStatsReport,
         },
         packet::{MediaPacket, MediaPacketHeader, PacketFlags, PacketType},
     };
@@ -1975,6 +2019,106 @@ mod tests {
         );
         assert!(state.room(room_id).is_none());
         assert!(state.published_stream(9).is_none());
+    }
+
+    #[test]
+    fn publisher_can_unpublish_owned_stream_and_clear_stream_state() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+        state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::ViewerStats(viewer_stats_report(room_id, 9)),
+            ),
+        );
+        state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                7,
+                ClientControl::RequestKeyframe(RequestKeyframe {
+                    room_id,
+                    stream_id: 9,
+                    reason: KeyframeReason::DecoderRecovery,
+                }),
+            ),
+        );
+        let packet = synthetic_packet(9);
+        state.record_media_forward_summary(
+            &packet,
+            MediaForwardSummary {
+                stream_id: 9,
+                queued: 1,
+                dropped: 0,
+            },
+            packet.encode().unwrap().len(),
+            1_700_000,
+            1,
+        );
+
+        let response = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                8,
+                ClientControl::UnpublishStream(UnpublishStream {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        assert_eq!(
+            response.message,
+            ServerControl::StreamUnpublished(StreamUnpublished {
+                room_id,
+                stream_id: 9
+            })
+        );
+        let room = state.room(room_id).unwrap();
+        assert!(room.participants.contains(&publisher.user_id.unwrap()));
+        assert!(!room.published_streams.contains_key(&9));
+        assert!(!room.subscriptions.contains_key(&9));
+        assert!(!state.viewer_stats.contains_key(&9));
+        assert!(!state.pending_keyframe_requests.contains_key(&9));
+        assert!(!state.stream_metrics.contains_key(&9));
+    }
+
+    #[test]
+    fn non_publisher_cannot_unpublish_stream() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::UnpublishStream(UnpublishStream {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_publisher"),
+            other => panic!("unexpected unpublish response: {other:?}"),
+        }
+        assert!(state.published_stream(9).is_some());
     }
 
     #[test]

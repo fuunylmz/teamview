@@ -35,6 +35,7 @@ pub enum ClientControl {
     JoinRoom(JoinRoom),
     ListParticipants(ListParticipants),
     PublishStream(PublishStream),
+    UnpublishStream(UnpublishStream),
     ListStreams(ListStreams),
     SubscribeStream(SubscribeStream),
     UnsubscribeStream(UnsubscribeStream),
@@ -63,6 +64,7 @@ pub enum ServerControl {
     RoomJoined(RoomJoined),
     ParticipantList(ParticipantList),
     StreamPublished(StreamPublished),
+    StreamUnpublished(StreamUnpublished),
     StreamList(StreamList),
     StreamSubscribed(StreamSubscribed),
     StreamUnsubscribed(StreamUnsubscribed),
@@ -197,6 +199,18 @@ pub struct PublishStream {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamPublished {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnpublishStream {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamUnpublished {
     pub room_id: RoomId,
     pub stream_id: StreamId,
 }
@@ -559,6 +573,30 @@ mod tests {
 
         assert_eq!(publish.codec, CodecId::H264);
         assert_eq!(publish.media_kind, MediaKind::Screen);
+    }
+
+    #[test]
+    fn unpublish_stream_round_trips_as_json_line() {
+        let request = ClientEnvelope::new(
+            9,
+            ClientControl::UnpublishStream(UnpublishStream {
+                room_id: 1,
+                stream_id: 9,
+            }),
+        );
+        let response = ServerEnvelope::new(
+            9,
+            ServerControl::StreamUnpublished(StreamUnpublished {
+                room_id: 1,
+                stream_id: 9,
+            }),
+        );
+
+        let encoded_request = encode_client_envelope(&request).unwrap();
+        let encoded_response = encode_server_envelope(&response).unwrap();
+
+        assert_eq!(decode_client_envelope(&encoded_request).unwrap(), request);
+        assert_eq!(decode_server_envelope(&encoded_response).unwrap(), response);
     }
 
     #[test]
