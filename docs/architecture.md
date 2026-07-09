@@ -4,6 +4,8 @@ TeamView is designed as a native-first real-time media system.
 
 The MVP avoids WebRTC and peer-to-peer delivery. A broadcaster sends low-latency encoded media to a Relay/SFU server over QUIC. The server forwards encoded packets to viewers without decoding, transcoding, compositing, or delaying fast viewers for slow viewers.
 
+The relay owns room and stream lifecycle state. Room creators join automatically, clients leave or unsubscribe during normal shutdown, and disconnect cleanup removes stale subscriptions, publisher-owned streams, stream metrics, keyframe requests, and empty rooms from discovery.
+
 ## Primary pipeline
 
 ```text

@@ -122,10 +122,12 @@ impl ControlState {
                 None => ServerControl::Error(ControlError::new("not_ready", "send Hello first")),
             },
             ClientControl::CreateRoom(create) => match session.user_id {
-                Some(_) => {
+                Some(user_id) => {
                     let room_id = self.next_room_id;
                     self.next_room_id += 1;
-                    self.rooms.insert(room_id, Room::new(room_id, &create.name));
+                    let mut room = Room::new(room_id, &create.name);
+                    room.join(user_id);
+                    self.rooms.insert(room_id, room);
                     ServerControl::RoomCreated(RoomCreated {
                         room_id,
                         name: create.name,
@@ -253,20 +255,8 @@ impl ControlState {
                 })
             }
             ClientControl::LeaveRoom(leave) => {
-                if let (Some(room), Some(user_id)) =
-                    (self.rooms.get_mut(&leave.room_id), session.user_id)
-                {
-                    let subscribed_streams = room
-                        .subscriptions
-                        .iter()
-                        .filter_map(|(stream_id, subscribers)| {
-                            subscribers.contains(&user_id).then_some(*stream_id)
-                        })
-                        .collect::<Vec<_>>();
-                    room.leave(user_id);
-                    for stream_id in subscribed_streams {
-                        self.remove_viewer_stats(stream_id, user_id);
-                    }
+                if let Some(user_id) = session.user_id {
+                    self.leave_room(user_id, leave.room_id);
                 }
                 ServerControl::RoomLeft(RoomLeft {
                     room_id: leave.room_id,
@@ -360,28 +350,68 @@ impl ControlState {
     }
 
     pub fn disconnect_user(&mut self, user_id: UserId) {
-        for room in self.rooms.values_mut() {
-            room.leave(user_id);
-            let published_by_user = room
-                .published_streams
-                .iter()
-                .filter_map(|(stream_id, stream)| {
-                    (stream.publisher_id == user_id).then_some(*stream_id)
-                })
-                .collect::<Vec<_>>();
-            for stream_id in published_by_user {
-                room.published_streams.remove(&stream_id);
-                room.subscriptions.remove(&stream_id);
-                self.viewer_stats.remove(&stream_id);
-                self.pending_keyframe_requests.remove(&stream_id);
-                self.stream_metrics.remove(&stream_id);
-            }
+        let affected_rooms = self
+            .rooms
+            .iter()
+            .filter_map(|(room_id, room)| {
+                let user_is_participant = room.participants.contains(&user_id);
+                let user_has_stream = room
+                    .published_streams
+                    .values()
+                    .any(|stream| stream.publisher_id == user_id);
+                (user_is_participant || user_has_stream).then_some(*room_id)
+            })
+            .collect::<Vec<_>>();
+
+        for room_id in affected_rooms {
+            self.leave_room(user_id, room_id);
         }
         for stream_viewer_stats in self.viewer_stats.values_mut() {
             stream_viewer_stats.remove(&user_id);
         }
         self.viewer_stats
             .retain(|_, stream_viewer_stats| !stream_viewer_stats.is_empty());
+    }
+
+    fn leave_room(&mut self, user_id: UserId, room_id: RoomId) {
+        let (subscribed_streams, removed_streams) = {
+            let Some(room) = self.rooms.get_mut(&room_id) else {
+                return;
+            };
+            let subscribed_streams = room
+                .subscriptions
+                .iter()
+                .filter_map(|(stream_id, subscribers)| {
+                    subscribers.contains(&user_id).then_some(*stream_id)
+                })
+                .collect::<Vec<_>>();
+            let removed_streams = room.streams_published_by(user_id);
+            room.leave(user_id);
+            for stream_id in &removed_streams {
+                room.remove_published_stream(*stream_id);
+            }
+            (subscribed_streams, removed_streams)
+        };
+
+        for stream_id in subscribed_streams {
+            self.remove_viewer_stats(stream_id, user_id);
+        }
+        for stream_id in removed_streams {
+            self.remove_stream_state(stream_id);
+        }
+        self.remove_room_if_empty(room_id);
+    }
+
+    fn remove_stream_state(&mut self, stream_id: StreamId) {
+        self.viewer_stats.remove(&stream_id);
+        self.pending_keyframe_requests.remove(&stream_id);
+        self.stream_metrics.remove(&stream_id);
+    }
+
+    fn remove_room_if_empty(&mut self, room_id: RoomId) {
+        if self.rooms.get(&room_id).is_some_and(Room::is_empty) {
+            self.rooms.remove(&room_id);
+        }
     }
 
     pub fn record_media_forward_summary(
@@ -818,8 +848,8 @@ mod tests {
         PROTOCOL_VERSION,
         codec::CodecId,
         control::{
-            Authenticate, ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, ListRooms,
-            ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
+            Authenticate, ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, LeaveRoom,
+            ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
             PollStreamMetrics, PublishStream, RequestKeyframe, SetTargetBitrate,
             SetTargetFramerate, StreamConfig, SubscribeStream, ViewerStatsReport,
         },
@@ -965,6 +995,19 @@ mod tests {
     }
 
     #[test]
+    fn create_room_adds_creator_as_participant() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+        authenticate(&mut state, &mut session, "creator");
+
+        let room_id = create_room(&mut state, &mut session, "stage1");
+
+        let room = state.room(room_id).unwrap();
+        assert!(room.participants.contains(&session.user_id.unwrap()));
+        assert_eq!(room.participants.len(), 1);
+    }
+
+    #[test]
     fn list_rooms_returns_room_summaries() {
         let mut state = ControlState::new();
         let mut publisher = Session::anonymous(1);
@@ -990,7 +1033,7 @@ mod tests {
                 assert_eq!(list.rooms[0].participant_count, 2);
                 assert_eq!(list.rooms[0].published_stream_count, 1);
                 assert_eq!(list.rooms[1].name, "empty");
-                assert_eq!(list.rooms[1].participant_count, 0);
+                assert_eq!(list.rooms[1].participant_count, 1);
                 assert_eq!(list.rooms[1].published_stream_count, 0);
             }
             other => panic!("unexpected room list response: {other:?}"),
@@ -1083,6 +1126,102 @@ mod tests {
         assert!(!room.participants.contains(&publisher.user_id.unwrap()));
         assert!(!room.published_streams.contains_key(&9));
         assert!(!room.subscriptions.contains_key(&9));
+    }
+
+    #[test]
+    fn disconnect_user_removes_empty_rooms_from_discovery() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        state.disconnect_user(publisher.user_id.unwrap());
+
+        assert!(state.room(room_id).is_none());
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(6, ClientControl::ListRooms(ListRooms)),
+        );
+        match response.message {
+            ServerControl::RoomList(list) => assert!(list.rooms.is_empty()),
+            other => panic!("unexpected room list response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publisher_leave_removes_owned_streams_and_empty_room() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        authenticate(&mut state, &mut publisher, "publisher");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(6, ClientControl::LeaveRoom(LeaveRoom { room_id })),
+        );
+
+        assert_eq!(
+            response.message,
+            ServerControl::RoomLeft(RoomLeft { room_id })
+        );
+        assert!(state.room(room_id).is_none());
+        assert!(state.published_stream(9).is_none());
+    }
+
+    #[test]
+    fn viewer_leave_keeps_published_room_and_removes_subscription_stats() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+        state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::ViewerStats(ViewerStatsReport {
+                    room_id,
+                    stream_id: 9,
+                    received_packets: 10,
+                    lost_packets: 0,
+                    decoded_frames: 2,
+                    dropped_frames: 0,
+                    jitter_buffer_ms: 40,
+                    estimated_latency_ms: 90,
+                }),
+            ),
+        );
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(7, ClientControl::LeaveRoom(LeaveRoom { room_id })),
+        );
+
+        assert_eq!(
+            response.message,
+            ServerControl::RoomLeft(RoomLeft { room_id })
+        );
+        let room = state.room(room_id).unwrap();
+        assert!(room.published_streams.contains_key(&9));
+        assert!(!room.participants.contains(&viewer.user_id.unwrap()));
+        assert!(!room.subscriptions.contains_key(&9));
+        assert!(
+            !state
+                .viewer_stats
+                .get(&9)
+                .is_some_and(|stats| stats.contains_key(&viewer.user_id.unwrap()))
+        );
     }
 
     #[test]

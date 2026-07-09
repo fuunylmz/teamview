@@ -143,6 +143,7 @@ Expected behavior:
 - The broadcaster polls aggregated `PublisherFeedback`; when feedback requests a keyframe, the synthetic encoder marks the next frame as a keyframe.
 - The broadcaster polls relay `StreamMetrics` at the end of the run to report server-observed ingress, queued egress, and dropped egress datagrams.
 - When most viewers are degraded, relay feedback lowers the synthetic target bitrate, and the broadcaster shrinks subsequent synthetic frame payloads.
+- The viewer unsubscribes and leaves on normal exit; when the last participant leaves, the relay removes the empty room from subsequent discovery.
 - The final viewer summary reports zero loss and drops on a healthy local run.
 
 ## Desktop synthetic voice checks

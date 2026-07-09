@@ -17,11 +17,12 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     codec::CodecId,
     control::{
-        Authenticate, ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, ListRooms,
-        ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig, PollStreamMetrics,
-        PublishStream, PublisherFeedback, RequestKeyframe, RoomId, RoomSummary, ServerControl,
-        ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId,
-        StreamMetricsSnapshot, StreamSummary, SubscribeStream, ViewerStatsReport,
+        Authenticate, ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, LeaveRoom,
+        ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
+        PollStreamMetrics, PublishStream, PublisherFeedback, RequestKeyframe, RoomId, RoomSummary,
+        ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig,
+        StreamId, StreamMetricsSnapshot, StreamSummary, SubscribeStream, UnsubscribeStream,
+        ViewerStatsReport,
     },
     frame::{packetize_frame_for_datagram_target, packetize_frame_with_type_for_datagram_target},
     packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, PacketType},
@@ -267,6 +268,7 @@ async fn run_broadcaster_control_flow(
         set_publisher_target_media(control, room_id, args).await?;
         run_synthetic_broadcaster_media(control, args, room_id).await?;
     }
+    leave_room(control, room_id).await?;
     Ok(())
 }
 
@@ -312,6 +314,8 @@ async fn run_viewer_control_flow(
     if args.synthetic_media_enabled() {
         run_synthetic_viewer_media(control, args, room_id, stream_id).await?;
     }
+    unsubscribe_stream(control, room_id, stream_id).await?;
+    leave_room(control, room_id).await?;
     Ok(())
 }
 
@@ -497,6 +501,40 @@ async fn poll_stream_config(
         ServerControl::StreamConfig(config) => Ok(config),
         ServerControl::Error(error) => bail!("poll stream config failed: {}", error.message),
         other => bail!("unexpected stream config response: {other:?}"),
+    }
+}
+
+async fn unsubscribe_stream(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
+    let response = control
+        .send(ClientControl::UnsubscribeStream(UnsubscribeStream {
+            room_id,
+            stream_id,
+        }))
+        .await?;
+    print_control_response("unsubscribe-stream", &response);
+    match response.message {
+        ServerControl::StreamUnsubscribed(_) => Ok(()),
+        ServerControl::Error(error) => bail!("unsubscribe stream failed: {}", error.message),
+        other => bail!("unexpected unsubscribe response: {other:?}"),
+    }
+}
+
+async fn leave_room(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+) -> anyhow::Result<()> {
+    let response = control
+        .send(ClientControl::LeaveRoom(LeaveRoom { room_id }))
+        .await?;
+    print_control_response("leave-room", &response);
+    match response.message {
+        ServerControl::RoomLeft(_) => Ok(()),
+        ServerControl::Error(error) => bail!("leave room failed: {}", error.message),
+        other => bail!("unexpected leave room response: {other:?}"),
     }
 }
 
