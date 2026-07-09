@@ -205,6 +205,12 @@ For audible local playback, add `--audio-output speaker` to the viewer command. 
 
 For TeamSpeak-style voice state checks, add `--muted` to the broadcaster, `--push-to-talk` without `--ptt-active` to simulate an idle talk key, or `--deafened` to the viewer. A muted or idle push-to-talk broadcaster updates relay voice state and publishes no voice packets; the relay also rejects stray voice datagrams from that inactive speaker state. A deafened viewer updates relay voice state, receives no voice datagrams for that stream, and exits the voice receive loop without opening playback.
 
+To inspect the current room presence and voice state without subscribing to media, run:
+
+```bash
+cargo run -p desktop-client -- --list-participants --room-name stage1
+```
+
 Expected behavior:
 
 - The broadcaster publishes an Opus voice stream config and prints `audio-send` lines with capture/encode/packetize/send timing.
@@ -212,6 +218,7 @@ Expected behavior:
 - With `--audio-output speaker`, the viewer queues decoded PCM to the default Windows speaker through WinMM while keeping the same `audio-play` metrics.
 - With `--push-to-talk --ptt-active`, the broadcaster prints `voice-state` with `speaking=true` and sends voice frames as usual.
 - With `--deafened`, the viewer prints `voice-state`, `voice-deafened`, and a zero-frame voice summary instead of `audio-play`.
+- `--list-participants` prints one `participant` line per room member with `muted`, `deafened`, `push_to_talk`, `speaking`, `published_streams`, and `subscribed_streams`.
 - The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams, zero drops, current stream egress queue depth, and server route timing percentiles.
 - The final viewer summary reports `kind=voice`, matching decoded and played frame counts, and zero loss on a healthy local run.
 
@@ -253,6 +260,6 @@ Expected behavior:
 
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, live primary-monitor acquisition, microphone PCM capture handoff, optional speaker playback handoff, mute/deafen/push-to-talk voice-state control, dual-stream broadcaster publication and viewer demux, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, microphone voice forwarding behavior, synthetic capture-to-viewer latency, multi-sample relay clock offset estimates, TimeSync-derived calibrated capture-to-viewer latency, broadcaster capture/encode/packetize/send timing, publisher stamped capture-to-encode/send timing, server receive-to-route timing, relay receive-to-send queue timing, viewer receive-to-reassembly timing, viewer decode/render timing, and render/playback FPS. Later milestones add hardware encode, real Opus, continuous calibrated cross-machine clock offset filtering, viewer receive, decode, and render timestamp calibration.
+Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, live primary-monitor acquisition, microphone PCM capture handoff, optional speaker playback handoff, mute/deafen/push-to-talk voice-state control, participant presence discovery, dual-stream broadcaster publication and viewer demux, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, microphone voice forwarding behavior, synthetic capture-to-viewer latency, multi-sample relay clock offset estimates, TimeSync-derived calibrated capture-to-viewer latency, broadcaster capture/encode/packetize/send timing, publisher stamped capture-to-encode/send timing, server receive-to-route timing, relay receive-to-send queue timing, viewer receive-to-reassembly timing, viewer decode/render timing, and render/playback FPS. Later milestones add hardware encode, real Opus, continuous calibrated cross-machine clock offset filtering, viewer receive, decode, and render timestamp calibration.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.

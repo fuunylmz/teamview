@@ -38,6 +38,7 @@ Current control messages cover:
 - create room
 - list rooms
 - join room
+- list participants
 - publish stream
 - list streams
 - subscribe / unsubscribe stream
@@ -56,7 +57,7 @@ When the relay is started with an access token, clients must send `Authenticate`
 
 `TimeSync` echoes the client's send timestamp and returns relay receive/send Unix microsecond timestamps. The desktop client takes multiple startup samples, uses the client send/receive midpoint and relay receive/send midpoint for each sample, logs per-sample RTT and `clock_offset_micros`, and selects the lowest-RTT sample as the clock offset used by media timing. Later stages should add continuous filtering before treating capture-to-viewer values as production-grade calibrated latency.
 
-Viewers can discover active sessions before subscribing. `ListRooms` returns room ids, names, participant counts, and published stream counts. After joining a room, `ListStreams` returns stream ids, publisher ids, codec/media kind, subscriber counts, config availability, and current target bitrate/FPS. The desktop viewer uses these messages to select a room by `--room-name` when `--room-id` is not provided, then polls `StreamConfig` for the current width/height.
+Viewers can discover active sessions before subscribing. `ListRooms` returns room ids, names, participant counts, and published stream counts. After joining a room, `ListParticipants` returns participant user ids, display names, mute/deafen/push-to-talk/speaking state, and published/subscribed stream counts. `ListStreams` returns stream ids, publisher ids, codec/media kind, subscriber counts, config availability, and current target bitrate/FPS. The desktop viewer uses these messages to select a room by `--room-name` when `--room-id` is not provided, can print participant presence with `--list-participants`, then polls `StreamConfig` for the current width/height before media receive.
 
 Room creators are automatically added as participants. `LeaveRoom` removes the user from participants and subscriptions; if the leaving user published streams, those streams and their viewer stats, metrics, keyframe requests, and subscriptions are removed too. Empty rooms are removed from discovery. The desktop client sends `UnsubscribeStream` and `LeaveRoom` during normal viewer shutdown, sends `LeaveRoom` during normal broadcaster shutdown, and the relay applies the same cleanup when a connection disconnects unexpectedly.
 

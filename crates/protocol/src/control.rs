@@ -33,6 +33,7 @@ pub enum ClientControl {
     CreateRoom(CreateRoom),
     ListRooms(ListRooms),
     JoinRoom(JoinRoom),
+    ListParticipants(ListParticipants),
     PublishStream(PublishStream),
     ListStreams(ListStreams),
     SubscribeStream(SubscribeStream),
@@ -58,6 +59,7 @@ pub enum ServerControl {
     RoomCreated(RoomCreated),
     RoomList(RoomList),
     RoomJoined(RoomJoined),
+    ParticipantList(ParticipantList),
     StreamPublished(StreamPublished),
     StreamList(StreamList),
     StreamSubscribed(StreamSubscribed),
@@ -155,6 +157,30 @@ pub struct JoinRoom {
 pub struct RoomJoined {
     pub room_id: RoomId,
     pub participant_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListParticipants {
+    pub room_id: RoomId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantSummary {
+    pub room_id: RoomId,
+    pub user_id: UserId,
+    pub display_name: String,
+    pub muted: bool,
+    pub deafened: bool,
+    pub push_to_talk: bool,
+    pub speaking: bool,
+    pub published_stream_count: u32,
+    pub subscribed_stream_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantList {
+    pub room_id: RoomId,
+    pub participants: Vec<ParticipantSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,6 +632,10 @@ mod tests {
         let list_rooms = ClientEnvelope::new(9, ClientControl::ListRooms(ListRooms));
         let list_streams =
             ClientEnvelope::new(10, ClientControl::ListStreams(ListStreams { room_id: 1 }));
+        let list_participants = ClientEnvelope::new(
+            11,
+            ClientControl::ListParticipants(ListParticipants { room_id: 1 }),
+        );
         let room_list = ServerEnvelope::new(
             11,
             ServerControl::RoomList(RoomList {
@@ -634,16 +664,39 @@ mod tests {
                 }],
             }),
         );
+        let participant_list = ServerEnvelope::new(
+            13,
+            ServerControl::ParticipantList(ParticipantList {
+                room_id: 1,
+                participants: vec![ParticipantSummary {
+                    room_id: 1,
+                    user_id: 7,
+                    display_name: "user-7".to_owned(),
+                    muted: false,
+                    deafened: false,
+                    push_to_talk: true,
+                    speaking: true,
+                    published_stream_count: 1,
+                    subscribed_stream_count: 2,
+                }],
+            }),
+        );
 
         let encoded_rooms = encode_client_envelope(&list_rooms).unwrap();
         let encoded_streams = encode_client_envelope(&list_streams).unwrap();
+        let encoded_participants = encode_client_envelope(&list_participants).unwrap();
         let encoded_room_list = encode_server_envelope(&room_list).unwrap();
         let encoded_stream_list = encode_server_envelope(&stream_list).unwrap();
+        let encoded_participant_list = encode_server_envelope(&participant_list).unwrap();
 
         assert_eq!(decode_client_envelope(&encoded_rooms).unwrap(), list_rooms);
         assert_eq!(
             decode_client_envelope(&encoded_streams).unwrap(),
             list_streams
+        );
+        assert_eq!(
+            decode_client_envelope(&encoded_participants).unwrap(),
+            list_participants
         );
         assert_eq!(
             decode_server_envelope(&encoded_room_list).unwrap(),
@@ -652,6 +705,10 @@ mod tests {
         assert_eq!(
             decode_server_envelope(&encoded_stream_list).unwrap(),
             stream_list
+        );
+        assert_eq!(
+            decode_server_envelope(&encoded_participant_list).unwrap(),
+            participant_list
         );
     }
 

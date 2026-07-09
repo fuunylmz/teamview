@@ -19,11 +19,12 @@ use teamview_protocol::{
     codec::CodecId,
     control::{
         Authenticate, ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, LeaveRoom,
-        ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
-        PollStreamMetrics, PublishStream, PublisherFeedback, RequestKeyframe, RoomId, RoomSummary,
-        ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, SetVoiceState,
-        StreamConfig, StreamId, StreamMetricsSnapshot, StreamSummary, SubscribeStream,
-        TimeSyncRequest, TimeSyncResponse, UnsubscribeStream, ViewerStatsReport,
+        ListParticipants, ListRooms, ListStreams, MediaKind, ParticipantSummary, Ping,
+        PollPublisherFeedback, PollStreamConfig, PollStreamMetrics, PublishStream,
+        PublisherFeedback, RequestKeyframe, RoomId, RoomSummary, ServerControl, ServerEnvelope,
+        SetTargetBitrate, SetTargetFramerate, SetVoiceState, StreamConfig, StreamId,
+        StreamMetricsSnapshot, StreamSummary, SubscribeStream, TimeSyncRequest, TimeSyncResponse,
+        UnsubscribeStream, ViewerStatsReport,
     },
     frame::{packetize_frame_for_datagram_target, packetize_frame_with_type_for_datagram_target},
     packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, PacketType},
@@ -113,6 +114,9 @@ struct Args {
 
     #[arg(long)]
     list_audio_sources: bool,
+
+    #[arg(long)]
+    list_participants: bool,
 
     #[arg(long, value_enum, default_value_t = CaptureSourceArg::PrimaryMonitor)]
     capture_source: CaptureSourceArg,
@@ -268,6 +272,10 @@ async fn main() -> anyhow::Result<()> {
     let clock_sync = sync_control_clock(&control, &args).await?;
     if let Some(access_token) = &args.access_token {
         authenticate_control(&control, access_token).await?;
+    }
+    if args.list_participants {
+        run_list_participants_flow(&control, &args).await?;
+        return Ok(());
     }
 
     match args.mode {
@@ -425,6 +433,31 @@ async fn set_voice_state_if_requested(
         ServerControl::Error(error) => bail!("set voice state failed: {}", error.message),
         other => bail!("unexpected set voice state response: {other:?}"),
     }
+}
+
+async fn run_list_participants_flow(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let room_id = resolve_viewer_room_id(control, args).await?;
+    let joined = control
+        .send(ClientControl::JoinRoom(JoinRoom { room_id }))
+        .await?;
+    print_control_response("join-room", &joined);
+    ensure_not_error("join room", &joined)?;
+    set_voice_state_if_requested(control, args, room_id).await?;
+
+    let participants = list_room_participants(control, room_id).await?;
+    println!(
+        "participants room_id={} count={}",
+        room_id,
+        participants.len()
+    );
+    for participant in &participants {
+        println!("{}", format_participant_summary(participant));
+    }
+    leave_room(control, room_id).await?;
+    Ok(())
 }
 
 async fn run_broadcaster_control_flow(
@@ -713,6 +746,38 @@ async fn list_room_streams(
         ServerControl::Error(error) => bail!("list streams failed: {}", error.message),
         other => bail!("unexpected list streams response: {other:?}"),
     }
+}
+
+async fn list_room_participants(
+    control: &crate::transport::quic::ControlClient,
+    room_id: RoomId,
+) -> anyhow::Result<Vec<ParticipantSummary>> {
+    let response = control
+        .send(ClientControl::ListParticipants(ListParticipants {
+            room_id,
+        }))
+        .await?;
+    print_control_response("list-participants", &response);
+    match response.message {
+        ServerControl::ParticipantList(list) => Ok(list.participants),
+        ServerControl::Error(error) => bail!("list participants failed: {}", error.message),
+        other => bail!("unexpected list participants response: {other:?}"),
+    }
+}
+
+fn format_participant_summary(participant: &ParticipantSummary) -> String {
+    format!(
+        "participant room_id={} user_id={} display_name={:?} muted={} deafened={} push_to_talk={} speaking={} published_streams={} subscribed_streams={}",
+        participant.room_id,
+        participant.user_id,
+        participant.display_name,
+        participant.muted,
+        participant.deafened,
+        participant.push_to_talk,
+        participant.speaking,
+        participant.published_stream_count,
+        participant.subscribed_stream_count
+    )
 }
 
 fn resolve_viewer_stream_id(args: &Args, streams: &[StreamSummary]) -> anyhow::Result<StreamId> {
@@ -2548,6 +2613,20 @@ mod tests {
         }
     }
 
+    fn participant_summary(user_id: u64) -> ParticipantSummary {
+        ParticipantSummary {
+            room_id: 1,
+            user_id,
+            display_name: format!("user-{user_id}"),
+            muted: false,
+            deafened: true,
+            push_to_talk: true,
+            speaking: false,
+            published_stream_count: 1,
+            subscribed_stream_count: 2,
+        }
+    }
+
     #[test]
     fn list_capture_sources_flag_parses_without_relay_options() {
         let args = Args::try_parse_from(["desktop-client", "--list-capture-sources"]).unwrap();
@@ -2560,6 +2639,13 @@ mod tests {
         let args = Args::try_parse_from(["desktop-client", "--list-audio-sources"]).unwrap();
 
         assert!(args.list_audio_sources);
+    }
+
+    #[test]
+    fn list_participants_flag_parses_without_media_options() {
+        let args = Args::try_parse_from(["desktop-client", "--list-participants"]).unwrap();
+
+        assert!(args.list_participants);
     }
 
     #[test]
@@ -2901,6 +2987,16 @@ mod tests {
         assert_eq!(
             format_audio_source(&source),
             "audio-source kind=device id=0 default=true sample_rate_hz=48000 channels=2 label=\"Microphone Array\""
+        );
+    }
+
+    #[test]
+    fn format_participant_summary_prints_voice_state() {
+        let summary = participant_summary(7);
+
+        assert_eq!(
+            format_participant_summary(&summary),
+            "participant room_id=1 user_id=7 display_name=\"user-7\" muted=false deafened=true push_to_talk=true speaking=false published_streams=1 subscribed_streams=2"
         );
     }
 

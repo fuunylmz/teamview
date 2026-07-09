@@ -33,7 +33,7 @@ The capture layer provides:
 - `WindowsGraphicsCapture` support detection, a test-frame path for non-interactive verification, and live CPU BGRA capture via GDI for primary-monitor, indexed-monitor, and exact-title visible-window sources in the `--screen-input live` broadcaster path.
 - Microphone source metadata/listing, captured PCM frame validation, a latest-audio capture queue, and a WinMM PCM input path are in place for `--voice-input microphone`.
 - The temporary Opus-like voice encoder can emit synthetic samples or embed captured microphone PCM, allowing audio packetization, relay forwarding, reassembly, decode, latest-audio sink playback, and optional WinMM speaker playback to be validated before real Opus is integrated.
-- Room-scoped voice state is tracked by the relay. `--muted` suppresses client voice sending, `--push-to-talk` / `--ptt-active` model an idle or pressed talk key, and `--deafened` suppresses relay voice delivery plus local playback for that viewer.
+- Room-scoped voice state is tracked by the relay. `--muted` suppresses client voice sending, `--push-to-talk` / `--ptt-active` model an idle or pressed talk key, and `--deafened` suppresses relay voice delivery plus local playback for that viewer. Room participants can list participant presence, voice state, and published/subscribed stream counts with `--list-participants`.
 - The temporary H.264-like screen encoder embeds a bounded BGRA preview for CPU-backed frames, allowing live screen pixels to travel through packetization, relay forwarding, reassembly, decode, and playback before hardware H.264 is integrated.
 - The viewer can render decoded BGRA frames into the latest-frame sink for tests or a native Win32 preview window with `--render-output window`.
 

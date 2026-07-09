@@ -4,10 +4,11 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     control::{
         ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason, MediaKind,
-        Pong, RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, RoomList, RoomSummary,
-        ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, SetVoiceState,
-        StreamConfig, StreamId, StreamList, StreamPublished, StreamSubscribed, StreamSummary,
-        StreamUnsubscribed, TimeSyncResponse, UserId, ViewerStatsReport, VoiceState,
+        ParticipantList, ParticipantSummary, Pong, RequestKeyframe, RoomCreated, RoomId,
+        RoomJoined, RoomLeft, RoomList, RoomSummary, ServerControl, ServerEnvelope,
+        SetTargetBitrate, SetTargetFramerate, SetVoiceState, StreamConfig, StreamId, StreamList,
+        StreamPublished, StreamSubscribed, StreamSummary, StreamUnsubscribed, TimeSyncResponse,
+        UserId, ViewerStatsReport, VoiceState,
     },
     packet::MediaPacket,
 };
@@ -179,6 +180,7 @@ impl ControlState {
                     ServerControl::Error(ControlError::new("room_not_found", "room does not exist"))
                 }
             },
+            ClientControl::ListParticipants(list) => self.list_participants(session, list.room_id),
             ClientControl::PublishStream(publish) => {
                 if self.publisher_for_stream(publish.stream_id).is_some() {
                     ServerControl::Error(ControlError::new(
@@ -948,6 +950,63 @@ impl ControlState {
         })
     }
 
+    fn list_participants(&self, session: &Session, room_id: RoomId) -> ServerControl {
+        let Some(user_id) = session.user_id else {
+            return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
+        };
+        let Some(room) = self.rooms.get(&room_id) else {
+            return ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            ));
+        };
+        if !room.participants.contains(&user_id) {
+            return ServerControl::Error(ControlError::new(
+                "not_in_room",
+                "join room before listing participants",
+            ));
+        }
+        ServerControl::ParticipantList(ParticipantList {
+            room_id,
+            participants: room
+                .participants
+                .iter()
+                .map(|participant_id| {
+                    let voice_state = self
+                        .voice_state(room_id, *participant_id)
+                        .cloned()
+                        .unwrap_or(VoiceState {
+                            room_id,
+                            user_id: *participant_id,
+                            muted: false,
+                            deafened: false,
+                            push_to_talk: false,
+                            speaking: true,
+                        });
+                    ParticipantSummary {
+                        room_id,
+                        user_id: *participant_id,
+                        display_name: format!("user-{participant_id}"),
+                        muted: voice_state.muted,
+                        deafened: voice_state.deafened,
+                        push_to_talk: voice_state.push_to_talk,
+                        speaking: voice_state.speaking,
+                        published_stream_count: room
+                            .published_streams
+                            .values()
+                            .filter(|stream| stream.publisher_id == *participant_id)
+                            .count() as u32,
+                        subscribed_stream_count: room
+                            .subscriptions
+                            .values()
+                            .filter(|subscribers| subscribers.contains(participant_id))
+                            .count() as u32,
+                    }
+                })
+                .collect(),
+        })
+    }
+
     fn poll_stream_metrics(
         &self,
         session: &Session,
@@ -1044,8 +1103,8 @@ mod tests {
         codec::CodecId,
         control::{
             Authenticate, ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, LeaveRoom,
-            ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
-            PollStreamMetrics, PublishStream, RequestKeyframe, SetTargetBitrate,
+            ListParticipants, ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback,
+            PollStreamConfig, PollStreamMetrics, PublishStream, RequestKeyframe, SetTargetBitrate,
             SetTargetFramerate, SetVoiceState, StreamConfig, SubscribeStream, TimeSyncRequest,
             ViewerStatsReport,
         },
@@ -2314,6 +2373,100 @@ mod tests {
         assert_eq!(room.participants.len(), 2);
         assert_eq!(room.published_streams.len(), 1);
         assert_eq!(room.subscriptions.get(&9).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn room_participant_can_list_participants_with_voice_state() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::SetVoiceState(SetVoiceState {
+                    room_id,
+                    muted: false,
+                    deafened: true,
+                    push_to_talk: true,
+                    speaking: false,
+                }),
+            ),
+        );
+
+        let response = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                7,
+                ClientControl::ListParticipants(ListParticipants { room_id }),
+            ),
+        );
+
+        let list = match response.message {
+            ServerControl::ParticipantList(list) => list,
+            other => panic!("unexpected participant list response: {other:?}"),
+        };
+        assert_eq!(list.room_id, room_id);
+        assert_eq!(list.participants.len(), 2);
+        let publisher_id = publisher.user_id.unwrap();
+        let viewer_id = viewer.user_id.unwrap();
+        let publisher_summary = list
+            .participants
+            .iter()
+            .find(|participant| participant.user_id == publisher_id)
+            .unwrap();
+        let viewer_summary = list
+            .participants
+            .iter()
+            .find(|participant| participant.user_id == viewer_id)
+            .unwrap();
+
+        assert_eq!(publisher_summary.display_name, "user-1");
+        assert!(!publisher_summary.muted);
+        assert!(!publisher_summary.deafened);
+        assert!(!publisher_summary.push_to_talk);
+        assert!(publisher_summary.speaking);
+        assert_eq!(publisher_summary.published_stream_count, 1);
+        assert_eq!(publisher_summary.subscribed_stream_count, 0);
+
+        assert_eq!(viewer_summary.display_name, "user-2");
+        assert!(!viewer_summary.muted);
+        assert!(viewer_summary.deafened);
+        assert!(viewer_summary.push_to_talk);
+        assert!(!viewer_summary.speaking);
+        assert_eq!(viewer_summary.published_stream_count, 0);
+        assert_eq!(viewer_summary.subscribed_stream_count, 1);
+    }
+
+    #[test]
+    fn non_participant_cannot_list_participants() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut outsider = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut outsider, "outsider");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+
+        let response = state.handle_client_envelope(
+            &mut outsider,
+            ClientEnvelope::new(
+                3,
+                ClientControl::ListParticipants(ListParticipants { room_id }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_in_room"),
+            other => panic!("unexpected participant list response: {other:?}"),
+        }
     }
 
     #[test]
