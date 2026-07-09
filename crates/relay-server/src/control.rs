@@ -840,6 +840,9 @@ fn viewer_is_degraded(report: &ViewerStatsReport) -> bool {
         || report.dropped_frames > 0
         || report.jitter_buffer_ms > 120
         || report.estimated_latency_ms > 200
+        || report.decode_ms_p95 > 40
+        || report.render_ms_p95 > 40
+        || (report.render_fps > 0 && report.render_fps < 15)
 }
 
 #[cfg(test)]
@@ -1199,6 +1202,7 @@ mod tests {
                     dropped_frames: 0,
                     jitter_buffer_ms: 40,
                     estimated_latency_ms: 90,
+                    ..viewer_stats_report(room_id, 9)
                 }),
             ),
         );
@@ -1330,6 +1334,7 @@ mod tests {
                     dropped_frames: 0,
                     jitter_buffer_ms: 40,
                     estimated_latency_ms: 90,
+                    ..viewer_stats_report(room_id, 9)
                 }),
             ),
         );
@@ -1344,6 +1349,25 @@ mod tests {
             }
             other => panic!("unexpected viewer stats response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn slow_decode_or_render_marks_viewer_degraded() {
+        let mut report = viewer_stats_report(1, 9);
+        report.decode_ms_p95 = 45;
+        assert!(viewer_is_degraded(&report));
+
+        let mut report = viewer_stats_report(1, 9);
+        report.render_ms_p95 = 45;
+        assert!(viewer_is_degraded(&report));
+
+        let mut report = viewer_stats_report(1, 9);
+        report.render_fps = 12;
+        assert!(viewer_is_degraded(&report));
+
+        let mut report = viewer_stats_report(1, 9);
+        report.render_fps = 30;
+        assert!(!viewer_is_degraded(&report));
     }
 
     #[test]
@@ -1376,6 +1400,7 @@ mod tests {
                     dropped_frames: 0,
                     jitter_buffer_ms: 40,
                     estimated_latency_ms: 90,
+                    ..viewer_stats_report(room_id, 9)
                 }),
             ),
         );
@@ -1392,6 +1417,7 @@ mod tests {
                     dropped_frames: 1,
                     jitter_buffer_ms: 130,
                     estimated_latency_ms: 220,
+                    ..viewer_stats_report(room_id, 9)
                 }),
             ),
         );
@@ -1531,6 +1557,7 @@ mod tests {
                     dropped_frames: 1,
                     jitter_buffer_ms: 160,
                     estimated_latency_ms: 240,
+                    ..viewer_stats_report(room_id, 9)
                 }),
             ),
         );
@@ -2027,6 +2054,24 @@ mod tests {
             response.message,
             ServerControl::StreamSubscribed(_)
         ));
+    }
+
+    fn viewer_stats_report(room_id: RoomId, stream_id: StreamId) -> ViewerStatsReport {
+        ViewerStatsReport {
+            room_id,
+            stream_id,
+            received_packets: 0,
+            lost_packets: 0,
+            decoded_frames: 0,
+            dropped_frames: 0,
+            jitter_buffer_ms: 0,
+            estimated_latency_ms: 0,
+            decode_ms_p50: 0,
+            decode_ms_p95: 0,
+            render_ms_p50: 0,
+            render_ms_p95: 0,
+            render_fps: 0,
+        }
     }
 
     fn sample_stream_config(room_id: RoomId, stream_id: StreamId) -> StreamConfig {

@@ -276,6 +276,11 @@ pub struct ViewerStatsReport {
     pub dropped_frames: u64,
     pub jitter_buffer_ms: u16,
     pub estimated_latency_ms: u16,
+    pub decode_ms_p50: u16,
+    pub decode_ms_p95: u16,
+    pub render_ms_p50: u16,
+    pub render_ms_p95: u16,
+    pub render_fps: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

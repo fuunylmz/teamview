@@ -9,7 +9,7 @@ mod playback;
 mod stats;
 mod transport;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
@@ -847,6 +847,10 @@ fn media_interval_micros(frames_per_second: u16) -> u64 {
     1_000_000 / frames_per_second.max(1) as u64
 }
 
+fn millis_for_log(duration: Duration) -> u16 {
+    duration.as_millis().min(u16::MAX as u128) as u16
+}
+
 fn unix_time_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -963,16 +967,25 @@ async fn run_synthetic_screen_viewer_media(
                 frame.is_keyframe,
                 stats.estimated_latency_ms
             );
+            let decode_start = Instant::now();
             if let Some(decoded) = decoder.decode(&frame.bytes)? {
+                let decode_duration = decode_start.elapsed();
+                stats.record_decode_duration(decode_duration);
+                let render_start = Instant::now();
                 playback.render(decoded)?;
+                let render_duration = render_start.elapsed();
                 if let Some(rendered) = playback.latest_frame() {
+                    stats.record_render_duration(render_duration, rendered.render_time_micros);
                     println!(
-                        "media-render frame_id={} width={} height={} pixel_bytes={} render_time_micros={}",
+                        "media-render frame_id={} width={} height={} pixel_bytes={} render_time_micros={} decode_ms={} render_ms={} render_fps={}",
                         rendered.frame_id,
                         rendered.width,
                         rendered.height,
                         rendered.pixel_bytes,
-                        rendered.render_time_micros
+                        rendered.render_time_micros,
+                        millis_for_log(decode_duration),
+                        millis_for_log(render_duration),
+                        stats.render_fps()
                     );
                 }
                 stats.record_decoded_frame();
@@ -1001,14 +1014,19 @@ async fn run_synthetic_screen_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={}",
+        "media-summary role=viewer frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={} decode_ms_p50={} decode_ms_p95={} render_ms_p50={} render_ms_p95={} render_fps={}",
         reassembled_frames,
         decoded_frames,
         playback.rendered_frames(),
         received_packets,
         stats.lost_packets,
         stats.dropped_frames,
-        stats.estimated_latency_ms
+        stats.estimated_latency_ms,
+        stats.to_viewer_report(room_id, stream_id).decode_ms_p50,
+        stats.to_viewer_report(room_id, stream_id).decode_ms_p95,
+        stats.to_viewer_report(room_id, stream_id).render_ms_p50,
+        stats.to_viewer_report(room_id, stream_id).render_ms_p95,
+        stats.render_fps()
     );
     Ok(())
 }
@@ -1060,15 +1078,24 @@ async fn run_synthetic_voice_viewer_media(
                 frame.bytes.len(),
                 stats.estimated_latency_ms
             );
+            let decode_start = Instant::now();
             if let Some(decoded) = decoder.decode(&frame.bytes)? {
+                let decode_duration = decode_start.elapsed();
+                stats.record_decode_duration(decode_duration);
+                let play_start = Instant::now();
                 playback.play(decoded)?;
+                let play_duration = play_start.elapsed();
+                stats.record_render_duration(play_duration, unix_time_micros());
                 if let Some(played) = playback.latest() {
                     println!(
-                        "audio-play frame_id={} sample_rate_hz={} channels={} samples={}",
+                        "audio-play frame_id={} sample_rate_hz={} channels={} samples={} decode_ms={} play_ms={} play_fps={}",
                         played.frame_id,
                         played.sample_rate_hz,
                         played.channel_count,
-                        played.sample_count
+                        played.sample_count,
+                        millis_for_log(decode_duration),
+                        millis_for_log(play_duration),
+                        stats.render_fps()
                     );
                 }
                 stats.record_decoded_frame();
@@ -1089,14 +1116,19 @@ async fn run_synthetic_voice_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer kind=voice frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={}",
+        "media-summary role=viewer kind=voice frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={} decode_ms_p50={} decode_ms_p95={} play_ms_p50={} play_ms_p95={} play_fps={}",
         reassembled_frames,
         decoded_frames,
         playback.played_frames(),
         received_packets,
         stats.lost_packets,
         stats.dropped_frames,
-        stats.estimated_latency_ms
+        stats.estimated_latency_ms,
+        stats.to_viewer_report(room_id, stream_id).decode_ms_p50,
+        stats.to_viewer_report(room_id, stream_id).decode_ms_p95,
+        stats.to_viewer_report(room_id, stream_id).render_ms_p50,
+        stats.to_viewer_report(room_id, stream_id).render_ms_p95,
+        stats.render_fps()
     );
     Ok(())
 }

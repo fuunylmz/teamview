@@ -1,7 +1,11 @@
+use std::time::Duration;
+
 use teamview_protocol::{
     control::{RoomId, StreamId, ViewerStatsReport},
     packet::MediaPacket,
 };
+
+const LATENCY_SAMPLE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientPipelineStats {
@@ -21,10 +25,15 @@ pub struct ClientMediaStats {
     pub received_packets: u64,
     pub lost_packets: u64,
     pub decoded_frames: u64,
+    pub rendered_frames: u64,
     pub dropped_frames: u64,
     pub jitter_buffer_ms: u16,
     pub estimated_latency_ms: u16,
     last_sequence_number: Option<u32>,
+    decode_samples_ms: LatencySamples,
+    render_samples_ms: LatencySamples,
+    first_render_time_micros: u64,
+    last_render_time_micros: u64,
 }
 
 impl ClientMediaStats {
@@ -44,6 +53,19 @@ impl ClientMediaStats {
 
     pub fn record_decoded_frame(&mut self) {
         self.decoded_frames = self.decoded_frames.saturating_add(1);
+    }
+
+    pub fn record_decode_duration(&mut self, duration: Duration) {
+        self.decode_samples_ms.push(duration_to_millis(duration));
+    }
+
+    pub fn record_render_duration(&mut self, duration: Duration, render_time_micros: u64) {
+        self.rendered_frames = self.rendered_frames.saturating_add(1);
+        self.render_samples_ms.push(duration_to_millis(duration));
+        if self.first_render_time_micros == 0 {
+            self.first_render_time_micros = render_time_micros;
+        }
+        self.last_render_time_micros = render_time_micros;
     }
 
     pub fn record_dropped_frame(&mut self) {
@@ -79,8 +101,70 @@ impl ClientMediaStats {
             dropped_frames: self.dropped_frames,
             jitter_buffer_ms: self.jitter_buffer_ms,
             estimated_latency_ms: self.estimated_latency_ms,
+            decode_ms_p50: self.decode_samples_ms.percentile(50),
+            decode_ms_p95: self.decode_samples_ms.percentile(95),
+            render_ms_p50: self.render_samples_ms.percentile(50),
+            render_ms_p95: self.render_samples_ms.percentile(95),
+            render_fps: self.render_fps(),
         }
     }
+
+    pub fn render_fps(self) -> u16 {
+        if self.rendered_frames < 2 || self.last_render_time_micros <= self.first_render_time_micros
+        {
+            return 0;
+        }
+        let elapsed_micros = self
+            .last_render_time_micros
+            .saturating_sub(self.first_render_time_micros);
+        self.rendered_frames
+            .saturating_sub(1)
+            .saturating_mul(1_000_000)
+            .checked_div(elapsed_micros)
+            .unwrap_or_default()
+            .min(u16::MAX as u64) as u16
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LatencySamples {
+    values: [u16; LATENCY_SAMPLE_CAPACITY],
+    len: usize,
+    next: usize,
+}
+
+impl Default for LatencySamples {
+    fn default() -> Self {
+        Self {
+            values: [0; LATENCY_SAMPLE_CAPACITY],
+            len: 0,
+            next: 0,
+        }
+    }
+}
+
+impl LatencySamples {
+    fn push(&mut self, value: u16) {
+        self.values[self.next] = value;
+        self.next = (self.next + 1) % LATENCY_SAMPLE_CAPACITY;
+        self.len = self.len.saturating_add(1).min(LATENCY_SAMPLE_CAPACITY);
+    }
+
+    fn percentile(self, percentile: u8) -> u16 {
+        if self.len == 0 {
+            return 0;
+        }
+        let mut samples = self.values[..self.len].to_vec();
+        samples.sort_unstable();
+        let index = ((self.len - 1) as u32)
+            .saturating_mul(percentile.min(100) as u32)
+            .div_ceil(100) as usize;
+        samples[index.min(samples.len() - 1)]
+    }
+}
+
+fn duration_to_millis(duration: Duration) -> u16 {
+    duration.as_millis().min(u16::MAX as u128) as u16
 }
 
 #[cfg(test)]
@@ -110,6 +194,10 @@ mod tests {
         let mut stats = ClientMediaStats::default();
         stats.record_packet(&packet_with_sequence(1));
         stats.record_decoded_frame();
+        stats.record_decode_duration(Duration::from_millis(4));
+        stats.record_decode_duration(Duration::from_millis(8));
+        stats.record_render_duration(Duration::from_millis(3), 1_000_000);
+        stats.record_render_duration(Duration::from_millis(5), 1_050_000);
         stats.record_dropped_frame();
         stats.jitter_buffer_ms = 42;
         stats.estimated_latency_ms = 88;
@@ -120,6 +208,11 @@ mod tests {
         assert_eq!(report.stream_id, 9);
         assert_eq!(report.received_packets, 1);
         assert_eq!(report.decoded_frames, 1);
+        assert_eq!(report.decode_ms_p50, 8);
+        assert_eq!(report.decode_ms_p95, 8);
+        assert_eq!(report.render_ms_p50, 5);
+        assert_eq!(report.render_ms_p95, 5);
+        assert_eq!(report.render_fps, 20);
         assert_eq!(report.dropped_frames, 1);
         assert_eq!(report.jitter_buffer_ms, 42);
         assert_eq!(report.estimated_latency_ms, 88);
@@ -145,6 +238,28 @@ mod tests {
         stats.record_estimated_latency(2_000_000, 1_123_456);
 
         assert_eq!(stats.estimated_latency_ms, 42);
+    }
+
+    #[test]
+    fn latency_samples_keep_recent_percentiles() {
+        let mut samples = LatencySamples::default();
+        samples.push(2);
+        samples.push(10);
+        samples.push(6);
+
+        assert_eq!(samples.percentile(50), 6);
+        assert_eq!(samples.percentile(95), 10);
+    }
+
+    #[test]
+    fn render_fps_requires_two_rendered_frames() {
+        let mut stats = ClientMediaStats::default();
+
+        stats.record_render_duration(Duration::from_millis(1), 1_000_000);
+        assert_eq!(stats.render_fps(), 0);
+
+        stats.record_render_duration(Duration::from_millis(1), 1_100_000);
+        assert_eq!(stats.render_fps(), 10);
     }
 
     fn packet_with_sequence(sequence_number: u32) -> MediaPacket {

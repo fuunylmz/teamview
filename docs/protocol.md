@@ -60,6 +60,8 @@ Keyframe requests are accepted from subscribed viewers and are also registered a
 
 Publishers can set their current target bitrate and framerate. `PublisherFeedback` returns the relay's current bitrate/FPS target; if most subscribed viewers report degraded stats, the relay lowers the bitrate target before returning feedback so the publisher can adapt future encoded frames.
 
+`ViewerStats` carries packet counts, decoded/dropped frame counts, jitter, estimated capture-to-viewer latency, decode/render p50 and p95 milliseconds, and render FPS. The relay treats packet loss, dropped frames, excessive jitter/latency, slow decode/render p95, or low nonzero render FPS as degraded viewer signals for publisher feedback.
+
 Room participants can poll `StreamMetrics` for a published stream. The relay reports server-observed ingress packets/bytes, queued and dropped egress datagrams, subscriber count, and the last server ingress timestamp.
 
 ## Media plane
