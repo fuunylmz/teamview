@@ -486,6 +486,25 @@ async function updateVoiceState(nextVoice) {
   }
 }
 
+async function updateScreenShareState(nextScreenShare) {
+  clientApp.localScreenShare = { ...clientApp.localScreenShare, ...nextScreenShare };
+  render();
+  if (!canUseClientApi()) return;
+
+  try {
+    const response = await fetch("api/screen-share", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sharing: clientApp.localScreenShare.sharing }),
+    });
+    if (!response.ok) throw new Error(`screen share update failed: ${response.status}`);
+    applySnapshot(await response.json());
+    render();
+  } catch {
+    render();
+  }
+}
+
 function setButtonLabel(button, label) {
   button.querySelector("span:last-child").textContent = label;
 }
@@ -689,10 +708,12 @@ function drawVoice(channel) {
   }
 }
 
-elements.shareButton.addEventListener("click", () => {
+elements.shareButton.addEventListener("click", async () => {
   if (clientApp.role !== "broadcaster") return;
-  clientApp.localScreenShare.sharing = !clientApp.localScreenShare.sharing;
-  render();
+  await updateScreenShareState({
+    ...clientApp.localScreenShare,
+    sharing: !clientApp.localScreenShare.sharing,
+  });
 });
 
 elements.muteButton.addEventListener("click", async () => {

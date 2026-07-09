@@ -795,7 +795,9 @@ async fn build_ui_state_json_with_controls(
         streams = list_room_streams(control, room_id).await?;
         stream_configs = poll_configured_streams(control, room_id, &streams).await?;
         participants = list_room_participants(control, room_id).await?;
-        leave_room(control, room_id).await?;
+        if !(push_voice_state && args.mode == Mode::Broadcaster && local_screen_share.sharing) {
+            leave_room(control, room_id).await?;
+        }
     }
 
     let app = ClientApp::from_discovery(ClientAppDiscovery {
@@ -828,11 +830,19 @@ struct VoiceStatePatch {
     ptt_active: Option<bool>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScreenSharePatch {
+    sharing: bool,
+}
+
 impl UiServerState {
     fn new(args: &Args) -> Self {
+        let mut local_screen_share = args.ui_screen_share_control_state();
+        local_screen_share.sharing = false;
         Self {
             local_voice: Arc::new(Mutex::new(args.ui_voice_control_state())),
-            local_screen_share: Arc::new(Mutex::new(args.ui_screen_share_control_state())),
+            local_screen_share: Arc::new(Mutex::new(local_screen_share)),
         }
     }
 
@@ -878,6 +888,15 @@ impl UiServerState {
             voice.ptt_active = false;
         }
         Ok(voice.clone())
+    }
+
+    fn set_screen_sharing(&self, sharing: bool) -> anyhow::Result<ScreenShareControlState> {
+        let mut screen = self
+            .local_screen_share
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UI screen state lock is poisoned"))?;
+        screen.sharing = sharing;
+        Ok(screen.clone())
     }
 }
 
@@ -1009,13 +1028,44 @@ fn handle_ui_http_connection(
                 Err(error) => write_json_error(stream, "500 Internal Server Error", &error),
             }
         }
+        ("POST", UiRoute::ScreenShare) => {
+            let patch = match serde_json::from_str::<ScreenSharePatch>(body) {
+                Ok(patch) => patch,
+                Err(error) => {
+                    return write_json_error(
+                        stream,
+                        "400 Bad Request",
+                        &anyhow::anyhow!("failed to parse screen-share request: {error}"),
+                    );
+                }
+            };
+            if let Err(error) = runtime.block_on(apply_ui_screen_share_state(
+                control,
+                args,
+                state,
+                patch.sharing,
+            )) {
+                return write_json_error(stream, "500 Internal Server Error", &error);
+            }
+            match runtime.block_on(build_ui_state_json_for_ui(control, args, state)) {
+                Ok((json, _)) => write_http_response(
+                    stream,
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    json.as_bytes(),
+                    true,
+                ),
+                Err(error) => write_json_error(stream, "500 Internal Server Error", &error),
+            }
+        }
         (
             _,
             UiRoute::Index
             | UiRoute::Script
             | UiRoute::Style
             | UiRoute::State
-            | UiRoute::VoiceState,
+            | UiRoute::VoiceState
+            | UiRoute::ScreenShare,
         ) => write_http_response(
             stream,
             "405 Method Not Allowed",
@@ -1064,6 +1114,149 @@ fn read_ui_http_request(stream: &mut TcpStream) -> anyhow::Result<String> {
     String::from_utf8(request).context("UI HTTP request was not valid UTF-8")
 }
 
+async fn apply_ui_screen_share_state(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    state: &UiServerState,
+    sharing: bool,
+) -> anyhow::Result<()> {
+    ensure_ui_screen_share_allowed(args)?;
+    if sharing {
+        start_ui_screen_share(control, args, state).await
+    } else {
+        stop_ui_screen_share(control, args, state).await
+    }
+}
+
+fn ensure_ui_screen_share_allowed(args: &Args) -> anyhow::Result<()> {
+    if args.mode != Mode::Broadcaster {
+        bail!("screen sharing is only available in broadcaster mode");
+    }
+    if args.media_kind == MediaKindArg::Voice {
+        bail!("screen sharing is not available when --media-kind voice");
+    }
+    Ok(())
+}
+
+async fn start_ui_screen_share(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    state: &UiServerState,
+) -> anyhow::Result<()> {
+    if state.local_screen_share()?.sharing {
+        return Ok(());
+    }
+
+    let room_id = resolve_or_create_ui_screen_share_room_id(control, args).await?;
+    let joined = control
+        .send(ClientControl::JoinRoom(JoinRoom { room_id }))
+        .await?;
+    print_control_response("join-room", &joined);
+    ensure_not_error("join room", &joined)?;
+    set_voice_state(control, room_id, &state.local_voice()?).await?;
+
+    let screen_args = args.for_media_kind(MediaKindArg::Screen, args.stream_id);
+    if let Err(error) = publish_configured_stream(control, &screen_args, room_id).await {
+        let _ = leave_room(control, room_id).await;
+        return Err(error);
+    }
+    if let Err(error) = set_publisher_target_media(control, room_id, &screen_args).await {
+        let _ = unpublish_stream_for_ui(control, room_id, args.stream_id).await;
+        let _ = leave_room(control, room_id).await;
+        return Err(error);
+    }
+
+    state.set_screen_sharing(true)?;
+    Ok(())
+}
+
+async fn stop_ui_screen_share(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    state: &UiServerState,
+) -> anyhow::Result<()> {
+    let screen = state.local_screen_share()?;
+    if !screen.sharing {
+        return Ok(());
+    }
+
+    let rooms = list_rooms(control).await?;
+    let Some(room_id) = select_ui_state_channel_id(args, &rooms)? else {
+        state.set_screen_sharing(false)?;
+        return Ok(());
+    };
+
+    unpublish_stream_for_ui(control, room_id, screen.stream_id).await?;
+    state.set_screen_sharing(false)?;
+    leave_room(control, room_id).await?;
+    Ok(())
+}
+
+async fn resolve_or_create_ui_screen_share_room_id(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<RoomId> {
+    let rooms = list_rooms(control).await?;
+    if let Some(room_id) = args.selected_room_id()? {
+        if rooms.iter().any(|room| room.room_id == room_id) {
+            return Ok(room_id);
+        }
+        bail!(
+            "channel {} was not found; available channels: {}",
+            room_id,
+            format_room_summaries(&rooms)
+        );
+    }
+
+    let channel_name = args.selected_channel_name()?;
+    if let Some(room) = select_viewer_room(&rooms, channel_name) {
+        return Ok(room.room_id);
+    }
+
+    let response = control
+        .send(ClientControl::CreateRoom(CreateRoom {
+            name: channel_name.to_owned(),
+        }))
+        .await?;
+    print_control_response("create-room", &response);
+    match response.message {
+        ServerControl::RoomCreated(room) => Ok(room.room_id),
+        ServerControl::Error(error) => bail!("create room failed: {}", error.message),
+        other => bail!("unexpected create room response: {other:?}"),
+    }
+}
+
+async fn unpublish_stream_for_ui(
+    control: &crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
+    let response = control
+        .send(ClientControl::UnpublishStream(UnpublishStream {
+            room_id,
+            stream_id,
+        }))
+        .await?;
+    print_control_response("unpublish-stream", &response);
+    match response.message {
+        ServerControl::StreamUnpublished(unpublished)
+            if unpublished.room_id == room_id && unpublished.stream_id == stream_id =>
+        {
+            Ok(())
+        }
+        ServerControl::Error(error)
+            if matches!(
+                error.code.as_str(),
+                "stream_not_found" | "room_not_found" | "not_publisher"
+            ) =>
+        {
+            Ok(())
+        }
+        ServerControl::Error(error) => bail!("unpublish stream failed: {}", error.message),
+        other => bail!("unexpected unpublish response: {other:?}"),
+    }
+}
+
 async fn build_ui_state_json_for_ui(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
@@ -1104,6 +1297,7 @@ enum UiRoute {
     Style,
     State,
     VoiceState,
+    ScreenShare,
     NotFound,
 }
 
@@ -1142,6 +1336,7 @@ fn ui_route_for_path(path: &str) -> UiRoute {
         "/styles.css" => UiRoute::Style,
         "/state.json" => UiRoute::State,
         "/api/voice-state" => UiRoute::VoiceState,
+        "/api/screen-share" => UiRoute::ScreenShare,
         _ => UiRoute::NotFound,
     }
 }
@@ -3925,6 +4120,7 @@ mod tests {
         assert_eq!(ui_route_for_path("/styles.css"), UiRoute::Style);
         assert_eq!(ui_route_for_path("/state.json"), UiRoute::State);
         assert_eq!(ui_route_for_path("/api/voice-state"), UiRoute::VoiceState);
+        assert_eq!(ui_route_for_path("/api/screen-share"), UiRoute::ScreenShare);
         assert_eq!(ui_route_for_path("/missing"), UiRoute::NotFound);
     }
 
@@ -3971,6 +4167,29 @@ mod tests {
         assert!(voice.muted);
         assert!(!voice.ptt_active);
         assert!(!voice_speaking_from_state(&voice));
+    }
+
+    #[test]
+    fn ui_screen_share_state_starts_idle_and_updates() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--mode",
+            "broadcaster",
+            "--media-kind",
+            "screen",
+        ])
+        .unwrap();
+        assert!(args.ui_screen_share_control_state().sharing);
+
+        let state = UiServerState::new(&args);
+        assert!(!state.local_screen_share().unwrap().sharing);
+
+        let screen = state.set_screen_sharing(true).unwrap();
+        assert!(screen.sharing);
+        assert_eq!(screen.stream_id, args.stream_id);
+
+        let screen = state.set_screen_sharing(false).unwrap();
+        assert!(!screen.sharing);
     }
 
     #[test]
