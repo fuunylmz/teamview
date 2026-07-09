@@ -118,12 +118,13 @@ cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-id 1 
 Expected behavior:
 
 - The broadcaster prints five `media-send` lines at 5 fps for a 1000 ms run.
-- The broadcaster publishes `StreamConfig`, and the viewer polls it before media receive.
+- The broadcaster publishes `StreamConfig`, sets target bitrate/framerate, and the viewer polls config before media receive.
 - The viewer receives and decodes five frames split across ten packets with `--max-datagram-payload 700`.
 - The viewer reassembly buffer drops stale incomplete frames after `--reassembly-window-frames` to avoid accumulating latency.
 - The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.
 - New subscribers, packet loss, and decoder recovery can register keyframe requests with the relay.
 - The broadcaster polls aggregated `PublisherFeedback`; when feedback requests a keyframe, the synthetic encoder marks the next frame as a keyframe.
+- When most viewers are degraded, relay feedback lowers the synthetic target bitrate, and the broadcaster shrinks subsequent synthetic frame payloads.
 - The final viewer summary reports zero loss and drops on a healthy local run.
 
 ## Measurement plan

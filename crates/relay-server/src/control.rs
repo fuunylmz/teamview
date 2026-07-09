@@ -5,8 +5,8 @@ use teamview_protocol::{
     control::{
         ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason,
         RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, ServerControl, ServerEnvelope,
-        StreamConfig, StreamId, StreamPublished, StreamSubscribed, StreamUnsubscribed, UserId,
-        ViewerStatsReport,
+        SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId, StreamPublished,
+        StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
     },
 };
 
@@ -15,6 +15,14 @@ use crate::{
     session::Session,
 };
 
+const DEFAULT_TARGET_BITRATE_BPS: u32 = 4_000_000;
+const DEFAULT_TARGET_FRAMES_PER_SECOND: u16 = 30;
+const MIN_TARGET_BITRATE_BPS: u32 = 16_000;
+const MAX_TARGET_BITRATE_BPS: u32 = 16_000_000;
+const MIN_TARGET_FRAMES_PER_SECOND: u16 = 5;
+const MAX_TARGET_FRAMES_PER_SECOND: u16 = 120;
+const DEGRADED_BITRATE_PERCENT: u32 = 80;
+
 #[derive(Debug, Default)]
 pub struct ControlState {
     rooms: BTreeMap<RoomId, Room>,
@@ -22,6 +30,12 @@ pub struct ControlState {
     pending_keyframe_requests: BTreeMap<StreamId, KeyframeReason>,
     next_room_id: RoomId,
     next_user_id: UserId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamTarget {
+    bitrate_bps: u32,
+    frames_per_second: u16,
 }
 
 impl ControlState {
@@ -120,6 +134,8 @@ impl ControlState {
                                     codec: publish.codec,
                                     media_kind: publish.media_kind,
                                     config: None,
+                                    target_bitrate_bps: DEFAULT_TARGET_BITRATE_BPS,
+                                    target_frames_per_second: DEFAULT_TARGET_FRAMES_PER_SECOND,
                                 });
                                 ServerControl::StreamPublished(StreamPublished {
                                     room_id: publish.room_id,
@@ -234,12 +250,8 @@ impl ControlState {
             ClientControl::PollPublisherFeedback(poll) => {
                 self.poll_publisher_feedback(session, poll.room_id, poll.stream_id)
             }
-            ClientControl::SetTargetBitrate(_) | ClientControl::SetTargetFramerate(_) => {
-                ServerControl::Error(ControlError::new(
-                    "not_implemented",
-                    "control accepted in later stage",
-                ))
-            }
+            ClientControl::SetTargetBitrate(target) => self.set_target_bitrate(session, target),
+            ClientControl::SetTargetFramerate(target) => self.set_target_framerate(session, target),
         };
 
         ServerEnvelope::new(request_id, message)
@@ -302,6 +314,7 @@ impl ControlState {
         room_id: RoomId,
         stream_id: StreamId,
     ) -> teamview_protocol::control::PublisherFeedback {
+        let target = self.stream_target(stream_id);
         let total_viewer_count = self.subscribers_for_stream(stream_id).len() as u32;
         let mut degraded_viewer_count = 0_u32;
         let mut keyframe_requested = self.pending_keyframe_requests.contains_key(&stream_id);
@@ -318,10 +331,74 @@ impl ControlState {
         teamview_protocol::control::PublisherFeedback {
             room_id,
             stream_id,
-            aggregate_available_bitrate_bps: 0,
+            aggregate_available_bitrate_bps: target.bitrate_bps,
+            target_frames_per_second: target.frames_per_second,
             degraded_viewer_count,
             total_viewer_count,
             keyframe_requested,
+        }
+    }
+
+    fn adaptive_publisher_feedback(
+        &mut self,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) -> teamview_protocol::control::PublisherFeedback {
+        let mut feedback = self.aggregate_publisher_feedback(room_id, stream_id);
+        if feedback.total_viewer_count > 0
+            && feedback.degraded_viewer_count.saturating_mul(2) >= feedback.total_viewer_count
+        {
+            let target = self.stream_target(stream_id);
+            let reduced_bitrate = target.bitrate_bps.saturating_mul(DEGRADED_BITRATE_PERCENT) / 100;
+            let new_bitrate = reduced_bitrate.max(MIN_TARGET_BITRATE_BPS);
+            let mut new_fps = target.frames_per_second;
+            if new_bitrate == target.bitrate_bps
+                && target.frames_per_second > MIN_TARGET_FRAMES_PER_SECOND
+            {
+                new_fps = target
+                    .frames_per_second
+                    .saturating_mul(DEGRADED_BITRATE_PERCENT as u16)
+                    / 100;
+                new_fps = new_fps.max(MIN_TARGET_FRAMES_PER_SECOND);
+            }
+            self.update_stream_target(stream_id, new_bitrate, new_fps);
+            feedback.aggregate_available_bitrate_bps = new_bitrate;
+            feedback.target_frames_per_second = new_fps;
+        }
+        feedback
+    }
+
+    fn stream_target(&self, stream_id: StreamId) -> StreamTarget {
+        self.published_stream(stream_id)
+            .map(|stream| StreamTarget {
+                bitrate_bps: stream.target_bitrate_bps,
+                frames_per_second: stream.target_frames_per_second,
+            })
+            .unwrap_or(StreamTarget {
+                bitrate_bps: DEFAULT_TARGET_BITRATE_BPS,
+                frames_per_second: DEFAULT_TARGET_FRAMES_PER_SECOND,
+            })
+    }
+
+    fn update_stream_target(
+        &mut self,
+        stream_id: StreamId,
+        bitrate_bps: u32,
+        frames_per_second: u16,
+    ) {
+        let Some(stream) = self
+            .rooms
+            .values_mut()
+            .find_map(|room| room.published_streams.get_mut(&stream_id))
+        else {
+            return;
+        };
+        stream.target_bitrate_bps =
+            bitrate_bps.clamp(MIN_TARGET_BITRATE_BPS, MAX_TARGET_BITRATE_BPS);
+        stream.target_frames_per_second =
+            frames_per_second.clamp(MIN_TARGET_FRAMES_PER_SECOND, MAX_TARGET_FRAMES_PER_SECOND);
+        if let Some(config) = &mut stream.config {
+            config.frames_per_second = stream.target_frames_per_second;
         }
     }
 
@@ -382,7 +459,7 @@ impl ControlState {
     ) -> ServerControl {
         match session.user_id {
             Some(user_id) if self.publisher_for_stream(stream_id) == Some(user_id) => {
-                let feedback = self.aggregate_publisher_feedback(room_id, stream_id);
+                let feedback = self.adaptive_publisher_feedback(room_id, stream_id);
                 self.pending_keyframe_requests.remove(&stream_id);
                 ServerControl::PublisherFeedback(feedback)
             }
@@ -422,8 +499,80 @@ impl ControlState {
                 "stream config codec must match published stream codec",
             ));
         }
+        stream.target_frames_per_second = config
+            .frames_per_second
+            .clamp(MIN_TARGET_FRAMES_PER_SECOND, MAX_TARGET_FRAMES_PER_SECOND);
         stream.config = Some(config.clone());
         ServerControl::StreamConfig(config)
+    }
+
+    fn set_target_bitrate(&mut self, session: &Session, target: SetTargetBitrate) -> ServerControl {
+        let Some(error) =
+            self.validate_publisher_control(session, target.room_id, target.stream_id)
+        else {
+            let current = self.stream_target(target.stream_id);
+            let bitrate_bps = target
+                .bitrate_bps
+                .clamp(MIN_TARGET_BITRATE_BPS, MAX_TARGET_BITRATE_BPS);
+            self.update_stream_target(target.stream_id, bitrate_bps, current.frames_per_second);
+            return ServerControl::PublisherFeedback(
+                self.aggregate_publisher_feedback(target.room_id, target.stream_id),
+            );
+        };
+        error
+    }
+
+    fn set_target_framerate(
+        &mut self,
+        session: &Session,
+        target: SetTargetFramerate,
+    ) -> ServerControl {
+        let Some(error) =
+            self.validate_publisher_control(session, target.room_id, target.stream_id)
+        else {
+            let current = self.stream_target(target.stream_id);
+            let frames_per_second = target
+                .frames_per_second
+                .clamp(MIN_TARGET_FRAMES_PER_SECOND, MAX_TARGET_FRAMES_PER_SECOND);
+            self.update_stream_target(target.stream_id, current.bitrate_bps, frames_per_second);
+            return ServerControl::PublisherFeedback(
+                self.aggregate_publisher_feedback(target.room_id, target.stream_id),
+            );
+        };
+        error
+    }
+
+    fn validate_publisher_control(
+        &self,
+        session: &Session,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) -> Option<ServerControl> {
+        let Some(user_id) = session.user_id else {
+            return Some(ServerControl::Error(ControlError::new(
+                "unauthenticated",
+                "send Hello first",
+            )));
+        };
+        let Some(room) = self.rooms.get(&room_id) else {
+            return Some(ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            )));
+        };
+        let Some(stream) = room.published_streams.get(&stream_id) else {
+            return Some(ServerControl::Error(ControlError::new(
+                "stream_not_found",
+                "stream does not exist",
+            )));
+        };
+        if stream.publisher_id != user_id {
+            return Some(ServerControl::Error(ControlError::new(
+                "not_publisher",
+                "only the stream publisher can update target media settings",
+            )));
+        }
+        None
     }
 
     fn poll_stream_config(
@@ -477,8 +626,8 @@ mod tests {
         codec::CodecId,
         control::{
             ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind,
-            PollPublisherFeedback, PollStreamConfig, PublishStream, RequestKeyframe, StreamConfig,
-            SubscribeStream, ViewerStatsReport,
+            PollPublisherFeedback, PollStreamConfig, PublishStream, RequestKeyframe,
+            SetTargetBitrate, SetTargetFramerate, StreamConfig, SubscribeStream, ViewerStatsReport,
         },
     };
 
@@ -669,6 +818,145 @@ mod tests {
                 assert!(feedback.keyframe_requested);
             }
             other => panic!("unexpected poll feedback response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publisher_sets_target_media_settings() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        authenticate(&mut state, &mut publisher, "publisher");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let bitrate = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                6,
+                ClientControl::SetTargetBitrate(SetTargetBitrate {
+                    room_id,
+                    stream_id: 9,
+                    bitrate_bps: 96_000,
+                }),
+            ),
+        );
+        match bitrate.message {
+            ServerControl::PublisherFeedback(feedback) => {
+                assert_eq!(feedback.aggregate_available_bitrate_bps, 96_000);
+                assert_eq!(feedback.target_frames_per_second, 30);
+            }
+            other => panic!("unexpected target bitrate response: {other:?}"),
+        }
+
+        let framerate = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                7,
+                ClientControl::SetTargetFramerate(SetTargetFramerate {
+                    room_id,
+                    stream_id: 9,
+                    frames_per_second: 12,
+                }),
+            ),
+        );
+        match framerate.message {
+            ServerControl::PublisherFeedback(feedback) => {
+                assert_eq!(feedback.aggregate_available_bitrate_bps, 96_000);
+                assert_eq!(feedback.target_frames_per_second, 12);
+            }
+            other => panic!("unexpected target framerate response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_publisher_cannot_set_target_media_settings() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::SetTargetBitrate(SetTargetBitrate {
+                    room_id,
+                    stream_id: 9,
+                    bitrate_bps: 96_000,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_publisher"),
+            other => panic!("unexpected set target response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn degraded_majority_reduces_target_bitrate() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+        state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                6,
+                ClientControl::SetTargetBitrate(SetTargetBitrate {
+                    room_id,
+                    stream_id: 9,
+                    bitrate_bps: 100_000,
+                }),
+            ),
+        );
+        state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                7,
+                ClientControl::ViewerStats(ViewerStatsReport {
+                    room_id,
+                    stream_id: 9,
+                    received_packets: 10,
+                    lost_packets: 2,
+                    decoded_frames: 4,
+                    dropped_frames: 1,
+                    jitter_buffer_ms: 160,
+                    estimated_latency_ms: 240,
+                }),
+            ),
+        );
+
+        let feedback = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                8,
+                ClientControl::PollPublisherFeedback(PollPublisherFeedback {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        match feedback.message {
+            ServerControl::PublisherFeedback(feedback) => {
+                assert_eq!(feedback.aggregate_available_bitrate_bps, 80_000);
+                assert_eq!(feedback.degraded_viewer_count, 1);
+                assert!(feedback.keyframe_requested);
+            }
+            other => panic!("unexpected degraded feedback response: {other:?}"),
         }
     }
 

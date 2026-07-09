@@ -18,8 +18,8 @@ use teamview_protocol::{
     control::{
         ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind,
         PollPublisherFeedback, PollStreamConfig, PublishStream, PublisherFeedback, RequestKeyframe,
-        RoomId, ServerControl, ServerEnvelope, StreamConfig, StreamId, SubscribeStream,
-        ViewerStatsReport,
+        RoomId, ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig,
+        StreamId, SubscribeStream, ViewerStatsReport,
     },
     frame::packetize_frame_for_datagram_target,
     packet::DEFAULT_DATAGRAM_PAYLOAD_TARGET,
@@ -35,6 +35,8 @@ use crate::{
     stats::ClientMediaStats,
     transport::quic::{build_client_endpoint, connect_control_client},
 };
+
+const MIN_SYNTHETIC_PAYLOAD_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -199,6 +201,7 @@ async fn run_broadcaster_control_flow(
         room_id, args.stream_id
     );
     if args.synthetic_media_enabled() {
+        set_publisher_target_media(control, room_id, args).await?;
         run_synthetic_broadcaster_media(control, args, room_id).await?;
     }
     Ok(())
@@ -287,11 +290,14 @@ async fn run_synthetic_broadcaster_media(
     )?;
     let mut encoder = H264Encoder::default();
     encoder.config.synthetic_payload_bytes = args.media_frame_bytes;
+    encoder.config.bitrate_bps = args.synthetic_bitrate_bps();
+    encoder.config.frames_per_second = args.media_fps;
     encoder.request_keyframe();
 
     let mut ticker = tokio::time::interval(frame_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let capture_step_micros = frame_interval.as_micros().min(u64::MAX as u128) as u64;
+    let mut active_fps = args.media_fps;
+    let mut capture_step_micros = frame_interval.as_micros().min(u64::MAX as u128) as u64;
     let mut sent_packets = 0_u64;
     let mut next_sequence_number = 1_u32;
     for frame_id in 1..=media_frames {
@@ -327,6 +333,8 @@ async fn run_synthetic_broadcaster_media(
             if feedback.keyframe_requested {
                 encoder.request_keyframe();
             }
+            apply_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
+            capture_step_micros = media_interval_micros(active_fps);
         }
     }
     let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
@@ -336,6 +344,7 @@ async fn run_synthetic_broadcaster_media(
             feedback.stream_id, feedback.degraded_viewer_count, feedback.total_viewer_count
         );
     }
+    apply_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
     println!(
         "media-summary role=broadcaster frames={} packets={} fps={} run_ms={}",
         media_frames, sent_packets, args.media_fps, args.media_run_ms
@@ -344,6 +353,77 @@ async fn run_synthetic_broadcaster_media(
         tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
     }
     Ok(())
+}
+
+async fn set_publisher_target_media(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let bitrate = control
+        .send(ClientControl::SetTargetBitrate(SetTargetBitrate {
+            room_id,
+            stream_id: args.stream_id,
+            bitrate_bps: args.synthetic_bitrate_bps(),
+        }))
+        .await?;
+    print_control_response("set-target-bitrate", &bitrate);
+    ensure_not_error("set target bitrate", &bitrate)?;
+
+    let framerate = control
+        .send(ClientControl::SetTargetFramerate(SetTargetFramerate {
+            room_id,
+            stream_id: args.stream_id,
+            frames_per_second: args.media_fps.max(1),
+        }))
+        .await?;
+    print_control_response("set-target-framerate", &framerate);
+    ensure_not_error("set target framerate", &framerate)?;
+    Ok(())
+}
+
+fn apply_publisher_feedback(
+    feedback: &PublisherFeedback,
+    encoder: &mut H264Encoder,
+    active_fps: &mut u16,
+    ticker: &mut tokio::time::Interval,
+) {
+    let mut adapted = false;
+    let target_bitrate = feedback.aggregate_available_bitrate_bps;
+    if target_bitrate > 0 && target_bitrate != encoder.config.bitrate_bps {
+        encoder.update_bitrate(target_bitrate);
+        encoder.config.synthetic_payload_bytes =
+            synthetic_payload_bytes_for_bitrate(target_bitrate, (*active_fps).max(1));
+        adapted = true;
+    }
+    if feedback.target_frames_per_second > 0 && feedback.target_frames_per_second != *active_fps {
+        *active_fps = feedback.target_frames_per_second;
+        encoder.config.frames_per_second = *active_fps;
+        encoder.config.synthetic_payload_bytes =
+            synthetic_payload_bytes_for_bitrate(encoder.config.bitrate_bps, (*active_fps).max(1));
+        *ticker = tokio::time::interval(Duration::from_micros(media_interval_micros(*active_fps)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        adapted = true;
+    }
+    if adapted {
+        println!(
+            "publisher-adapt stream_id={} bitrate_bps={} fps={} frame_bytes={}",
+            feedback.stream_id,
+            encoder.config.bitrate_bps,
+            *active_fps,
+            encoder.config.synthetic_payload_bytes
+        );
+    }
+}
+
+fn synthetic_payload_bytes_for_bitrate(bitrate_bps: u32, frames_per_second: u16) -> usize {
+    let fps = frames_per_second.max(1) as u32;
+    let bytes = bitrate_bps.saturating_div(8).saturating_div(fps);
+    (bytes as usize).max(MIN_SYNTHETIC_PAYLOAD_BYTES)
+}
+
+fn media_interval_micros(frames_per_second: u16) -> u64 {
+    1_000_000 / frames_per_second.max(1) as u64
 }
 
 async fn poll_publisher_feedback(
@@ -533,7 +613,14 @@ impl Args {
         if self.media_fps == 0 {
             bail!("--media-fps must be greater than zero");
         }
-        Ok(Duration::from_micros(1_000_000 / self.media_fps as u64))
+        Ok(Duration::from_micros(media_interval_micros(self.media_fps)))
+    }
+
+    fn synthetic_bitrate_bps(&self) -> u32 {
+        let bitrate = (self.media_frame_bytes as u128)
+            .saturating_mul(self.media_fps.max(1) as u128)
+            .saturating_mul(8);
+        bitrate.min(u32::MAX as u128) as u32
     }
 
     fn synthetic_stream_config(&self, room_id: RoomId) -> StreamConfig {

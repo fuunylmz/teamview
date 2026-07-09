@@ -48,6 +48,8 @@ JSON-line framing is intentionally a Stage 1 choice. Later stages can replace it
 
 Keyframe requests are accepted from subscribed viewers and are also registered automatically when a viewer first subscribes to a stream. The relay exposes those requests to the publisher through `PublisherFeedback.keyframe_requested`; the publisher consumes the pending request when it polls feedback and should make the next encoded video frame a keyframe.
 
+Publishers can set their current target bitrate and framerate. `PublisherFeedback` returns the relay's current bitrate/FPS target; if most subscribed viewers report degraded stats, the relay lowers the bitrate target before returning feedback so the publisher can adapt future encoded frames.
+
 ## Media plane
 
 Media packets travel over QUIC datagrams. Each datagram carries one packet with a versioned binary header and an opaque encoded payload.

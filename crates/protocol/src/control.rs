@@ -184,6 +184,7 @@ pub struct PublisherFeedback {
     pub room_id: RoomId,
     pub stream_id: StreamId,
     pub aggregate_available_bitrate_bps: u32,
+    pub target_frames_per_second: u16,
     pub degraded_viewer_count: u32,
     pub total_viewer_count: u32,
     pub keyframe_requested: bool,

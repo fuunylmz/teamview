@@ -66,6 +66,8 @@ pub struct PublishedStream {
     pub codec: CodecId,
     pub media_kind: MediaKind,
     pub config: Option<StreamConfig>,
+    pub target_bitrate_bps: u32,
+    pub target_frames_per_second: u16,
 }
 
 #[cfg(test)]
@@ -81,6 +83,8 @@ mod tests {
             codec: CodecId::H264,
             media_kind: MediaKind::Screen,
             config: None,
+            target_bitrate_bps: 4_000_000,
+            target_frames_per_second: 30,
         });
         room.publish_stream(PublishedStream {
             stream_id: 7,
@@ -88,6 +92,8 @@ mod tests {
             codec: CodecId::H264,
             media_kind: MediaKind::Screen,
             config: None,
+            target_bitrate_bps: 4_000_000,
+            target_frames_per_second: 30,
         });
 
         assert_eq!(room.published_streams.len(), 1);
@@ -104,6 +110,8 @@ mod tests {
             codec: CodecId::H264,
             media_kind: MediaKind::Screen,
             config: None,
+            target_bitrate_bps: 4_000_000,
+            target_frames_per_second: 30,
         });
         assert!(room.subscribe(9, 2));
     }
