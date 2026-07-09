@@ -661,14 +661,16 @@ async fn run_synthetic_screen_broadcaster_media(
     apply_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
     let stream_metrics = poll_stream_metrics(control, room_id, args.stream_id).await?;
     println!(
-        "stream-metrics stream_id={} ingress_packets={} ingress_bytes={} egress_queued={} egress_dropped={} subscribers={} last_ingress_time_micros={}",
+        "stream-metrics stream_id={} ingress_packets={} ingress_bytes={} egress_queued={} egress_dropped={} subscribers={} last_ingress_time_micros={} server_route_ms_p50={} server_route_ms_p95={}",
         stream_metrics.stream_id,
         stream_metrics.ingress_packets,
         stream_metrics.ingress_bytes,
         stream_metrics.egress_queued_packets,
         stream_metrics.egress_dropped_packets,
         stream_metrics.subscriber_count,
-        stream_metrics.last_ingress_time_micros
+        stream_metrics.last_ingress_time_micros,
+        stream_metrics.server_route_ms_p50,
+        stream_metrics.server_route_ms_p95
     );
     let timing = timing.timing_snapshot();
     println!(
@@ -775,14 +777,16 @@ async fn run_synthetic_voice_broadcaster_media(
     apply_audio_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
     let stream_metrics = poll_stream_metrics(control, room_id, args.stream_id).await?;
     println!(
-        "stream-metrics stream_id={} ingress_packets={} ingress_bytes={} egress_queued={} egress_dropped={} subscribers={} last_ingress_time_micros={}",
+        "stream-metrics stream_id={} ingress_packets={} ingress_bytes={} egress_queued={} egress_dropped={} subscribers={} last_ingress_time_micros={} server_route_ms_p50={} server_route_ms_p95={}",
         stream_metrics.stream_id,
         stream_metrics.ingress_packets,
         stream_metrics.ingress_bytes,
         stream_metrics.egress_queued_packets,
         stream_metrics.egress_dropped_packets,
         stream_metrics.subscriber_count,
-        stream_metrics.last_ingress_time_micros
+        stream_metrics.last_ingress_time_micros,
+        stream_metrics.server_route_ms_p50,
+        stream_metrics.server_route_ms_p95
     );
     let timing = timing.timing_snapshot();
     println!(

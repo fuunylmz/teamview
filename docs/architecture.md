@@ -39,3 +39,5 @@ The queue defaults to capacity 1. This is intentional: if capture outruns encode
 ## First milestones
 
 The first milestones use synthetic media datagrams, pre-encoded sample frames, live CPU screen frames with downsampled BGRA previews wrapped by the synthetic H.264-like encoder, and synthetic Opus-like voice frames. This proves the server routing model, per-viewer isolation, packetization, decoder-to-playback handoff, audio playback handoff, and low-latency queue policy before interactive Windows Graphics Capture GPU textures, microphone capture, hardware encoding, real Opus, and production window controls are added.
+
+Relay stream metrics include ingress/egress counters, drop counts, subscriber counts, last ingress time, and receive-to-route p50/p95 timing so publisher-side logs can separate server routing cost from broadcaster and viewer pipeline cost.

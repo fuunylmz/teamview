@@ -174,7 +174,7 @@ Expected behavior:
 - The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.
 - New subscribers, packet loss, and decoder recovery can register keyframe requests with the relay.
 - The broadcaster polls aggregated `PublisherFeedback`; when feedback requests a keyframe, the synthetic encoder marks the next frame as a keyframe.
-- The broadcaster polls relay `StreamMetrics` at the end of the run to report server-observed ingress, queued egress, and dropped egress datagrams.
+- The broadcaster polls relay `StreamMetrics` at the end of the run to report server-observed ingress, queued/dropped egress datagrams, and server route p50/p95 timing.
 - When most viewers are degraded by packet loss, dropped frames, excessive jitter/latency, slow decode/render p95, or low render FPS, relay feedback lowers the synthetic target bitrate, and the broadcaster shrinks subsequent synthetic frame payloads.
 - The viewer unsubscribes and leaves on normal exit; when the last participant leaves, the relay removes the empty room from subsequent discovery.
 - The final viewer summary reports zero loss and drops on a healthy local run.
@@ -194,11 +194,11 @@ Expected behavior:
 
 - The broadcaster publishes an Opus voice stream config and prints `audio-send` lines with capture/encode/packetize/send timing.
 - The viewer prints `audio-recv` and `audio-play` lines for each decoded frame, including decode/play timing and playback FPS.
-- The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams with zero drops.
+- The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams with zero drops and server route timing percentiles.
 - The final viewer summary reports `kind=voice`, matching decoded and played frame counts, and zero loss on a healthy local run.
 
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, live primary-monitor acquisition, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, synthetic capture-to-viewer latency, broadcaster capture/encode/packetize/send timing, viewer decode/render timing, and render/playback FPS. Later milestones add hardware encode, calibrated server receive/send, viewer receive, decode, and render timestamps.
+Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, live primary-monitor acquisition, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, synthetic capture-to-viewer latency, broadcaster capture/encode/packetize/send timing, server receive-to-route timing, viewer decode/render timing, and render/playback FPS. Later milestones add hardware encode, calibrated server send, viewer receive, decode, and render timestamps.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.

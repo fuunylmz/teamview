@@ -18,7 +18,10 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::ServerConfig, control::ControlState, media::MediaRelay, metrics::unix_time_micros,
+    config::ServerConfig,
+    control::ControlState,
+    media::MediaRelay,
+    metrics::{micros_delta_to_millis, unix_time_micros},
     session::Session,
 };
 
@@ -99,7 +102,10 @@ impl ControlRuntime {
                 }
                 datagram = connection.read_datagram() => {
                     match datagram {
-                        Ok(bytes) => self.handle_media_datagram(session.clone(), &bytes).await,
+                        Ok(bytes) => {
+                            let received_at_micros = unix_time_micros();
+                            self.handle_media_datagram(session.clone(), &bytes, received_at_micros).await;
+                        }
                         Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                         Err(quinn::ConnectionError::LocallyClosed) => break,
                         Err(quinn::ConnectionError::TimedOut) => break,
@@ -156,7 +162,12 @@ impl ControlRuntime {
         Ok(())
     }
 
-    async fn handle_media_datagram(&self, session: Arc<Mutex<Session>>, bytes: &[u8]) {
+    async fn handle_media_datagram(
+        &self,
+        session: Arc<Mutex<Session>>,
+        bytes: &[u8],
+        received_at_micros: u64,
+    ) {
         let session = session.lock().await;
         let Some(user_id) = session.user_id else {
             debug!(
@@ -184,7 +195,14 @@ impl ControlRuntime {
         let mut state = self.state.lock().await;
         let media = self.media.lock().await;
         let summary = media.forward_media_packet(&state, user_id, &packet);
-        state.record_media_forward_summary(&packet, summary, bytes.len(), unix_time_micros());
+        let server_route_ms = micros_delta_to_millis(received_at_micros, unix_time_micros());
+        state.record_media_forward_summary(
+            &packet,
+            summary,
+            bytes.len(),
+            received_at_micros,
+            server_route_ms,
+        );
         debug!(
             session_id,
             user_id,
@@ -638,6 +656,7 @@ mod tests {
                 assert_eq!(metrics.subscriber_count, 1);
                 assert!(metrics.ingress_bytes > 0);
                 assert!(metrics.last_ingress_time_micros > 0);
+                assert!(metrics.server_route_ms_p95 >= metrics.server_route_ms_p50);
             }
             other => panic!("unexpected metrics response: {other:?}"),
         }

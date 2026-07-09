@@ -16,7 +16,10 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-use crate::{control::ControlState, metrics::unix_time_micros};
+use crate::{
+    control::ControlState,
+    metrics::{micros_delta_to_millis, unix_time_micros},
+};
 
 const DEFAULT_EGRESS_QUEUE_CAPACITY: usize = 256;
 
@@ -198,6 +201,7 @@ pub async fn serve_media_datagrams(
             | Err(quinn::ConnectionError::TimedOut) => break,
             Err(error) => return Err(error).context("failed to read media datagram"),
         };
+        let received_at_micros = unix_time_micros();
         let packet = match MediaPacket::decode(&bytes) {
             Ok(packet) => packet,
             Err(error) => {
@@ -208,7 +212,14 @@ pub async fn serve_media_datagrams(
         let mut state = state.lock().await;
         let media = media.lock().await;
         let summary = media.forward_media_packet(&state, user_id, &packet);
-        state.record_media_forward_summary(&packet, summary, bytes.len(), unix_time_micros());
+        let server_route_ms = micros_delta_to_millis(received_at_micros, unix_time_micros());
+        state.record_media_forward_summary(
+            &packet,
+            summary,
+            bytes.len(),
+            received_at_micros,
+            server_route_ms,
+        );
         debug!(
             user_id,
             stream_id = summary.stream_id,

@@ -420,6 +420,7 @@ impl ControlState {
         summary: MediaForwardSummary,
         ingress_bytes: usize,
         received_at_micros: u64,
+        server_route_ms: u16,
     ) {
         let stream_id = packet.header.room_stream_id;
         if self.published_stream(stream_id).is_none() {
@@ -433,6 +434,7 @@ impl ControlState {
                 summary.queued,
                 summary.dropped,
                 received_at_micros,
+                server_route_ms,
             );
     }
 
@@ -1252,6 +1254,7 @@ mod tests {
             },
             ingress_bytes,
             1_700_000,
+            4,
         );
 
         let response = state.handle_client_envelope(
@@ -1275,6 +1278,8 @@ mod tests {
                 assert_eq!(metrics.egress_dropped_packets, 1);
                 assert_eq!(metrics.subscriber_count, 1);
                 assert_eq!(metrics.last_ingress_time_micros, 1_700_000);
+                assert_eq!(metrics.server_route_ms_p50, 4);
+                assert_eq!(metrics.server_route_ms_p95, 4);
             }
             other => panic!("unexpected stream metrics response: {other:?}"),
         }

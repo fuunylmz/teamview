@@ -253,6 +253,8 @@ pub struct StreamMetricsSnapshot {
     pub egress_dropped_packets: u64,
     pub subscriber_count: u32,
     pub last_ingress_time_micros: u64,
+    pub server_route_ms_p50: u16,
+    pub server_route_ms_p95: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -518,6 +520,8 @@ mod tests {
                 egress_dropped_packets: 1,
                 subscriber_count: 2,
                 last_ingress_time_micros: 1_700_000,
+                server_route_ms_p50: 2,
+                server_route_ms_p95: 3,
             }),
         );
 
