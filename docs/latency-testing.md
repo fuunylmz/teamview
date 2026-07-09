@@ -120,6 +120,7 @@ Expected behavior:
 - The broadcaster prints five `media-send` lines at 5 fps for a 1000 ms run.
 - The broadcaster publishes `StreamConfig`, and the viewer polls it before media receive.
 - The viewer receives and decodes five frames split across ten packets with `--max-datagram-payload 700`.
+- The viewer reassembly buffer drops stale incomplete frames after `--reassembly-window-frames` to avoid accumulating latency.
 - The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.
 - The broadcaster polls aggregated `PublisherFeedback`; when feedback requests a keyframe, the synthetic encoder marks the next frame as a keyframe.
 - The final viewer summary reports zero loss and drops on a healthy local run.

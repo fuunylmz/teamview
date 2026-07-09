@@ -94,6 +94,9 @@ struct Args {
     #[arg(long, default_value_t = 5_000)]
     media_idle_timeout_ms: u64,
 
+    #[arg(long, default_value_t = 6)]
+    reassembly_window_frames: u32,
+
     #[arg(long, default_value_t = 30)]
     stats_interval_frames: u32,
 
@@ -365,7 +368,9 @@ async fn run_synthetic_viewer_media(
     args: &Args,
 ) -> anyhow::Result<()> {
     let target_frames = args.synthetic_media_frames()?;
-    let mut buffer = FrameReassemblyBuffer::new();
+    let frame_interval = args.media_frame_interval()?;
+    let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
+    let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
     let mut decoder = H264Decoder;
     let mut playback = NullPlayback;
     let mut stats = ClientMediaStats::default();
@@ -391,7 +396,12 @@ async fn run_synthetic_viewer_media(
         };
         stats.record_packet(&packet);
         received_packets += 1;
-        if let Some(frame) = buffer.push(packet)? {
+        let outcome = buffer.push_with_stats(packet)?;
+        if outcome.dropped_frames > 0 {
+            stats.record_dropped_frames(outcome.dropped_frames);
+        }
+        stats.jitter_buffer_ms = buffer.estimated_jitter_ms(frame_interval_ms.max(1));
+        if let Some(frame) = outcome.frame {
             println!(
                 "media-recv frame_id={} bytes={} keyframe={}",
                 frame.frame_id,

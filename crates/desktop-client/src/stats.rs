@@ -50,6 +50,10 @@ impl ClientMediaStats {
         self.dropped_frames = self.dropped_frames.saturating_add(1);
     }
 
+    pub fn record_dropped_frames(&mut self, dropped_frames: u64) {
+        self.dropped_frames = self.dropped_frames.saturating_add(dropped_frames);
+    }
+
     pub fn to_viewer_report(self, room_id: RoomId, stream_id: StreamId) -> ViewerStatsReport {
         ViewerStatsReport {
             room_id,

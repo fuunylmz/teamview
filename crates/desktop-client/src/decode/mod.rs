@@ -19,46 +19,112 @@ pub trait VideoDecoder {
 }
 
 const MAX_PENDING_FRAMES: usize = 64;
+const MAX_FRAME_AGE_FRAMES: u32 = 64;
 
 #[derive(Debug, Default)]
 pub struct FrameReassemblyBuffer {
-    pending: BTreeMap<u32, Vec<MediaPacket>>,
+    pending: BTreeMap<u32, PendingFrame>,
+    max_pending_frames: usize,
+    max_frame_age_frames: u32,
 }
 
 impl FrameReassemblyBuffer {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limits(MAX_PENDING_FRAMES, MAX_FRAME_AGE_FRAMES)
+    }
+
+    pub fn with_limits(max_pending_frames: usize, max_frame_age_frames: u32) -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            max_pending_frames: max_pending_frames.max(1),
+            max_frame_age_frames: max_frame_age_frames.max(1),
+        }
     }
 
     pub fn push(&mut self, packet: MediaPacket) -> anyhow::Result<Option<EncodedFrame>> {
+        self.push_with_stats(packet).map(|outcome| outcome.frame)
+    }
+
+    pub fn push_with_stats(&mut self, packet: MediaPacket) -> anyhow::Result<ReassemblyOutcome> {
         let frame_id = packet.header.frame_id;
         let fragment_count = packet.header.fragment_count as usize;
         let fragment_index = packet.header.fragment_index;
-        if !self.pending.contains_key(&frame_id)
-            && self.pending.len() >= MAX_PENDING_FRAMES
-            && let Some(oldest_frame_id) = self.pending.keys().next().copied()
+        let mut dropped_frames = self.evict_stale_frames(frame_id);
+        while !self.pending.contains_key(&frame_id) && self.pending.len() >= self.max_pending_frames
         {
+            let Some(oldest_frame_id) = self.pending.keys().next().copied() else {
+                break;
+            };
             self.pending.remove(&oldest_frame_id);
+            dropped_frames += 1;
         }
-        let packets = self.pending.entry(frame_id).or_default();
-        if packets
+        let pending = self.pending.entry(frame_id).or_default();
+        if pending
+            .packets
             .iter()
             .any(|pending| pending.header.fragment_index == fragment_index)
         {
             anyhow::bail!("duplicate media fragment {fragment_index} for frame {frame_id}");
         }
-        packets.push(packet);
-        if packets.len() != fragment_count {
-            return Ok(None);
+        pending.packets.push(packet);
+        if pending.packets.len() != fragment_count {
+            return Ok(ReassemblyOutcome {
+                frame: None,
+                dropped_frames,
+            });
         }
 
-        let packets = self.pending.remove(&frame_id).unwrap();
-        reassemble_frame(packets).map(Some).map_err(Into::into)
+        let packets = self.pending.remove(&frame_id).unwrap().packets;
+        let frame = reassemble_frame(packets).map_err(anyhow::Error::from)?;
+        Ok(ReassemblyOutcome {
+            frame: Some(frame),
+            dropped_frames,
+        })
     }
 
     pub fn pending_frames(&self) -> usize {
         self.pending.len()
     }
+
+    pub fn estimated_jitter_ms(&self, frame_interval_ms: u16) -> u16 {
+        (self.pending.len() as u16).saturating_mul(frame_interval_ms)
+    }
+
+    fn evict_stale_frames(&mut self, newest_frame_id: u32) -> u64 {
+        let stale_frame_ids = self
+            .pending
+            .keys()
+            .copied()
+            .filter(|frame_id| {
+                frame_is_older_than_window(*frame_id, newest_frame_id, self.max_frame_age_frames)
+            })
+            .collect::<Vec<_>>();
+        let dropped_frames = stale_frame_ids.len() as u64;
+        for frame_id in stale_frame_ids {
+            self.pending.remove(&frame_id);
+        }
+        dropped_frames
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct PendingFrame {
+    packets: Vec<MediaPacket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReassemblyOutcome {
+    pub frame: Option<EncodedFrame>,
+    pub dropped_frames: u64,
+}
+
+fn frame_is_older_than_window(
+    frame_id: u32,
+    newest_frame_id: u32,
+    max_frame_age_frames: u32,
+) -> bool {
+    let distance = newest_frame_id.wrapping_sub(frame_id);
+    distance > max_frame_age_frames && distance < u32::MAX / 2
 }
 
 #[cfg(test)]
@@ -120,6 +186,55 @@ mod tests {
         }
 
         assert_eq!(buffer.pending_frames(), MAX_PENDING_FRAMES);
+    }
+
+    #[test]
+    fn reassembly_buffer_reports_capacity_drops() {
+        let mut buffer = FrameReassemblyBuffer::with_limits(1, 64);
+        let mut first_packets = packetize_frame(&sample_frame_with_id(1), 1, 8).unwrap();
+        first_packets.pop();
+        assert_eq!(
+            buffer.push_with_stats(first_packets.remove(0)).unwrap(),
+            ReassemblyOutcome {
+                frame: None,
+                dropped_frames: 0,
+            }
+        );
+
+        let mut second_packets = packetize_frame(&sample_frame_with_id(2), 10, 8).unwrap();
+        second_packets.pop();
+        assert_eq!(
+            buffer.push_with_stats(second_packets.remove(0)).unwrap(),
+            ReassemblyOutcome {
+                frame: None,
+                dropped_frames: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn reassembly_buffer_drops_stale_incomplete_frames() {
+        let mut buffer = FrameReassemblyBuffer::with_limits(64, 2);
+        let mut old_packets = packetize_frame(&sample_frame_with_id(1), 1, 8).unwrap();
+        old_packets.pop();
+        buffer.push_with_stats(old_packets.remove(0)).unwrap();
+
+        let mut new_packets = packetize_frame(&sample_frame_with_id(4), 20, 8).unwrap();
+        new_packets.pop();
+        let outcome = buffer.push_with_stats(new_packets.remove(0)).unwrap();
+
+        assert_eq!(outcome.dropped_frames, 1);
+        assert_eq!(buffer.pending_frames(), 1);
+    }
+
+    #[test]
+    fn jitter_estimate_scales_with_pending_frames() {
+        let mut buffer = FrameReassemblyBuffer::new();
+        let mut packets = packetize_frame(&sample_frame_with_id(1), 1, 8).unwrap();
+        packets.pop();
+        buffer.push(packets.remove(0)).unwrap();
+
+        assert_eq!(buffer.estimated_jitter_ms(33), 33);
     }
 
     fn sample_frame() -> EncodedFrame {
