@@ -200,14 +200,14 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     print_control_response("hello", &response);
     ensure_not_error("hello", &response)?;
-    sync_control_clock(&mut control).await?;
+    let clock_sync = sync_control_clock(&mut control).await?;
     if let Some(access_token) = &args.access_token {
         authenticate_control(&mut control, access_token).await?;
     }
 
     match args.mode {
-        Mode::Broadcaster => run_broadcaster_control_flow(&mut control, &args).await?,
-        Mode::Viewer => run_viewer_control_flow(&mut control, &args).await?,
+        Mode::Broadcaster => run_broadcaster_control_flow(&mut control, &args, clock_sync).await?,
+        Mode::Viewer => run_viewer_control_flow(&mut control, &args, clock_sync).await?,
     }
 
     Ok(())
@@ -293,6 +293,7 @@ async fn authenticate_control(
 async fn run_broadcaster_control_flow(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     let room_id = match args.room_id {
         Some(room_id) => room_id,
@@ -345,7 +346,7 @@ async fn run_broadcaster_control_flow(
     );
     if args.synthetic_media_enabled() {
         set_publisher_target_media(control, room_id, args).await?;
-        run_synthetic_broadcaster_media(control, args, room_id).await?;
+        run_synthetic_broadcaster_media(control, args, room_id, clock_sync).await?;
     }
     leave_room(control, room_id).await?;
     Ok(())
@@ -354,6 +355,7 @@ async fn run_broadcaster_control_flow(
 async fn run_viewer_control_flow(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     let room_id = resolve_viewer_room_id(control, args).await?;
 
@@ -391,7 +393,7 @@ async fn run_viewer_control_flow(
         room_id, stream_id
     );
     if args.synthetic_media_enabled() {
-        run_synthetic_viewer_media(control, args, room_id, stream_id).await?;
+        run_synthetic_viewer_media(control, args, room_id, stream_id, clock_sync).await?;
     }
     unsubscribe_stream(control, room_id, stream_id).await?;
     leave_room(control, room_id).await?;
@@ -621,12 +623,15 @@ async fn run_synthetic_broadcaster_media(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
     room_id: RoomId,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     match args.media_kind {
         MediaKindArg::Screen => {
-            run_synthetic_screen_broadcaster_media(control, args, room_id).await
+            run_synthetic_screen_broadcaster_media(control, args, room_id, clock_sync).await
         }
-        MediaKindArg::Voice => run_synthetic_voice_broadcaster_media(control, args, room_id).await,
+        MediaKindArg::Voice => {
+            run_synthetic_voice_broadcaster_media(control, args, room_id, clock_sync).await
+        }
     }
 }
 
@@ -634,6 +639,7 @@ async fn run_synthetic_screen_broadcaster_media(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
     room_id: RoomId,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     if args.media_start_delay_ms > 0 {
         sleep_with_keepalive(control, Duration::from_millis(args.media_start_delay_ms)).await?;
@@ -670,6 +676,7 @@ async fn run_synthetic_screen_broadcaster_media(
             timing.record_encode_duration(encode_start.elapsed());
             continue;
         };
+        frame.sender_clock_offset_micros = clock_sync.clock_offset_micros;
         frame.sender_encode_done_time_micros = unix_time_micros();
         let encode_duration = encode_start.elapsed();
         timing.record_encode_duration(encode_duration);
@@ -776,6 +783,7 @@ async fn run_synthetic_voice_broadcaster_media(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
     room_id: RoomId,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     if args.media_start_delay_ms > 0 {
         sleep_with_keepalive(control, Duration::from_millis(args.media_start_delay_ms)).await?;
@@ -801,6 +809,7 @@ async fn run_synthetic_voice_broadcaster_media(
         timing.record_capture_duration(capture_duration);
         let encode_start = Instant::now();
         let mut frame = encoder.encode(frame_id, capture_time_micros, args.stream_id)?;
+        frame.sender_clock_offset_micros = clock_sync.clock_offset_micros;
         frame.sender_encode_done_time_micros = unix_time_micros();
         let encode_duration = encode_start.elapsed();
         timing.record_encode_duration(encode_duration);
@@ -1038,13 +1047,14 @@ async fn run_synthetic_viewer_media(
     args: &Args,
     room_id: RoomId,
     stream_id: StreamId,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     match args.media_kind {
         MediaKindArg::Screen => {
-            run_synthetic_screen_viewer_media(control, args, room_id, stream_id).await
+            run_synthetic_screen_viewer_media(control, args, room_id, stream_id, clock_sync).await
         }
         MediaKindArg::Voice => {
-            run_synthetic_voice_viewer_media(control, args, room_id, stream_id).await
+            run_synthetic_voice_viewer_media(control, args, room_id, stream_id, clock_sync).await
         }
     }
 }
@@ -1054,6 +1064,7 @@ async fn run_synthetic_screen_viewer_media(
     args: &Args,
     room_id: RoomId,
     stream_id: StreamId,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     let target_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
@@ -1102,6 +1113,12 @@ async fn run_synthetic_screen_viewer_media(
                 frame.sender_capture_time_micros,
                 packet_receive_time_micros,
             );
+            stats.record_calibrated_latency(
+                frame.sender_capture_time_micros,
+                frame.sender_clock_offset_micros,
+                packet_receive_time_micros,
+                clock_sync.clock_offset_micros,
+            );
             stats.record_sender_timestamps(
                 frame.sender_capture_time_micros,
                 frame.sender_encode_done_time_micros,
@@ -1112,11 +1129,12 @@ async fn run_synthetic_screen_viewer_media(
                 frame.server_send_time_micros,
             );
             println!(
-                "media-recv frame_id={} bytes={} keyframe={} latency_ms={} sender_encode_ms={} sender_send_ms={} server_queue_ms={} reassembly_ms={}",
+                "media-recv frame_id={} bytes={} keyframe={} latency_ms={} calibrated_latency_ms={} sender_encode_ms={} sender_send_ms={} server_queue_ms={} reassembly_ms={}",
                 frame.frame_id,
                 frame.bytes.len(),
                 frame.is_keyframe,
                 stats.estimated_latency_ms,
+                stats.calibrated_latency_ms,
                 stats.sender_encode_ms,
                 stats.sender_send_ms,
                 stats.server_queue_ms,
@@ -1169,7 +1187,7 @@ async fn run_synthetic_screen_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={} sender_encode_ms_p50={} sender_encode_ms_p95={} sender_send_ms_p50={} sender_send_ms_p95={} server_queue_ms_p50={} server_queue_ms_p95={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} render_ms_p50={} render_ms_p95={} render_fps={}",
+        "media-summary role=viewer frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={} calibrated_latency_ms={} sender_encode_ms_p50={} sender_encode_ms_p95={} sender_send_ms_p50={} sender_send_ms_p95={} server_queue_ms_p50={} server_queue_ms_p95={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} render_ms_p50={} render_ms_p95={} render_fps={}",
         reassembled_frames,
         decoded_frames,
         playback.rendered_frames(),
@@ -1177,6 +1195,7 @@ async fn run_synthetic_screen_viewer_media(
         stats.lost_packets,
         stats.dropped_frames,
         stats.estimated_latency_ms,
+        stats.calibrated_latency_ms,
         stats.sender_encode_ms_p50(),
         stats.sender_encode_ms_p95(),
         stats.sender_send_ms_p50(),
@@ -1199,6 +1218,7 @@ async fn run_synthetic_voice_viewer_media(
     args: &Args,
     room_id: RoomId,
     stream_id: StreamId,
+    clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
     let target_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
@@ -1240,6 +1260,12 @@ async fn run_synthetic_voice_viewer_media(
                 frame.sender_capture_time_micros,
                 packet_receive_time_micros,
             );
+            stats.record_calibrated_latency(
+                frame.sender_capture_time_micros,
+                frame.sender_clock_offset_micros,
+                packet_receive_time_micros,
+                clock_sync.clock_offset_micros,
+            );
             stats.record_sender_timestamps(
                 frame.sender_capture_time_micros,
                 frame.sender_encode_done_time_micros,
@@ -1250,10 +1276,11 @@ async fn run_synthetic_voice_viewer_media(
                 frame.server_send_time_micros,
             );
             println!(
-                "audio-recv frame_id={} bytes={} latency_ms={} sender_encode_ms={} sender_send_ms={} server_queue_ms={} reassembly_ms={}",
+                "audio-recv frame_id={} bytes={} latency_ms={} calibrated_latency_ms={} sender_encode_ms={} sender_send_ms={} server_queue_ms={} reassembly_ms={}",
                 frame.frame_id,
                 frame.bytes.len(),
                 stats.estimated_latency_ms,
+                stats.calibrated_latency_ms,
                 stats.sender_encode_ms,
                 stats.sender_send_ms,
                 stats.server_queue_ms,
@@ -1297,7 +1324,7 @@ async fn run_synthetic_voice_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer kind=voice frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={} sender_encode_ms_p50={} sender_encode_ms_p95={} sender_send_ms_p50={} sender_send_ms_p95={} server_queue_ms_p50={} server_queue_ms_p95={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} play_ms_p50={} play_ms_p95={} play_fps={}",
+        "media-summary role=viewer kind=voice frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={} calibrated_latency_ms={} sender_encode_ms_p50={} sender_encode_ms_p95={} sender_send_ms_p50={} sender_send_ms_p95={} server_queue_ms_p50={} server_queue_ms_p95={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} play_ms_p50={} play_ms_p95={} play_fps={}",
         reassembled_frames,
         decoded_frames,
         playback.played_frames(),
@@ -1305,6 +1332,7 @@ async fn run_synthetic_voice_viewer_media(
         stats.lost_packets,
         stats.dropped_frames,
         stats.estimated_latency_ms,
+        stats.calibrated_latency_ms,
         stats.sender_encode_ms_p50(),
         stats.sender_encode_ms_p95(),
         stats.sender_send_ms_p50(),

@@ -80,6 +80,7 @@ pub struct ClientMediaStats {
     pub dropped_frames: u64,
     pub jitter_buffer_ms: u16,
     pub estimated_latency_ms: u16,
+    pub calibrated_latency_ms: u16,
     pub sender_encode_ms: u16,
     pub sender_send_ms: u16,
     pub server_queue_ms: u16,
@@ -151,6 +152,29 @@ impl ClientMediaStats {
             .saturating_div(1_000)
             .min(u16::MAX as u64) as u16;
         self.estimated_latency_ms = latency_ms;
+    }
+
+    pub fn record_calibrated_latency(
+        &mut self,
+        sender_capture_time_micros: u64,
+        sender_clock_offset_micros: i64,
+        receive_time_micros: u64,
+        receiver_clock_offset_micros: i64,
+    ) {
+        if sender_capture_time_micros == 0 {
+            return;
+        }
+        let sender_capture_relay_micros =
+            sender_capture_time_micros as i128 + sender_clock_offset_micros as i128;
+        let receiver_receive_relay_micros =
+            receive_time_micros as i128 + receiver_clock_offset_micros as i128;
+        if receiver_receive_relay_micros < sender_capture_relay_micros {
+            return;
+        }
+        let latency_ms = (receiver_receive_relay_micros - sender_capture_relay_micros)
+            .saturating_div(1_000)
+            .min(u16::MAX as i128) as u16;
+        self.calibrated_latency_ms = latency_ms;
     }
 
     pub fn record_sender_timestamps(
@@ -226,6 +250,7 @@ impl ClientMediaStats {
             dropped_frames: self.dropped_frames,
             jitter_buffer_ms: self.jitter_buffer_ms,
             estimated_latency_ms: self.estimated_latency_ms,
+            calibrated_latency_ms: self.calibrated_latency_ms,
             reassembly_ms_p50: self.reassembly_samples_ms.percentile(50),
             reassembly_ms_p95: self.reassembly_samples_ms.percentile(95),
             decode_ms_p50: self.decode_samples_ms.percentile(50),
@@ -337,6 +362,7 @@ mod tests {
         stats.record_dropped_frame();
         stats.jitter_buffer_ms = 42;
         stats.estimated_latency_ms = 88;
+        stats.calibrated_latency_ms = 84;
         stats.record_sender_timestamps(900_000, 903_000, 905_000);
         stats.record_server_queue_latency(1_000_000, 1_005_000);
 
@@ -356,6 +382,7 @@ mod tests {
         assert_eq!(report.dropped_frames, 1);
         assert_eq!(report.jitter_buffer_ms, 42);
         assert_eq!(report.estimated_latency_ms, 88);
+        assert_eq!(report.calibrated_latency_ms, 84);
         assert_eq!(stats.sender_encode_ms, 3);
         assert_eq!(stats.sender_send_ms, 5);
         assert_eq!(stats.sender_encode_ms_p50(), 3);
@@ -374,6 +401,28 @@ mod tests {
         stats.record_estimated_latency(1_000_000, 1_123_456);
 
         assert_eq!(stats.estimated_latency_ms, 123);
+    }
+
+    #[test]
+    fn media_stats_estimates_latency_with_clock_offsets() {
+        let mut stats = ClientMediaStats::default();
+
+        stats.record_calibrated_latency(1_000_000, 500, 1_123_456, -456);
+
+        assert_eq!(stats.calibrated_latency_ms, 122);
+    }
+
+    #[test]
+    fn media_stats_ignores_missing_or_reversed_calibrated_latency() {
+        let mut stats = ClientMediaStats {
+            calibrated_latency_ms: 77,
+            ..Default::default()
+        };
+
+        stats.record_calibrated_latency(0, 500, 1_123_456, -456);
+        stats.record_calibrated_latency(2_000_000, 0, 1_123_456, 0);
+
+        assert_eq!(stats.calibrated_latency_ms, 77);
     }
 
     #[test]

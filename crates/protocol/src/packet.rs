@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PROTOCOL_VERSION, codec::CodecId};
 
-pub const MEDIA_PACKET_HEADER_LEN: usize = 73;
+pub const MEDIA_PACKET_HEADER_LEN: usize = 81;
 pub const DEFAULT_DATAGRAM_PAYLOAD_TARGET: usize = 1_150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +76,7 @@ pub struct MediaPacketHeader {
     pub fragment_count: u16,
     pub media_timestamp: u64,
     pub sender_capture_time_micros: u64,
+    pub sender_clock_offset_micros: i64,
     pub sender_encode_done_time_micros: u64,
     pub sender_send_time_micros: u64,
     pub server_receive_time_micros: u64,
@@ -104,6 +105,7 @@ impl MediaPacketHeader {
             fragment_count: 1,
             media_timestamp: 0,
             sender_capture_time_micros: 0,
+            sender_clock_offset_micros: 0,
             sender_encode_done_time_micros: 0,
             sender_send_time_micros: 0,
             server_receive_time_micros: 0,
@@ -126,6 +128,7 @@ impl MediaPacketHeader {
         dst.put_u16(self.fragment_count);
         dst.put_u64(self.media_timestamp);
         dst.put_u64(self.sender_capture_time_micros);
+        dst.put_i64(self.sender_clock_offset_micros);
         dst.put_u64(self.sender_encode_done_time_micros);
         dst.put_u64(self.sender_send_time_micros);
         dst.put_u64(self.server_receive_time_micros);
@@ -169,6 +172,7 @@ impl MediaPacketHeader {
         let fragment_count = buf.get_u16();
         let media_timestamp = buf.get_u64();
         let sender_capture_time_micros = buf.get_u64();
+        let sender_clock_offset_micros = buf.get_i64();
         let sender_encode_done_time_micros = buf.get_u64();
         let sender_send_time_micros = buf.get_u64();
         let server_receive_time_micros = buf.get_u64();
@@ -189,6 +193,7 @@ impl MediaPacketHeader {
             fragment_count,
             media_timestamp,
             sender_capture_time_micros,
+            sender_clock_offset_micros,
             sender_encode_done_time_micros,
             sender_send_time_micros,
             server_receive_time_micros,
@@ -346,6 +351,7 @@ mod tests {
             fragment_count: 2,
             media_timestamp: 123_456,
             sender_capture_time_micros: 654_321,
+            sender_clock_offset_micros: -123,
             sender_encode_done_time_micros: 655_000,
             sender_send_time_micros: 656_000,
             server_receive_time_micros: 777_000,

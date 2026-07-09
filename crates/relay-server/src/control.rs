@@ -857,11 +857,19 @@ fn viewer_is_degraded(report: &ViewerStatsReport) -> bool {
     report.lost_packets > 0
         || report.dropped_frames > 0
         || report.jitter_buffer_ms > 120
-        || report.estimated_latency_ms > 200
+        || viewer_latency_ms(report) > 200
         || report.reassembly_ms_p95 > 80
         || report.decode_ms_p95 > 40
         || report.render_ms_p95 > 40
         || (report.render_fps > 0 && report.render_fps < 15)
+}
+
+fn viewer_latency_ms(report: &ViewerStatsReport) -> u16 {
+    if report.calibrated_latency_ms > 0 {
+        report.calibrated_latency_ms
+    } else {
+        report.estimated_latency_ms
+    }
 }
 
 #[cfg(test)]
@@ -1443,6 +1451,24 @@ mod tests {
         let mut report = viewer_stats_report(1, 9);
         report.render_fps = 30;
         assert!(!viewer_is_degraded(&report));
+    }
+
+    #[test]
+    fn calibrated_latency_is_used_for_viewer_degradation() {
+        let mut report = viewer_stats_report(1, 9);
+        report.estimated_latency_ms = 0;
+        report.calibrated_latency_ms = 220;
+        assert!(viewer_is_degraded(&report));
+
+        let mut report = viewer_stats_report(1, 9);
+        report.estimated_latency_ms = 220;
+        report.calibrated_latency_ms = 90;
+        assert!(!viewer_is_degraded(&report));
+
+        let mut report = viewer_stats_report(1, 9);
+        report.estimated_latency_ms = 220;
+        report.calibrated_latency_ms = 0;
+        assert!(viewer_is_degraded(&report));
     }
 
     #[test]
@@ -2141,6 +2167,7 @@ mod tests {
             dropped_frames: 0,
             jitter_buffer_ms: 0,
             estimated_latency_ms: 0,
+            calibrated_latency_ms: 0,
             reassembly_ms_p50: 0,
             reassembly_ms_p95: 0,
             decode_ms_p50: 0,

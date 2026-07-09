@@ -83,6 +83,7 @@ impl VideoEncoder for H264Encoder {
             frame_id: frame.frame_id as u32,
             media_timestamp: frame.frame_id.saturating_mul(3_000),
             sender_capture_time_micros: frame.capture_time_micros,
+            sender_clock_offset_micros: 0,
             sender_encode_done_time_micros: 0,
             sender_send_time_micros: 0,
             server_receive_time_micros: 0,

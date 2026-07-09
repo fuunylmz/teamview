@@ -87,6 +87,7 @@ The packet header is defined in `crates/protocol/src/packet.rs` and includes:
 - fragment index/count
 - media timestamp
 - sender capture timestamp
+- sender relay-clock offset estimate
 - sender encode-done timestamp
 - sender send timestamp
 - relay receive timestamp
@@ -107,6 +108,7 @@ Stage 3 adds reusable encoded-frame helpers in `crates/protocol/src/frame.rs`.
 - `frame_id`
 - `media_timestamp`
 - `sender_capture_time_micros`
+- `sender_clock_offset_micros`
 - `sender_encode_done_time_micros`
 - `sender_send_time_micros`
 - `server_receive_time_micros`
@@ -115,7 +117,7 @@ Stage 3 adds reusable encoded-frame helpers in `crates/protocol/src/frame.rs`.
 - `is_keyframe`
 - opaque encoded bytes
 
-The desktop synthetic broadcaster writes `sender_capture_time_micros` as Unix epoch microseconds, stamps `sender_encode_done_time_micros` after encoding, and stamps `sender_send_time_micros` immediately before each QUIC datagram send. The relay stamps forwarded datagrams with `server_receive_time_micros` when it accepts an ingress datagram and `server_send_time_micros` immediately before it calls QUIC `send_datagram` for a viewer. Viewers compare sender capture/encode/send timestamps to log publisher-side media timing, compare relay receive/send timestamps to log server queue delay, and compare sender capture time with local receive time to populate `ViewerStats.estimated_latency_ms`; production cross-machine latency should apply clock offset calibration before capture-to-viewer values are treated as calibrated glass-to-glass latency.
+The desktop synthetic broadcaster writes `sender_capture_time_micros` as Unix epoch microseconds, copies its `TimeSync` relay-clock offset estimate into `sender_clock_offset_micros`, stamps `sender_encode_done_time_micros` after encoding, and stamps `sender_send_time_micros` immediately before each QUIC datagram send. The relay stamps forwarded datagrams with `server_receive_time_micros` when it accepts an ingress datagram and `server_send_time_micros` immediately before it calls QUIC `send_datagram` for a viewer. Viewers compare sender capture/encode/send timestamps to log publisher-side media timing, compare relay receive/send timestamps to log server queue delay, compare sender capture time with local receive time to populate `ViewerStats.estimated_latency_ms`, and combine sender/viewer relay-clock offsets to populate `ViewerStats.calibrated_latency_ms`. Later stages should take multiple `TimeSync` samples and use the lowest-RTT sample or a filtered estimator before treating capture-to-viewer values as production-grade glass-to-glass latency.
 
 `packetize_frame` splits a video frame into `MediaPacket` fragments. `packetize_frame_with_type` uses the same fragmentation rules for other media packet types such as audio:
 

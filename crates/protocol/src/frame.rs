@@ -11,6 +11,7 @@ pub struct EncodedFrame {
     pub frame_id: u32,
     pub media_timestamp: u64,
     pub sender_capture_time_micros: u64,
+    pub sender_clock_offset_micros: i64,
     pub sender_encode_done_time_micros: u64,
     pub sender_send_time_micros: u64,
     pub server_receive_time_micros: u64,
@@ -90,6 +91,7 @@ pub fn packetize_frame_with_type(
         header.fragment_count = fragment_count as u16;
         header.media_timestamp = frame.media_timestamp;
         header.sender_capture_time_micros = frame.sender_capture_time_micros;
+        header.sender_clock_offset_micros = frame.sender_clock_offset_micros;
         header.sender_encode_done_time_micros = frame.sender_encode_done_time_micros;
         header.sender_send_time_micros = frame.sender_send_time_micros;
         header.server_receive_time_micros = frame.server_receive_time_micros;
@@ -199,6 +201,7 @@ pub fn reassemble_frame(
             || packet.header.layer != first.layer
             || packet.header.media_timestamp != first.media_timestamp
             || packet.header.sender_capture_time_micros != first.sender_capture_time_micros
+            || packet.header.sender_clock_offset_micros != first.sender_clock_offset_micros
             || packet.header.flags.contains(PacketFlags::KEYFRAME) != is_keyframe
         {
             return Err(FrameReassemblyError::FragmentMetadataMismatch);
@@ -227,6 +230,7 @@ pub fn reassemble_frame(
         frame_id: first.frame_id,
         media_timestamp: first.media_timestamp,
         sender_capture_time_micros: first.sender_capture_time_micros,
+        sender_clock_offset_micros: first.sender_clock_offset_micros,
         sender_encode_done_time_micros,
         sender_send_time_micros,
         server_receive_time_micros,
@@ -283,6 +287,7 @@ mod tests {
             frame_id: 7,
             media_timestamp: 960,
             sender_capture_time_micros: 1_234_567,
+            sender_clock_offset_micros: 0,
             sender_encode_done_time_micros: 0,
             sender_send_time_micros: 0,
             server_receive_time_micros: 0,
@@ -395,6 +400,7 @@ mod tests {
             frame_id: 7,
             media_timestamp: 90_000,
             sender_capture_time_micros: 1_234_567,
+            sender_clock_offset_micros: 0,
             sender_encode_done_time_micros: 0,
             sender_send_time_micros: 0,
             server_receive_time_micros: 0,
