@@ -8,7 +8,7 @@ mod playback;
 mod stats;
 mod transport;
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
@@ -297,12 +297,11 @@ async fn run_synthetic_broadcaster_media(
     let mut ticker = tokio::time::interval(frame_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut active_fps = args.media_fps;
-    let mut capture_step_micros = frame_interval.as_micros().min(u64::MAX as u128) as u64;
     let mut sent_packets = 0_u64;
     let mut next_sequence_number = 1_u32;
     for frame_id in 1..=media_frames {
         ticker.tick().await;
-        capture.push_test_frame(1280, 720, frame_id as u64 * capture_step_micros.max(1));
+        capture.push_test_frame(1280, 720, unix_time_micros());
         let Some(captured) = capture.next_frame()? else {
             continue;
         };
@@ -334,7 +333,6 @@ async fn run_synthetic_broadcaster_media(
                 encoder.request_keyframe();
             }
             apply_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
-            capture_step_micros = media_interval_micros(active_fps);
         }
     }
     let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
@@ -426,6 +424,14 @@ fn media_interval_micros(frames_per_second: u16) -> u64 {
     1_000_000 / frames_per_second.max(1) as u64
 }
 
+fn unix_time_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_micros()
+        .min(u64::MAX as u128) as u64
+}
+
 async fn poll_publisher_feedback(
     control: &mut crate::transport::quic::ControlClient,
     room_id: RoomId,
@@ -493,11 +499,13 @@ async fn run_synthetic_viewer_media(
         }
         stats.jitter_buffer_ms = buffer.estimated_jitter_ms(frame_interval_ms.max(1));
         if let Some(frame) = outcome.frame {
+            stats.record_estimated_latency(frame.sender_capture_time_micros, unix_time_micros());
             println!(
-                "media-recv frame_id={} bytes={} keyframe={}",
+                "media-recv frame_id={} bytes={} keyframe={} latency_ms={}",
                 frame.frame_id,
                 frame.bytes.len(),
-                frame.is_keyframe
+                frame.is_keyframe,
+                stats.estimated_latency_ms
             );
             if let Some(decoded) = decoder.decode(&frame.bytes)? {
                 playback.render(decoded)?;
@@ -532,12 +540,13 @@ async fn run_synthetic_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer frames={} decoded={} packets={} lost={} dropped={}",
+        "media-summary role=viewer frames={} decoded={} packets={} lost={} dropped={} latency_ms={}",
         reassembled_frames,
         decoded_frames,
         received_packets,
         stats.lost_packets,
-        stats.dropped_frames
+        stats.dropped_frames,
+        stats.estimated_latency_ms
     );
     Ok(())
 }

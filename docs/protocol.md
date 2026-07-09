@@ -88,6 +88,8 @@ Stage 3 adds reusable encoded-frame helpers in `crates/protocol/src/frame.rs`.
 - `is_keyframe`
 - opaque encoded bytes
 
+The desktop synthetic broadcaster writes `sender_capture_time_micros` as Unix epoch microseconds. Viewers compare it with their local receive time to populate `ViewerStats.estimated_latency_ms`; production cross-machine latency will need clock offset estimation before this value can be treated as calibrated glass-to-glass latency.
+
 `packetize_frame` splits a frame into `MediaPacket` fragments:
 
 - `sequence_number` increments for every fragment.

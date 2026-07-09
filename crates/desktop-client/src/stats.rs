@@ -54,6 +54,21 @@ impl ClientMediaStats {
         self.dropped_frames = self.dropped_frames.saturating_add(dropped_frames);
     }
 
+    pub fn record_estimated_latency(
+        &mut self,
+        sender_capture_time_micros: u64,
+        receive_time_micros: u64,
+    ) {
+        if sender_capture_time_micros == 0 || receive_time_micros < sender_capture_time_micros {
+            return;
+        }
+        let latency_ms = receive_time_micros
+            .saturating_sub(sender_capture_time_micros)
+            .saturating_div(1_000)
+            .min(u16::MAX as u64) as u16;
+        self.estimated_latency_ms = latency_ms;
+    }
+
     pub fn to_viewer_report(self, room_id: RoomId, stream_id: StreamId) -> ViewerStatsReport {
         ViewerStatsReport {
             room_id,
@@ -108,6 +123,28 @@ mod tests {
         assert_eq!(report.dropped_frames, 1);
         assert_eq!(report.jitter_buffer_ms, 42);
         assert_eq!(report.estimated_latency_ms, 88);
+    }
+
+    #[test]
+    fn media_stats_estimates_latency_from_capture_timestamp() {
+        let mut stats = ClientMediaStats::default();
+
+        stats.record_estimated_latency(1_000_000, 1_123_456);
+
+        assert_eq!(stats.estimated_latency_ms, 123);
+    }
+
+    #[test]
+    fn media_stats_ignores_missing_or_future_capture_timestamp() {
+        let mut stats = ClientMediaStats {
+            estimated_latency_ms: 42,
+            ..Default::default()
+        };
+
+        stats.record_estimated_latency(0, 1_123_456);
+        stats.record_estimated_latency(2_000_000, 1_123_456);
+
+        assert_eq!(stats.estimated_latency_ms, 42);
     }
 
     fn packet_with_sequence(sequence_number: u32) -> MediaPacket {

@@ -105,7 +105,7 @@ quic-sample-forward frames=2 fragments=14 reassembled=4 delivered=28 dropped=0
 
 ## Desktop synthetic session checks
 
-The desktop client can run a paced synthetic media session over the relay. The broadcaster uses a frame interval derived from `--media-fps`, keeps sequence numbers continuous across fragments, and lingers briefly after finite sends so in-flight datagrams can drain. The viewer reassembles frames, parses synthetic Annex B H.264-like NAL units, tracks packet loss from sequence gaps, and periodically sends `ViewerStats` over the control stream.
+The desktop client can run a paced synthetic media session over the relay. The broadcaster uses a frame interval derived from `--media-fps`, stamps synthetic captures with Unix epoch microseconds, keeps sequence numbers continuous across fragments, and lingers briefly after finite sends so in-flight datagrams can drain. The viewer reassembles frames, parses synthetic Annex B H.264-like NAL units, estimates capture-to-viewer latency from `sender_capture_time_micros`, tracks packet loss from sequence gaps, and periodically sends `ViewerStats` over the control stream.
 
 Run in separate terminals:
 
@@ -120,6 +120,7 @@ Expected behavior:
 - The broadcaster prints five `media-send` lines at 5 fps for a 1000 ms run.
 - The broadcaster publishes `StreamConfig`, sets target bitrate/framerate, and the viewer polls config before media receive.
 - The viewer receives and decodes five frames split across ten packets with `--max-datagram-payload 700`.
+- Each received frame prints `latency_ms`, and the final viewer summary includes the latest estimated latency.
 - The viewer reassembly buffer drops stale incomplete frames after `--reassembly-window-frames` to avoid accumulating latency.
 - The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.
 - New subscribers, packet loss, and decoder recovery can register keyframe requests with the relay.
@@ -129,6 +130,6 @@ Expected behavior:
 
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, and synthetic QUIC forwarding behavior. Later milestones add real capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
+Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, synthetic QUIC forwarding behavior, and synthetic capture-to-viewer latency. Later milestones add real capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.
