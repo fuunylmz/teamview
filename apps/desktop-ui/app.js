@@ -1,6 +1,6 @@
-const LOCAL_USER_ID = 101;
+const FALLBACK_LOCAL_USER_ID = 101;
 
-const clientApp = {
+const fallbackClientApp = {
   role: "broadcaster",
   connection: "connected",
   relayAddr: "127.0.0.1:4433",
@@ -27,14 +27,14 @@ const clientApp = {
       channelId: 1,
       name: "General",
       participants: [
-        participant(LOCAL_USER_ID, "You", { speaking: true, sharingScreen: true }),
+        participant(FALLBACK_LOCAL_USER_ID, "You", { speaking: true, sharingScreen: true }),
         participant(7, "Alice", { speaking: true }),
         participant(8, "Ben"),
         participant(9, "Chen", { muted: true }),
       ],
       screenStream: {
         streamId: 1,
-        publisherId: LOCAL_USER_ID,
+        publisherId: FALLBACK_LOCAL_USER_ID,
         codec: "H264",
         title: "Primary monitor",
         width: 1280,
@@ -48,7 +48,7 @@ const clientApp = {
       },
       voiceStream: {
         streamId: 2,
-        publisherId: LOCAL_USER_ID,
+        publisherId: FALLBACK_LOCAL_USER_ID,
         codec: "Opus",
         framesPerSecond: 50,
         subscribed: true,
@@ -62,7 +62,7 @@ const clientApp = {
       channelId: 2,
       name: "Ops Review",
       participants: [
-        participant(LOCAL_USER_ID, "You"),
+        participant(FALLBACK_LOCAL_USER_ID, "You"),
         participant(10, "Dana", { speaking: true, sharingScreen: true }),
         participant(11, "Mina"),
       ],
@@ -95,7 +95,7 @@ const clientApp = {
     {
       channelId: 3,
       name: "Quiet Room",
-      participants: [participant(LOCAL_USER_ID, "You"), participant(12, "Noah")],
+      participants: [participant(FALLBACK_LOCAL_USER_ID, "You"), participant(12, "Noah")],
       screenStream: null,
       voiceStream: {
         streamId: 7,
@@ -111,6 +111,9 @@ const clientApp = {
     },
   ],
 };
+
+let clientApp = cloneState(fallbackClientApp);
+let localUserId = FALLBACK_LOCAL_USER_ID;
 
 const elements = {
   channelList: document.querySelector("#channelList"),
@@ -153,12 +156,121 @@ function participant(userId, displayName, overrides = {}) {
   };
 }
 
+function cloneState(state) {
+  return JSON.parse(JSON.stringify(state));
+}
+
+async function loadInitialState() {
+  if (window.teamviewState) return window.teamviewState;
+  const stateUrl = new URLSearchParams(window.location.search).get("state");
+  if (!stateUrl) return null;
+
+  try {
+    const response = await fetch(stateUrl, { cache: "no-store" });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function normalizeClientAppState(snapshot) {
+  const fallback = cloneState(fallbackClientApp);
+  const normalized = {
+    ...fallback,
+    ...snapshot,
+    frame: 0,
+    localVoice: {
+      ...fallback.localVoice,
+      ...(snapshot?.localVoice ?? {}),
+    },
+    localScreenShare: {
+      ...fallback.localScreenShare,
+      ...(snapshot?.localScreenShare ?? {}),
+    },
+    channels: Array.isArray(snapshot?.channels) && snapshot.channels.length > 0
+      ? snapshot.channels.map(normalizeChannel)
+      : fallback.channels.map(normalizeChannel),
+  };
+  normalized.selectedChannelId =
+    normalized.selectedChannelId ?? normalized.channels[0]?.channelId ?? null;
+  if (normalized.role !== "broadcaster") {
+    normalized.localScreenShare.sharing = false;
+  }
+  return normalized;
+}
+
+function normalizeChannel(channel) {
+  const participants = Array.isArray(channel.participants)
+    ? channel.participants.map(normalizeParticipant)
+    : [];
+  return {
+    channelId: channel.channelId,
+    name: channel.name ?? `Channel ${channel.channelId}`,
+    participantCount: channel.participantCount ?? participants.length,
+    publishedStreamCount:
+      channel.publishedStreamCount ??
+      [channel.screenStream, channel.voiceStream].filter(Boolean).length,
+    participants,
+    screenStream: channel.screenStream ? normalizeScreenStream(channel.screenStream) : null,
+    voiceStream: channel.voiceStream ? normalizeVoiceStream(channel.voiceStream) : null,
+  };
+}
+
+function normalizeParticipant(entry) {
+  return participant(entry.userId, entry.displayName ?? `User ${entry.userId}`, {
+    muted: Boolean(entry.muted),
+    deafened: Boolean(entry.deafened),
+    pushToTalk: Boolean(entry.pushToTalk),
+    speaking: Boolean(entry.speaking),
+    sharingScreen: Boolean(entry.sharingScreen),
+  });
+}
+
+function normalizeScreenStream(stream) {
+  return {
+    streamId: stream.streamId,
+    publisherId: stream.publisherId,
+    codec: stream.codec ?? "H264",
+    title: stream.title ?? `Screen stream ${stream.streamId}`,
+    width: stream.width ?? 0,
+    height: stream.height ?? 0,
+    framesPerSecond: stream.framesPerSecond ?? 0,
+    subscribed: Boolean(stream.subscribed),
+    renderedFrames: stream.renderedFrames ?? 0,
+    droppedFrames: stream.droppedFrames ?? 0,
+    latencyMs: stream.latencyMs ?? 0,
+    bitrateBps: stream.bitrateBps ?? 0,
+  };
+}
+
+function normalizeVoiceStream(stream) {
+  return {
+    streamId: stream.streamId,
+    publisherId: stream.publisherId,
+    codec: stream.codec ?? "Opus",
+    framesPerSecond: stream.framesPerSecond ?? 0,
+    subscribed: Boolean(stream.subscribed),
+    decodedFrames: stream.decodedFrames ?? 0,
+    droppedFrames: stream.droppedFrames ?? 0,
+    latencyMs: stream.latencyMs ?? 0,
+    bitrateBps: stream.bitrateBps ?? 0,
+  };
+}
+
 function selectedChannel() {
-  return clientApp.channels.find((channel) => channel.channelId === clientApp.selectedChannelId);
+  return (
+    clientApp.channels.find((channel) => channel.channelId === clientApp.selectedChannelId) ??
+    clientApp.channels[0] ??
+    normalizeChannel({ channelId: 0, name: "No channels" })
+  );
 }
 
 function render() {
   const channel = selectedChannel();
+  if (channel.channelId !== clientApp.selectedChannelId) {
+    clientApp.selectedChannelId = channel.channelId;
+  }
   syncChannelState(channel);
   renderChannels(channel);
   renderTopbar(channel);
@@ -171,15 +283,15 @@ function render() {
 
 function syncChannelState(channel) {
   for (const item of clientApp.channels) {
-    const localParticipant = item.participants.find((entry) => entry.userId === LOCAL_USER_ID);
+    const localParticipant = item.participants.find((entry) => entry.userId === localUserId);
     if (localParticipant && item.channelId !== channel.channelId) {
       localParticipant.speaking = false;
       localParticipant.sharingScreen = false;
     }
-    if (item.channelId !== channel.channelId && item.screenStream?.publisherId === LOCAL_USER_ID) {
+    if (item.channelId !== channel.channelId && item.screenStream?.publisherId === localUserId) {
       item.screenStream = null;
     }
-    if (item.channelId !== channel.channelId && item.voiceStream?.publisherId === LOCAL_USER_ID) {
+    if (item.channelId !== channel.channelId && item.voiceStream?.publisherId === localUserId) {
       item.voiceStream = null;
     }
   }
@@ -191,11 +303,11 @@ function syncChannelState(channel) {
   localParticipant.speaking = localSpeaking();
   localParticipant.sharingScreen = clientApp.localScreenShare.sharing;
 
-  if (clientApp.localScreenShare.sharing) {
-    const previous = channel.screenStream?.publisherId === LOCAL_USER_ID ? channel.screenStream : {};
+  if (clientApp.role === "broadcaster" && clientApp.localScreenShare.sharing) {
+    const previous = channel.screenStream?.publisherId === localUserId ? channel.screenStream : {};
     channel.screenStream = {
       streamId: clientApp.localScreenShare.streamId,
-      publisherId: LOCAL_USER_ID,
+      publisherId: localUserId,
       codec: "H264",
       title: clientApp.localScreenShare.sourceLabel,
       width: clientApp.localScreenShare.targetWidth,
@@ -207,28 +319,32 @@ function syncChannelState(channel) {
       latencyMs: previous.latencyMs ?? 28,
       bitrateBps: 192000,
     };
-  } else if (channel.screenStream?.publisherId === LOCAL_USER_ID) {
+  } else if (channel.screenStream?.publisherId === localUserId) {
     channel.screenStream = null;
   }
 
-  const previousVoice = channel.voiceStream?.publisherId === LOCAL_USER_ID ? channel.voiceStream : {};
-  channel.voiceStream = {
-    streamId: 2,
-    publisherId: LOCAL_USER_ID,
-    codec: "Opus",
-    framesPerSecond: 50,
-    subscribed: !clientApp.localVoice.deafened,
-    decodedFrames: previousVoice.decodedFrames ?? 0,
-    droppedFrames: previousVoice.droppedFrames ?? 0,
-    latencyMs: previousVoice.latencyMs ?? 8,
-    bitrateBps: 38400,
-  };
+  if (clientApp.role === "broadcaster") {
+    const previousVoice = channel.voiceStream?.publisherId === localUserId ? channel.voiceStream : {};
+    channel.voiceStream = {
+      streamId: previousVoice.streamId ?? 2,
+      publisherId: localUserId,
+      codec: "Opus",
+      framesPerSecond: previousVoice.framesPerSecond ?? 50,
+      subscribed: !clientApp.localVoice.deafened,
+      decodedFrames: previousVoice.decodedFrames ?? 0,
+      droppedFrames: previousVoice.droppedFrames ?? 0,
+      latencyMs: previousVoice.latencyMs ?? 8,
+      bitrateBps: previousVoice.bitrateBps ?? 38400,
+    };
+  } else if (channel.voiceStream?.publisherId === localUserId) {
+    channel.voiceStream = null;
+  }
 }
 
 function ensureLocalParticipant(channel) {
-  let localParticipant = channel.participants.find((entry) => entry.userId === LOCAL_USER_ID);
+  let localParticipant = channel.participants.find((entry) => entry.userId === localUserId);
   if (!localParticipant) {
-    localParticipant = participant(LOCAL_USER_ID, "You");
+    localParticipant = participant(localUserId, "You");
     channel.participants.unshift(localParticipant);
   }
   return localParticipant;
@@ -263,7 +379,7 @@ function renderChannels(channel) {
 
       const count = document.createElement("span");
       count.className = "channel-count";
-      count.textContent = String(item.participants.length);
+      count.textContent = String(channelParticipantCount(item));
 
       body.append(name, activity);
       button.append(body, count);
@@ -277,13 +393,16 @@ function channelActivityLabel(channel) {
   if (channel.screenStream) segments.push("screen");
   const speakers = activeSpeakerCount(channel);
   if (speakers > 0) segments.push(`${speakers} voice`);
+  if (segments.length === 0 && channel.publishedStreamCount > 0) {
+    segments.push(`${channel.publishedStreamCount} streams`);
+  }
   return segments.length > 0 ? segments.join(" / ") : "idle";
 }
 
 function renderTopbar(channel) {
   const speakers = activeSpeakerCount(channel);
   elements.channelTitle.textContent = channel.name;
-  elements.channelMeta.textContent = `${channel.participants.length} participants / ${speakers} speaking`;
+  elements.channelMeta.textContent = `${channelParticipantCount(channel)} participants / ${speakers} speaking`;
   elements.connectionState.textContent = titleCase(clientApp.connection);
   elements.connectionState.dataset.status = clientApp.connection;
   elements.relayState.textContent = clientApp.relayAddr;
@@ -343,7 +462,7 @@ function voiceLabel(channel) {
 }
 
 function renderParticipants(channel) {
-  elements.participantCount.textContent = String(channel.participants.length);
+  elements.participantCount.textContent = String(channelParticipantCount(channel));
   elements.participantList.replaceChildren(
     ...channel.participants.map((entry) => {
       const row = document.createElement("div");
@@ -402,6 +521,10 @@ function participantBadges(entry) {
 
 function activeSpeakerCount(channel) {
   return channel.participants.filter((entry) => entry.speaking && !entry.muted).length;
+}
+
+function channelParticipantCount(channel) {
+  return Math.max(channel.participantCount ?? 0, channel.participants.length);
 }
 
 function publisherName(channel, publisherId) {
@@ -563,5 +686,12 @@ function animate() {
   requestAnimationFrame(animate);
 }
 
-render();
-animate();
+async function boot() {
+  const loadedState = await loadInitialState();
+  clientApp = normalizeClientAppState(loadedState ?? fallbackClientApp);
+  localUserId = clientApp.localUserId ?? FALLBACK_LOCAL_USER_ID;
+  render();
+  animate();
+}
+
+boot();

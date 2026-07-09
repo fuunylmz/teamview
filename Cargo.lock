@@ -294,6 +294,8 @@ dependencies = [
  "clap",
  "quinn",
  "rustls",
+ "serde",
+ "serde_json",
  "teamview-protocol",
  "tokio",
  "tracing",

@@ -1,19 +1,29 @@
-use teamview_protocol::control::{RoomId as ChannelId, StreamId, UserId};
+use serde::{Deserialize, Serialize};
+use teamview_protocol::{
+    codec::CodecId,
+    control::{
+        MediaKind, ParticipantSummary, RoomId as ChannelId, RoomSummary, StreamConfig, StreamId,
+        StreamSummary, UserId,
+    },
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ClientRole {
     Broadcaster,
     Viewer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ConnectionStatus {
     Disconnected,
     Connecting,
     Connected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientApp {
     pub role: ClientRole,
     pub connection: ConnectionStatus,
@@ -25,16 +35,20 @@ pub struct ClientApp {
     pub status_line: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChannelView {
     pub channel_id: ChannelId,
     pub name: String,
+    pub participant_count: u32,
+    pub published_stream_count: u32,
     pub participants: Vec<ParticipantView>,
     pub screen_stream: Option<ScreenStreamView>,
     pub voice_stream: Option<VoiceStreamView>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ParticipantView {
     pub user_id: UserId,
     pub display_name: String,
@@ -45,28 +59,39 @@ pub struct ParticipantView {
     pub sharing_screen: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScreenStreamView {
     pub stream_id: StreamId,
     pub publisher_id: UserId,
+    pub codec: CodecId,
+    pub title: String,
     pub width: u32,
     pub height: u32,
     pub frames_per_second: u16,
     pub subscribed: bool,
     pub rendered_frames: u64,
     pub dropped_frames: u64,
+    pub latency_ms: u16,
+    pub bitrate_bps: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VoiceStreamView {
     pub stream_id: StreamId,
     pub publisher_id: UserId,
+    pub codec: CodecId,
+    pub frames_per_second: u16,
     pub subscribed: bool,
     pub decoded_frames: u64,
     pub dropped_frames: u64,
+    pub latency_ms: u16,
+    pub bitrate_bps: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VoiceControlState {
     pub muted: bool,
     pub deafened: bool,
@@ -76,7 +101,8 @@ pub struct VoiceControlState {
     pub output_label: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScreenShareControlState {
     pub sharing: bool,
     pub stream_id: StreamId,
@@ -84,6 +110,19 @@ pub struct ScreenShareControlState {
     pub target_width: u32,
     pub target_height: u32,
     pub target_fps: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClientAppDiscovery<'a> {
+    pub role: ClientRole,
+    pub relay_addr: &'a str,
+    pub selected_channel_id: Option<ChannelId>,
+    pub rooms: &'a [RoomSummary],
+    pub streams: &'a [StreamSummary],
+    pub stream_configs: &'a [StreamConfig],
+    pub participants: &'a [ParticipantSummary],
+    pub local_voice: &'a VoiceControlState,
+    pub local_screen_share: &'a ScreenShareControlState,
 }
 
 impl ClientApp {
@@ -98,6 +137,46 @@ impl ClientApp {
             local_screen_share: ScreenShareControlState::default(),
             status_line: "Disconnected".to_owned(),
         }
+    }
+
+    pub fn from_discovery(discovery: ClientAppDiscovery<'_>) -> Self {
+        let relay_addr = discovery.relay_addr.to_owned();
+        let mut app = Self::new(discovery.role);
+        app.connection = ConnectionStatus::Connected;
+        app.relay_addr = relay_addr.clone();
+        app.status_line = format!("Connected to {relay_addr}");
+        app.local_voice = discovery.local_voice.clone();
+        app.local_screen_share = discovery.local_screen_share.clone();
+
+        let selected_channel_id = discovery
+            .selected_channel_id
+            .or_else(|| discovery.rooms.first().map(|room| room.room_id));
+        let channels = discovery
+            .rooms
+            .iter()
+            .map(|room| {
+                let is_selected = Some(room.room_id) == selected_channel_id;
+                ChannelView::from_discovery(
+                    room,
+                    if is_selected { discovery.streams } else { &[] },
+                    if is_selected {
+                        discovery.stream_configs
+                    } else {
+                        &[]
+                    },
+                    if is_selected {
+                        discovery.participants
+                    } else {
+                        &[]
+                    },
+                )
+            })
+            .collect();
+        app.set_channels(channels);
+        if let Some(channel_id) = selected_channel_id {
+            app.select_channel(channel_id);
+        }
+        app
     }
 
     pub fn connecting(&mut self, relay_addr: impl Into<String>) {
@@ -204,10 +283,52 @@ impl ChannelView {
         Self {
             channel_id,
             name: name.into(),
+            participant_count: 0,
+            published_stream_count: 0,
             participants: Vec::new(),
             screen_stream: None,
             voice_stream: None,
         }
+    }
+
+    pub fn from_discovery(
+        room: &RoomSummary,
+        streams: &[StreamSummary],
+        stream_configs: &[StreamConfig],
+        participants: &[ParticipantSummary],
+    ) -> Self {
+        let mut channel = Self {
+            channel_id: room.room_id,
+            name: room.name.clone(),
+            participant_count: if participants.is_empty() {
+                room.participant_count
+            } else {
+                participants.len().min(u32::MAX as usize) as u32
+            },
+            published_stream_count: room.published_stream_count,
+            participants: participants
+                .iter()
+                .map(|participant| ParticipantView::from_summary(participant, streams))
+                .collect(),
+            screen_stream: None,
+            voice_stream: None,
+        };
+
+        channel.screen_stream = streams
+            .iter()
+            .filter(|stream| {
+                stream.room_id == room.room_id && stream.media_kind == MediaKind::Screen
+            })
+            .min_by_key(|stream| stream.stream_id)
+            .map(|stream| ScreenStreamView::from_summary(stream, stream_configs));
+        channel.voice_stream = streams
+            .iter()
+            .filter(|stream| {
+                stream.room_id == room.room_id && stream.media_kind == MediaKind::Voice
+            })
+            .min_by_key(|stream| stream.stream_id)
+            .map(|stream| VoiceStreamView::from_summary(stream, stream_configs));
+        channel
     }
 
     pub fn active_speaker_count(&self) -> usize {
@@ -224,6 +345,72 @@ impl ChannelView {
                 .iter()
                 .any(|participant| participant.sharing_screen)
     }
+}
+
+impl ParticipantView {
+    pub fn from_summary(participant: &ParticipantSummary, streams: &[StreamSummary]) -> Self {
+        Self {
+            user_id: participant.user_id,
+            display_name: participant.display_name.clone(),
+            muted: participant.muted,
+            deafened: participant.deafened,
+            push_to_talk: participant.push_to_talk,
+            speaking: participant.speaking,
+            sharing_screen: streams.iter().any(|stream| {
+                stream.publisher_id == participant.user_id && stream.media_kind == MediaKind::Screen
+            }),
+        }
+    }
+}
+
+impl ScreenStreamView {
+    pub fn from_summary(stream: &StreamSummary, stream_configs: &[StreamConfig]) -> Self {
+        let config = stream_config_for(stream, stream_configs);
+        Self {
+            stream_id: stream.stream_id,
+            publisher_id: stream.publisher_id,
+            codec: stream.codec,
+            title: format!("Screen stream {}", stream.stream_id),
+            width: config.map(|config| config.width).unwrap_or_default(),
+            height: config.map(|config| config.height).unwrap_or_default(),
+            frames_per_second: config
+                .map(|config| config.frames_per_second)
+                .unwrap_or(stream.target_frames_per_second),
+            subscribed: false,
+            rendered_frames: 0,
+            dropped_frames: 0,
+            latency_ms: 0,
+            bitrate_bps: stream.target_bitrate_bps,
+        }
+    }
+}
+
+impl VoiceStreamView {
+    pub fn from_summary(stream: &StreamSummary, stream_configs: &[StreamConfig]) -> Self {
+        let config = stream_config_for(stream, stream_configs);
+        Self {
+            stream_id: stream.stream_id,
+            publisher_id: stream.publisher_id,
+            codec: stream.codec,
+            frames_per_second: config
+                .map(|config| config.frames_per_second)
+                .unwrap_or(stream.target_frames_per_second),
+            subscribed: false,
+            decoded_frames: 0,
+            dropped_frames: 0,
+            latency_ms: 0,
+            bitrate_bps: stream.target_bitrate_bps,
+        }
+    }
+}
+
+fn stream_config_for<'a>(
+    stream: &StreamSummary,
+    stream_configs: &'a [StreamConfig],
+) -> Option<&'a StreamConfig> {
+    stream_configs
+        .iter()
+        .find(|config| config.room_id == stream.room_id && config.stream_id == stream.stream_id)
 }
 
 impl Default for VoiceControlState {
@@ -308,5 +495,106 @@ mod tests {
 
         assert_eq!(channel.active_speaker_count(), 1);
         assert!(channel.screen_share_active());
+    }
+
+    #[test]
+    fn channel_view_builds_selected_media_from_discovery() {
+        let room = RoomSummary {
+            room_id: 3,
+            name: "Live Review".to_owned(),
+            participant_count: 2,
+            published_stream_count: 2,
+        };
+        let streams = vec![
+            StreamSummary {
+                room_id: 3,
+                stream_id: 8,
+                publisher_id: 9,
+                codec: CodecId::H264,
+                media_kind: MediaKind::Screen,
+                subscriber_count: 1,
+                has_config: true,
+                target_bitrate_bps: 192_000,
+                target_frames_per_second: 30,
+            },
+            StreamSummary {
+                room_id: 3,
+                stream_id: 9,
+                publisher_id: 9,
+                codec: CodecId::Opus,
+                media_kind: MediaKind::Voice,
+                subscriber_count: 1,
+                has_config: true,
+                target_bitrate_bps: 38_400,
+                target_frames_per_second: 50,
+            },
+        ];
+        let stream_configs = vec![
+            StreamConfig {
+                room_id: 3,
+                stream_id: 8,
+                codec: CodecId::H264,
+                width: 1280,
+                height: 720,
+                frames_per_second: 30,
+                timebase_hz: 90_000,
+            },
+            StreamConfig {
+                room_id: 3,
+                stream_id: 9,
+                codec: CodecId::Opus,
+                width: 0,
+                height: 0,
+                frames_per_second: 50,
+                timebase_hz: 48_000,
+            },
+        ];
+        let participants = vec![ParticipantSummary {
+            room_id: 3,
+            user_id: 9,
+            display_name: "Alice".to_owned(),
+            muted: false,
+            deafened: false,
+            push_to_talk: false,
+            speaking: true,
+            published_stream_count: 2,
+            subscribed_stream_count: 0,
+        }];
+
+        let channel = ChannelView::from_discovery(&room, &streams, &stream_configs, &participants);
+
+        assert_eq!(channel.participant_count, 1);
+        assert_eq!(channel.screen_stream.as_ref().unwrap().width, 1280);
+        assert_eq!(channel.voice_stream.as_ref().unwrap().frames_per_second, 50);
+        assert!(channel.participants[0].sharing_screen);
+    }
+
+    #[test]
+    fn client_app_serializes_camel_case_ui_state() {
+        let local_voice = VoiceControlState::default();
+        let local_screen_share = ScreenShareControlState::default();
+        let app = ClientApp::from_discovery(ClientAppDiscovery {
+            role: ClientRole::Broadcaster,
+            relay_addr: "127.0.0.1:4433",
+            selected_channel_id: None,
+            rooms: &[RoomSummary {
+                room_id: 1,
+                name: "General".to_owned(),
+                participant_count: 0,
+                published_stream_count: 0,
+            }],
+            streams: &[],
+            stream_configs: &[],
+            participants: &[],
+            local_voice: &local_voice,
+            local_screen_share: &local_screen_share,
+        });
+
+        let json = serde_json::to_string(&app).unwrap();
+
+        assert!(json.contains(r#""selectedChannelId":1"#));
+        assert!(json.contains(r#""localVoice""#));
+        assert!(json.contains(r#""screenStream":null"#));
+        assert!(json.contains(r#""role":"broadcaster""#));
     }
 }

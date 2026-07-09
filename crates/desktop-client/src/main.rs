@@ -12,7 +12,11 @@ mod remote_input;
 mod stats;
 mod transport;
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
@@ -36,6 +40,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::info;
 
 use crate::{
+    app::{ClientApp, ClientAppDiscovery, ClientRole, ScreenShareControlState, VoiceControlState},
     audio::{AudioOutputPlayback, AudioPlayback, SyntheticOpusDecoder, SyntheticOpusEncoder},
     audio_capture::{
         AudioCaptureConfig, MicrophoneCapture, MicrophoneSource, MicrophoneSourceInfo,
@@ -171,6 +176,12 @@ struct Args {
 
     #[arg(long)]
     list_participants: bool,
+
+    #[arg(long)]
+    print_ui_state: bool,
+
+    #[arg(long)]
+    export_ui_state: Option<PathBuf>,
 
     #[arg(long, value_enum, default_value_t = CaptureSourceArg::PrimaryMonitor)]
     capture_source: CaptureSourceArg,
@@ -369,6 +380,10 @@ async fn main() -> anyhow::Result<()> {
     let clock_sync = sync_control_clock(&control, &args).await?;
     if let Some(access_token) = &args.access_token {
         authenticate_control(&control, access_token).await?;
+    }
+    if args.print_ui_state || args.export_ui_state.is_some() {
+        run_ui_state_export_flow(&control, &args).await?;
+        return Ok(());
     }
     if args.list_rooms {
         run_list_rooms_flow(&control).await?;
@@ -674,6 +689,115 @@ async fn run_list_participants_flow(
     }
     leave_room(control, room_id).await?;
     Ok(())
+}
+
+async fn run_ui_state_export_flow(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let rooms = list_rooms(control).await?;
+    let selected_channel_id = select_ui_state_channel_id(args, &rooms)?;
+    let mut streams = Vec::new();
+    let mut stream_configs = Vec::new();
+    let mut participants = Vec::new();
+
+    if let Some(room_id) = selected_channel_id {
+        let joined = control
+            .send(ClientControl::JoinRoom(JoinRoom { room_id }))
+            .await?;
+        print_control_response("join-room", &joined);
+        ensure_not_error("join room", &joined)?;
+        set_voice_state_if_requested(control, args, room_id).await?;
+
+        streams = list_room_streams(control, room_id).await?;
+        stream_configs = poll_configured_streams(control, room_id, &streams).await?;
+        participants = list_room_participants(control, room_id).await?;
+        leave_room(control, room_id).await?;
+    }
+
+    let local_voice = args.ui_voice_control_state();
+    let local_screen_share = args.ui_screen_share_control_state();
+    let app = ClientApp::from_discovery(ClientAppDiscovery {
+        role: args.client_role(),
+        relay_addr: &args.relay,
+        selected_channel_id,
+        rooms: &rooms,
+        streams: &streams,
+        stream_configs: &stream_configs,
+        participants: &participants,
+        local_voice: &local_voice,
+        local_screen_share: &local_screen_share,
+    });
+    let json = serde_json::to_string_pretty(&app)?;
+
+    if let Some(path) = &args.export_ui_state {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create UI state directory {}", parent.display())
+            })?;
+        }
+        fs::write(path, &json)
+            .with_context(|| format!("failed to write UI state to {}", path.display()))?;
+        println!(
+            "ui-state-export path={} channels={} selected_channel_id={}",
+            path.display(),
+            app.channels.len(),
+            app.selected_channel_id
+                .map(|channel_id| channel_id.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        );
+    }
+
+    if args.print_ui_state {
+        println!("{json}");
+    }
+
+    Ok(())
+}
+
+fn select_ui_state_channel_id(
+    args: &Args,
+    rooms: &[RoomSummary],
+) -> anyhow::Result<Option<RoomId>> {
+    if rooms.is_empty() {
+        return Ok(None);
+    }
+    if let Some(room_id) = args.selected_room_id()? {
+        if rooms.iter().any(|room| room.room_id == room_id) {
+            return Ok(Some(room_id));
+        }
+        bail!(
+            "channel {} was not found; available channels: {}",
+            room_id,
+            format_room_summaries(rooms)
+        );
+    }
+
+    let channel_name = args.selected_channel_name()?;
+    select_viewer_room(rooms, channel_name)
+        .map(|room| Some(room.room_id))
+        .with_context(|| {
+            format!(
+                "no channel matched name {:?}; available channels: {}",
+                channel_name,
+                format_room_summaries(rooms)
+            )
+        })
+}
+
+async fn poll_configured_streams(
+    control: &crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    streams: &[StreamSummary],
+) -> anyhow::Result<Vec<StreamConfig>> {
+    let mut configs = Vec::new();
+    for stream in streams.iter().filter(|stream| stream.has_config) {
+        configs.push(poll_stream_config(control, room_id, stream.stream_id).await?);
+    }
+    Ok(configs)
 }
 
 async fn run_broadcaster_control_flow(
@@ -2831,6 +2955,13 @@ fn ensure_not_error(action: &str, response: &ServerEnvelope) -> anyhow::Result<(
 }
 
 impl Args {
+    fn client_role(&self) -> ClientRole {
+        match self.mode {
+            Mode::Broadcaster => ClientRole::Broadcaster,
+            Mode::Viewer => ClientRole::Viewer,
+        }
+    }
+
     fn control_display_name(&self) -> String {
         self.display_name
             .clone()
@@ -2874,6 +3005,63 @@ impl Args {
 
     fn voice_speaking(&self) -> bool {
         !self.muted && (!self.voice_push_to_talk_enabled() || self.ptt_active)
+    }
+
+    fn ui_voice_control_state(&self) -> VoiceControlState {
+        VoiceControlState {
+            muted: self.muted,
+            deafened: self.deafened,
+            push_to_talk: self.voice_push_to_talk_enabled(),
+            ptt_active: self.ptt_active,
+            input_label: self.ui_voice_input_label(),
+            output_label: self.ui_audio_output_label(),
+        }
+    }
+
+    fn ui_screen_share_control_state(&self) -> ScreenShareControlState {
+        let (target_width, target_height) = self.screen_capture_dimensions().unwrap_or((1280, 720));
+        ScreenShareControlState {
+            sharing: self.mode == Mode::Broadcaster && self.media_kind != MediaKindArg::Voice,
+            stream_id: self.stream_id,
+            source_label: self.ui_screen_source_label(),
+            target_width,
+            target_height,
+            target_fps: self.media_fps.max(1),
+        }
+    }
+
+    fn ui_voice_input_label(&self) -> String {
+        match (self.voice_input, self.microphone_id.as_deref()) {
+            (VoiceInputArg::Synthetic, _) => "Synthetic voice".to_owned(),
+            (VoiceInputArg::Microphone, Some(id)) => format!("Microphone {id}"),
+            (VoiceInputArg::Microphone, None) => "Default microphone".to_owned(),
+        }
+    }
+
+    fn ui_audio_output_label(&self) -> String {
+        match self.audio_output {
+            AudioOutputArg::Sink => "Audio sink".to_owned(),
+            AudioOutputArg::Speaker => "Default speaker".to_owned(),
+        }
+    }
+
+    fn ui_screen_source_label(&self) -> String {
+        match (self.screen_input, self.capture_source) {
+            (ScreenInputArg::Synthetic, _) => "Synthetic screen".to_owned(),
+            (ScreenInputArg::Live, CaptureSourceArg::PrimaryMonitor) => {
+                "Primary monitor".to_owned()
+            }
+            (ScreenInputArg::Live, CaptureSourceArg::Monitor) => self
+                .monitor_id
+                .as_deref()
+                .map(|id| format!("Monitor {id}"))
+                .unwrap_or_else(|| "Monitor".to_owned()),
+            (ScreenInputArg::Live, CaptureSourceArg::Window) => self
+                .window_title
+                .as_deref()
+                .map(|title| format!("Window: {title}"))
+                .unwrap_or_else(|| "Window".to_owned()),
+        }
     }
 
     fn synthetic_media_frames(&self) -> anyhow::Result<u32> {
@@ -3254,6 +3442,23 @@ mod tests {
     }
 
     #[test]
+    fn ui_state_export_flags_parse_without_media_options() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--print-ui-state",
+            "--export-ui-state",
+            "apps/desktop-ui/state.json",
+        ])
+        .unwrap();
+
+        assert!(args.print_ui_state);
+        assert_eq!(
+            args.export_ui_state,
+            Some(PathBuf::from("apps/desktop-ui/state.json"))
+        );
+    }
+
+    #[test]
     fn display_name_overrides_default_control_name() {
         let named = Args::try_parse_from(["desktop-client", "--display-name", "Alice Screenshare"])
             .unwrap();
@@ -3276,6 +3481,66 @@ mod tests {
 
         assert_eq!(args.selected_room_id().unwrap(), Some(42));
         assert_eq!(args.selected_channel_name().unwrap(), "ops-live");
+    }
+
+    #[test]
+    fn ui_control_state_reflects_channel_media_args() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--mode",
+            "broadcaster",
+            "--media-kind",
+            "both",
+            "--screen-input",
+            "live",
+            "--capture-source",
+            "window",
+            "--window-title",
+            "Live Demo",
+            "--voice-input",
+            "microphone",
+            "--microphone-id",
+            "2",
+            "--audio-output",
+            "speaker",
+            "--muted",
+            "--push-to-talk",
+            "--ptt-active",
+        ])
+        .unwrap();
+
+        let voice = args.ui_voice_control_state();
+        let screen = args.ui_screen_share_control_state();
+
+        assert!(voice.muted);
+        assert!(voice.push_to_talk);
+        assert!(voice.ptt_active);
+        assert_eq!(voice.input_label, "Microphone 2");
+        assert_eq!(voice.output_label, "Default speaker");
+        assert!(screen.sharing);
+        assert_eq!(screen.source_label, "Window: Live Demo");
+        assert_eq!(screen.target_fps, DEFAULT_SCREEN_FPS);
+    }
+
+    #[test]
+    fn ui_state_channel_selection_uses_requested_channel() {
+        let args = Args::try_parse_from(["desktop-client", "--channel-id", "2"]).unwrap();
+        let rooms = vec![
+            RoomSummary {
+                room_id: 1,
+                name: "General".to_owned(),
+                participant_count: 1,
+                published_stream_count: 0,
+            },
+            RoomSummary {
+                room_id: 2,
+                name: "Stage".to_owned(),
+                participant_count: 2,
+                published_stream_count: 2,
+            },
+        ];
+
+        assert_eq!(select_ui_state_channel_id(&args, &rooms).unwrap(), Some(2));
     }
 
     #[test]
