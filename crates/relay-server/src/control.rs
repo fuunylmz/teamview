@@ -1,14 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use teamview_protocol::{
     PROTOCOL_VERSION,
     control::{
         ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason, MediaKind,
-        ParticipantList, ParticipantSummary, Pong, RequestKeyframe, RoomCreated, RoomId,
-        RoomJoined, RoomLeft, RoomList, RoomSummary, ServerControl, ServerEnvelope,
-        SetTargetBitrate, SetTargetFramerate, SetVoiceState, StreamConfig, StreamId, StreamList,
-        StreamPublished, StreamSubscribed, StreamSummary, StreamUnsubscribed, TimeSyncResponse,
-        UserId, ViewerStatsReport, VoiceState,
+        ParticipantList, ParticipantSummary, PollRemoteInput, Pong, RemoteInputBatch,
+        RemoteInputEvent, RemoteInputKind, RemoteInputQueued, RequestKeyframe, RoomCreated, RoomId,
+        RoomJoined, RoomLeft, RoomList, RoomSummary, SendRemoteInput, ServerControl,
+        ServerEnvelope, SetTargetBitrate, SetTargetFramerate, SetVoiceState, StreamConfig,
+        StreamId, StreamList, StreamPublished, StreamSubscribed, StreamSummary, StreamUnsubscribed,
+        TimeSyncResponse, UserId, ViewerStatsReport, VoiceState,
     },
     packet::MediaPacket,
 };
@@ -33,6 +34,9 @@ const MAX_TARGET_WIDTH: u32 = 7680;
 const MAX_TARGET_HEIGHT: u32 = 4320;
 const MAX_DISPLAY_NAME_CHARS: usize = 64;
 const MAX_ROOM_NAME_CHARS: usize = 64;
+const MAX_REMOTE_INPUT_QUEUE_EVENTS: usize = 256;
+const MAX_REMOTE_INPUT_BATCH_EVENTS: usize = 64;
+const MAX_REMOTE_INPUT_TEXT_CHARS: usize = 256;
 pub const DEFAULT_MAX_ROOMS: usize = 128;
 pub const DEFAULT_MAX_PARTICIPANTS_PER_ROOM: usize = 64;
 pub const DEFAULT_MAX_STREAMS_PER_ROOM: usize = 8;
@@ -44,6 +48,7 @@ pub struct ControlState {
     viewer_stats: BTreeMap<StreamId, BTreeMap<UserId, ViewerStatsReport>>,
     voice_states: BTreeMap<RoomId, BTreeMap<UserId, VoiceState>>,
     pending_keyframe_requests: BTreeMap<StreamId, KeyframeReason>,
+    pending_remote_input: BTreeMap<StreamId, VecDeque<RemoteInputEvent>>,
     stream_metrics: BTreeMap<StreamId, StreamForwardingMetrics>,
     access_token: Option<String>,
     limits: ControlLimits,
@@ -94,6 +99,7 @@ impl ControlState {
             viewer_stats: BTreeMap::new(),
             voice_states: BTreeMap::new(),
             pending_keyframe_requests: BTreeMap::new(),
+            pending_remote_input: BTreeMap::new(),
             stream_metrics: BTreeMap::new(),
             access_token: None,
             limits: ControlLimits::default(),
@@ -394,6 +400,8 @@ impl ControlState {
                 self.poll_stream_metrics(session, poll.room_id, poll.stream_id)
             }
             ClientControl::RequestKeyframe(request) => self.request_keyframe(session, request),
+            ClientControl::SendRemoteInput(input) => self.send_remote_input(session, input),
+            ClientControl::PollRemoteInput(poll) => self.poll_remote_input(session, poll),
             ClientControl::ViewerStats(report) => {
                 if let Some(user_id) = session.user_id {
                     self.viewer_stats
@@ -565,6 +573,7 @@ impl ControlState {
     fn remove_stream_state(&mut self, stream_id: StreamId) {
         self.viewer_stats.remove(&stream_id);
         self.pending_keyframe_requests.remove(&stream_id);
+        self.pending_remote_input.remove(&stream_id);
         self.stream_metrics.remove(&stream_id);
     }
 
@@ -819,6 +828,146 @@ impl ControlState {
         }
         self.register_keyframe_request(request.stream_id, request.reason);
         ServerControl::RequestKeyframe(request)
+    }
+
+    fn send_remote_input(&mut self, session: &Session, input: SendRemoteInput) -> ServerControl {
+        let Some(user_id) = session.user_id else {
+            return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
+        };
+        let Some(room) = self.rooms.get(&input.room_id) else {
+            return ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            ));
+        };
+        if !room.participants.contains(&user_id) {
+            return ServerControl::Error(ControlError::new(
+                "not_in_room",
+                "join room before sending remote input",
+            ));
+        }
+        let Some(stream) = room.published_streams.get(&input.stream_id) else {
+            return ServerControl::Error(ControlError::new(
+                "stream_not_found",
+                "stream does not exist",
+            ));
+        };
+        if stream.media_kind != MediaKind::Screen {
+            return ServerControl::Error(ControlError::new(
+                "media_kind_mismatch",
+                "remote input can only target screen streams",
+            ));
+        }
+        let is_subscriber = room
+            .subscriptions
+            .get(&input.stream_id)
+            .is_some_and(|subscribers| subscribers.contains(&user_id));
+        if !is_subscriber {
+            return ServerControl::Error(ControlError::new(
+                "not_subscribed",
+                "subscribe to the screen stream before sending remote input",
+            ));
+        }
+        let kind = match sanitize_remote_input_kind(input.kind) {
+            Ok(kind) => kind,
+            Err(error) => return ServerControl::Error(error),
+        };
+        let publisher_id = stream.publisher_id;
+        let event = RemoteInputEvent {
+            sender_user_id: user_id,
+            sequence_number: input.sequence_number,
+            event_time_micros: if input.event_time_micros == 0 {
+                unix_time_micros()
+            } else {
+                input.event_time_micros
+            },
+            kind,
+        };
+        let queue = self
+            .pending_remote_input
+            .entry(input.stream_id)
+            .or_default();
+        let mut dropped_events = 0_u16;
+        while queue.len() >= MAX_REMOTE_INPUT_QUEUE_EVENTS {
+            queue.pop_front();
+            dropped_events = dropped_events.saturating_add(1);
+        }
+        queue.push_back(event);
+        ServerControl::RemoteInputQueued(RemoteInputQueued {
+            room_id: input.room_id,
+            stream_id: input.stream_id,
+            publisher_id,
+            queued_events: queue.len().min(u16::MAX as usize) as u16,
+            dropped_events,
+        })
+    }
+
+    fn poll_remote_input(&mut self, session: &Session, poll: PollRemoteInput) -> ServerControl {
+        let Some(error) =
+            self.validate_remote_input_publisher(session, poll.room_id, poll.stream_id)
+        else {
+            let max_events = poll
+                .max_events
+                .max(1)
+                .min(MAX_REMOTE_INPUT_BATCH_EVENTS as u16) as usize;
+            let mut events = Vec::new();
+            if let Some(queue) = self.pending_remote_input.get_mut(&poll.stream_id) {
+                while events.len() < max_events {
+                    let Some(event) = queue.pop_front() else {
+                        break;
+                    };
+                    events.push(event);
+                }
+                if queue.is_empty() {
+                    self.pending_remote_input.remove(&poll.stream_id);
+                }
+            }
+            return ServerControl::RemoteInputBatch(RemoteInputBatch {
+                room_id: poll.room_id,
+                stream_id: poll.stream_id,
+                events,
+            });
+        };
+        error
+    }
+
+    fn validate_remote_input_publisher(
+        &self,
+        session: &Session,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) -> Option<ServerControl> {
+        let Some(user_id) = session.user_id else {
+            return Some(ServerControl::Error(ControlError::new(
+                "unauthenticated",
+                "send Hello first",
+            )));
+        };
+        let Some(room) = self.rooms.get(&room_id) else {
+            return Some(ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            )));
+        };
+        let Some(stream) = room.published_streams.get(&stream_id) else {
+            return Some(ServerControl::Error(ControlError::new(
+                "stream_not_found",
+                "stream does not exist",
+            )));
+        };
+        if stream.publisher_id != user_id {
+            return Some(ServerControl::Error(ControlError::new(
+                "not_publisher",
+                "only the stream publisher can poll remote input",
+            )));
+        }
+        if stream.media_kind != MediaKind::Screen {
+            return Some(ServerControl::Error(ControlError::new(
+                "media_kind_mismatch",
+                "remote input can only target screen streams",
+            )));
+        }
+        None
     }
 
     fn poll_publisher_feedback(
@@ -1172,6 +1321,28 @@ fn viewer_latency_ms(report: &ViewerStatsReport) -> u16 {
     }
 }
 
+fn sanitize_remote_input_kind(kind: RemoteInputKind) -> Result<RemoteInputKind, ControlError> {
+    match kind {
+        RemoteInputKind::Text { text } => {
+            let mut sanitized = String::new();
+            for ch in text.chars().take(MAX_REMOTE_INPUT_TEXT_CHARS) {
+                if !ch.is_control() || matches!(ch, '\n' | '\r' | '\t') {
+                    sanitized.push(ch);
+                }
+            }
+            if sanitized.is_empty() {
+                Err(ControlError::new(
+                    "invalid_remote_input",
+                    "remote text input must not be empty",
+                ))
+            } else {
+                Ok(RemoteInputKind::Text { text: sanitized })
+            }
+        }
+        other => Ok(other),
+    }
+}
+
 fn reduce_resolution(width: u32, height: u32) -> (u32, u32) {
     if width == 0 || height == 0 {
         return (width, height);
@@ -1253,8 +1424,9 @@ mod tests {
         codec::CodecId,
         control::{
             Authenticate, ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, LeaveRoom,
-            ListParticipants, ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback,
-            PollStreamConfig, PollStreamMetrics, PublishStream, RequestKeyframe, SetTargetBitrate,
+            ListParticipants, ListRooms, ListStreams, MediaKind, Ping, PointerButton,
+            PollPublisherFeedback, PollRemoteInput, PollStreamConfig, PollStreamMetrics,
+            PublishStream, RemoteInputKind, RequestKeyframe, SendRemoteInput, SetTargetBitrate,
             SetTargetFramerate, SetVoiceState, StreamConfig, SubscribeStream, TimeSyncRequest,
             ViewerStatsReport,
         },
@@ -2525,6 +2697,198 @@ mod tests {
         match response.message {
             ServerControl::Error(error) => assert_eq!(error.code, "not_publisher"),
             other => panic!("unexpected non-publisher poll response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subscribed_viewer_remote_input_is_polled_by_publisher() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        let queued = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::SendRemoteInput(SendRemoteInput {
+                    room_id,
+                    stream_id: 9,
+                    sequence_number: 12,
+                    event_time_micros: 123_456,
+                    kind: RemoteInputKind::PointerButton {
+                        button: PointerButton::Left,
+                        pressed: true,
+                        normalized_x: 20_000,
+                        normalized_y: 30_000,
+                    },
+                }),
+            ),
+        );
+
+        match queued.message {
+            ServerControl::RemoteInputQueued(queued) => {
+                assert_eq!(queued.publisher_id, publisher.user_id.unwrap());
+                assert_eq!(queued.queued_events, 1);
+                assert_eq!(queued.dropped_events, 0);
+            }
+            other => panic!("unexpected remote input queue response: {other:?}"),
+        }
+
+        let polled = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                7,
+                ClientControl::PollRemoteInput(PollRemoteInput {
+                    room_id,
+                    stream_id: 9,
+                    max_events: 8,
+                }),
+            ),
+        );
+
+        match polled.message {
+            ServerControl::RemoteInputBatch(batch) => {
+                assert_eq!(batch.room_id, room_id);
+                assert_eq!(batch.stream_id, 9);
+                assert_eq!(batch.events.len(), 1);
+                assert_eq!(batch.events[0].sender_user_id, viewer.user_id.unwrap());
+                assert_eq!(batch.events[0].sequence_number, 12);
+                assert_eq!(batch.events[0].event_time_micros, 123_456);
+            }
+            other => panic!("unexpected remote input poll response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_subscriber_cannot_send_remote_input() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::SendRemoteInput(SendRemoteInput {
+                    room_id,
+                    stream_id: 9,
+                    sequence_number: 1,
+                    event_time_micros: 1,
+                    kind: RemoteInputKind::Key {
+                        key_code: 13,
+                        pressed: true,
+                    },
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_subscribed"),
+            other => panic!("unexpected remote input response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_publisher_cannot_poll_remote_input() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::PollRemoteInput(PollRemoteInput {
+                    room_id,
+                    stream_id: 9,
+                    max_events: 8,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_publisher"),
+            other => panic!("unexpected remote input poll response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_input_queue_drops_oldest_events() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        let mut last_dropped = 0;
+        for sequence_number in 1..=(MAX_REMOTE_INPUT_QUEUE_EVENTS as u64 + 1) {
+            let response = state.handle_client_envelope(
+                &mut viewer,
+                ClientEnvelope::new(
+                    sequence_number,
+                    ClientControl::SendRemoteInput(SendRemoteInput {
+                        room_id,
+                        stream_id: 9,
+                        sequence_number,
+                        event_time_micros: sequence_number,
+                        kind: RemoteInputKind::PointerMove {
+                            normalized_x: sequence_number as u16,
+                            normalized_y: sequence_number as u16,
+                        },
+                    }),
+                ),
+            );
+            if let ServerControl::RemoteInputQueued(queued) = response.message {
+                last_dropped = queued.dropped_events;
+            } else {
+                panic!("unexpected remote input response: {:?}", response.message);
+            }
+        }
+
+        assert_eq!(last_dropped, 1);
+
+        let polled = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                999,
+                ClientControl::PollRemoteInput(PollRemoteInput {
+                    room_id,
+                    stream_id: 9,
+                    max_events: 1,
+                }),
+            ),
+        );
+
+        match polled.message {
+            ServerControl::RemoteInputBatch(batch) => {
+                assert_eq!(batch.events.len(), 1);
+                assert_eq!(batch.events[0].sequence_number, 2);
+            }
+            other => panic!("unexpected remote input poll response: {other:?}"),
         }
     }
 

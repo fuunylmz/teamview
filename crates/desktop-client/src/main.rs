@@ -21,11 +21,12 @@ use teamview_protocol::{
     control::{
         Authenticate, ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, LeaveRoom,
         ListParticipants, ListRooms, ListStreams, MediaKind, ParticipantSummary, Ping,
-        PollPublisherFeedback, PollStreamConfig, PollStreamMetrics, PublishStream,
-        PublisherFeedback, RequestKeyframe, RoomId, RoomSummary, ServerControl, ServerEnvelope,
-        SetTargetBitrate, SetTargetFramerate, SetVoiceState, StreamConfig, StreamId,
-        StreamMetricsSnapshot, StreamSummary, SubscribeStream, TimeSyncRequest, TimeSyncResponse,
-        UnsubscribeStream, ViewerStatsReport,
+        PointerButton, PollPublisherFeedback, PollRemoteInput, PollStreamConfig, PollStreamMetrics,
+        PublishStream, PublisherFeedback, RemoteInputEvent, RemoteInputKind, RequestKeyframe,
+        RoomId, RoomSummary, SendRemoteInput, ServerControl, ServerEnvelope, SetTargetBitrate,
+        SetTargetFramerate, SetVoiceState, StreamConfig, StreamId, StreamMetricsSnapshot,
+        StreamSummary, SubscribeStream, TimeSyncRequest, TimeSyncResponse, UnsubscribeStream,
+        ViewerStatsReport,
     },
     frame::{packetize_frame_for_datagram_target, packetize_frame_with_type_for_datagram_target},
     packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, PacketType},
@@ -117,6 +118,13 @@ enum RenderOutputArg {
 enum AudioOutputArg {
     Sink,
     Speaker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RemoteInputScriptArg {
+    PointerTap,
+    KeyEnter,
+    Text,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -256,6 +264,12 @@ struct Args {
 
     #[arg(long, default_value_t = 5_000)]
     time_sync_refresh_ms: u64,
+
+    #[arg(long, value_enum)]
+    remote_input_script: Option<RemoteInputScriptArg>,
+
+    #[arg(long)]
+    remote_input_text: Option<String>,
 }
 
 #[tokio::main]
@@ -781,6 +795,7 @@ async fn run_viewer_control_flow(
         stream_config.frames_per_second,
         stream_config.timebase_hz
     );
+    send_remote_input_script_if_requested(control, args, room_id, stream_id).await?;
 
     println!(
         "control-flow viewer room_id={} stream_id={}",
@@ -827,6 +842,7 @@ async fn run_dual_stream_viewer_control_flow(
         voice_config.frames_per_second,
         voice_config.timebase_hz
     );
+    send_remote_input_script_if_requested(control, args, room_id, screen_stream_id).await?;
 
     println!(
         "control-flow viewer room_id={} screen_stream_id={} voice_stream_id={}",
@@ -973,6 +989,60 @@ fn format_stream_summary(stream: &StreamSummary) -> String {
         stream.target_bitrate_bps,
         stream.target_frames_per_second
     )
+}
+
+fn format_remote_input_event(event: &RemoteInputEvent) -> String {
+    match &event.kind {
+        RemoteInputKind::PointerMove {
+            normalized_x,
+            normalized_y,
+        } => format!(
+            "remote-input event=pointer-move sender_user_id={} sequence={} event_time_micros={} x={} y={}",
+            event.sender_user_id,
+            event.sequence_number,
+            event.event_time_micros,
+            normalized_x,
+            normalized_y
+        ),
+        RemoteInputKind::PointerButton {
+            button,
+            pressed,
+            normalized_x,
+            normalized_y,
+        } => format!(
+            "remote-input event=pointer-button sender_user_id={} sequence={} event_time_micros={} button={:?} pressed={} x={} y={}",
+            event.sender_user_id,
+            event.sequence_number,
+            event.event_time_micros,
+            button,
+            pressed,
+            normalized_x,
+            normalized_y
+        ),
+        RemoteInputKind::PointerWheel {
+            delta_x,
+            delta_y,
+            normalized_x,
+            normalized_y,
+        } => format!(
+            "remote-input event=pointer-wheel sender_user_id={} sequence={} event_time_micros={} delta_x={} delta_y={} x={} y={}",
+            event.sender_user_id,
+            event.sequence_number,
+            event.event_time_micros,
+            delta_x,
+            delta_y,
+            normalized_x,
+            normalized_y
+        ),
+        RemoteInputKind::Key { key_code, pressed } => format!(
+            "remote-input event=key sender_user_id={} sequence={} event_time_micros={} key_code={} pressed={}",
+            event.sender_user_id, event.sequence_number, event.event_time_micros, key_code, pressed
+        ),
+        RemoteInputKind::Text { text } => format!(
+            "remote-input event=text sender_user_id={} sequence={} event_time_micros={} text={:?}",
+            event.sender_user_id, event.sequence_number, event.event_time_micros, text
+        ),
+    }
 }
 
 fn resolve_viewer_stream_id(args: &Args, streams: &[StreamSummary]) -> anyhow::Result<StreamId> {
@@ -1315,6 +1385,7 @@ async fn run_synthetic_screen_broadcaster_media(
                 )
                 .await?;
             }
+            poll_remote_input(control, room_id, args.stream_id).await?;
         }
     }
     let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
@@ -1343,6 +1414,7 @@ async fn run_synthetic_screen_broadcaster_media(
         )
         .await?;
     }
+    poll_remote_input(control, room_id, args.stream_id).await?;
     let stream_metrics = poll_stream_metrics(control, room_id, args.stream_id).await?;
     println!(
         "stream-metrics stream_id={} ingress_packets={} ingress_bytes={} egress_queued={} egress_dropped={} egress_queue_packets={} egress_queue_media_ms={} subscribers={} last_ingress_time_micros={} server_route_ms_p50={} server_route_ms_p95={}",
@@ -1795,6 +1867,83 @@ async fn poll_stream_metrics(
         ServerControl::StreamMetrics(metrics) => Ok(metrics),
         ServerControl::Error(error) => bail!("poll stream metrics failed: {}", error.message),
         other => bail!("unexpected stream metrics response: {other:?}"),
+    }
+}
+
+async fn send_remote_input_script_if_requested(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
+    let Some(script) = args.remote_input_script else {
+        return Ok(());
+    };
+    if args.media_kind == MediaKindArg::Voice {
+        bail!("--remote-input-script requires a screen stream");
+    }
+
+    for (index, kind) in args
+        .remote_input_script_events(script)
+        .into_iter()
+        .enumerate()
+    {
+        let sequence_number = index as u64 + 1;
+        let response = control
+            .send(ClientControl::SendRemoteInput(SendRemoteInput {
+                room_id,
+                stream_id,
+                sequence_number,
+                event_time_micros: unix_time_micros(),
+                kind,
+            }))
+            .await?;
+        print_control_response("remote-input-send", &response);
+        match response.message {
+            ServerControl::RemoteInputQueued(queued) => {
+                println!(
+                    "remote-input-send stream_id={} sequence={} queued={} dropped={} publisher_id={}",
+                    queued.stream_id,
+                    sequence_number,
+                    queued.queued_events,
+                    queued.dropped_events,
+                    queued.publisher_id
+                );
+            }
+            ServerControl::Error(error) => bail!("send remote input failed: {}", error.message),
+            other => bail!("unexpected remote input response: {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+async fn poll_remote_input(
+    control: &crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
+    let response = control
+        .send(ClientControl::PollRemoteInput(PollRemoteInput {
+            room_id,
+            stream_id,
+            max_events: 64,
+        }))
+        .await?;
+    print_control_response("remote-input-poll", &response);
+    match response.message {
+        ServerControl::RemoteInputBatch(batch) => {
+            println!(
+                "remote-input-batch stream_id={} events={}",
+                batch.stream_id,
+                batch.events.len()
+            );
+            for event in &batch.events {
+                println!("{}", format_remote_input_event(event));
+            }
+            Ok(())
+        }
+        ServerControl::Error(error) => bail!("poll remote input failed: {}", error.message),
+        other => bail!("unexpected remote input poll response: {other:?}"),
     }
 }
 
@@ -2873,6 +3022,41 @@ impl Args {
             }
         }
     }
+
+    fn remote_input_script_events(&self, script: RemoteInputScriptArg) -> Vec<RemoteInputKind> {
+        match script {
+            RemoteInputScriptArg::PointerTap => vec![
+                RemoteInputKind::PointerButton {
+                    button: PointerButton::Left,
+                    pressed: true,
+                    normalized_x: 32_768,
+                    normalized_y: 32_768,
+                },
+                RemoteInputKind::PointerButton {
+                    button: PointerButton::Left,
+                    pressed: false,
+                    normalized_x: 32_768,
+                    normalized_y: 32_768,
+                },
+            ],
+            RemoteInputScriptArg::KeyEnter => vec![
+                RemoteInputKind::Key {
+                    key_code: 13,
+                    pressed: true,
+                },
+                RemoteInputKind::Key {
+                    key_code: 13,
+                    pressed: false,
+                },
+            ],
+            RemoteInputScriptArg::Text => vec![RemoteInputKind::Text {
+                text: self
+                    .remote_input_text
+                    .clone()
+                    .unwrap_or_else(|| "hello from viewer".to_owned()),
+            }],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3260,6 +3444,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_input_script_flag_builds_events() {
+        let tap = Args::try_parse_from(["desktop-client", "--remote-input-script", "pointer-tap"])
+            .unwrap();
+        let text = Args::try_parse_from([
+            "desktop-client",
+            "--remote-input-script",
+            "text",
+            "--remote-input-text",
+            "hi",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            tap.remote_input_script,
+            Some(RemoteInputScriptArg::PointerTap)
+        );
+        assert_eq!(
+            tap.remote_input_script_events(RemoteInputScriptArg::PointerTap)
+                .len(),
+            2
+        );
+        assert_eq!(
+            text.remote_input_script_events(RemoteInputScriptArg::Text),
+            vec![RemoteInputKind::Text {
+                text: "hi".to_owned()
+            }]
+        );
+    }
+
+    #[test]
     fn clock_sync_tracker_keeps_current_estimate_when_refresh_disabled() {
         let estimate = ClockSyncEstimate {
             rtt_micros: 1_000,
@@ -3396,6 +3610,24 @@ mod tests {
         assert_eq!(
             format_stream_summary(&stream),
             "stream room_id=1 stream_id=9 publisher_id=10 codec=H264 media_kind=Screen subscribers=0 configured=true target_bitrate_bps=800000 target_fps=30"
+        );
+    }
+
+    #[test]
+    fn format_remote_input_event_prints_event_details() {
+        let event = RemoteInputEvent {
+            sender_user_id: 7,
+            sequence_number: 2,
+            event_time_micros: 123,
+            kind: RemoteInputKind::Key {
+                key_code: 13,
+                pressed: false,
+            },
+        };
+
+        assert_eq!(
+            format_remote_input_event(&event),
+            "remote-input event=key sender_user_id=7 sequence=2 event_time_micros=123 key_code=13 pressed=false"
         );
     }
 

@@ -44,6 +44,8 @@ pub enum ClientControl {
     PollStreamConfig(PollStreamConfig),
     PollStreamMetrics(PollStreamMetrics),
     RequestKeyframe(RequestKeyframe),
+    SendRemoteInput(SendRemoteInput),
+    PollRemoteInput(PollRemoteInput),
     ViewerStats(ViewerStatsReport),
     PollPublisherFeedback(PollPublisherFeedback),
     SetTargetBitrate(SetTargetBitrate),
@@ -69,6 +71,8 @@ pub enum ServerControl {
     RequestKeyframe(RequestKeyframe),
     StreamConfig(StreamConfig),
     StreamMetrics(StreamMetricsSnapshot),
+    RemoteInputQueued(RemoteInputQueued),
+    RemoteInputBatch(RemoteInputBatch),
     PublisherFeedback(PublisherFeedback),
     Error(ControlError),
 }
@@ -279,6 +283,82 @@ pub struct RequestKeyframe {
     pub room_id: RoomId,
     pub stream_id: StreamId,
     pub reason: KeyframeReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendRemoteInput {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+    pub sequence_number: u64,
+    pub event_time_micros: u64,
+    pub kind: RemoteInputKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollRemoteInput {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+    pub max_events: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteInputQueued {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+    pub publisher_id: UserId,
+    pub queued_events: u16,
+    pub dropped_events: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteInputBatch {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+    pub events: Vec<RemoteInputEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteInputEvent {
+    pub sender_user_id: UserId,
+    pub sequence_number: u64,
+    pub event_time_micros: u64,
+    pub kind: RemoteInputKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteInputKind {
+    PointerMove {
+        normalized_x: u16,
+        normalized_y: u16,
+    },
+    PointerButton {
+        button: PointerButton,
+        pressed: bool,
+        normalized_x: u16,
+        normalized_y: u16,
+    },
+    PointerWheel {
+        delta_x: i16,
+        delta_y: i16,
+        normalized_x: u16,
+        normalized_y: u16,
+    },
+    Key {
+        key_code: u16,
+        pressed: bool,
+    },
+    Text {
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointerButton {
+    Left,
+    Right,
+    Middle,
+    X1,
+    X2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -565,6 +645,76 @@ mod tests {
         let encoded = encode_client_envelope(&envelope).unwrap();
 
         assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn remote_input_round_trips_as_control_messages() {
+        let request = ClientEnvelope::new(
+            8,
+            ClientControl::SendRemoteInput(SendRemoteInput {
+                room_id: 1,
+                stream_id: 9,
+                sequence_number: 3,
+                event_time_micros: 1_234,
+                kind: RemoteInputKind::PointerButton {
+                    button: PointerButton::Left,
+                    pressed: true,
+                    normalized_x: 32_768,
+                    normalized_y: 16_384,
+                },
+            }),
+        );
+        let queued = ServerEnvelope::new(
+            8,
+            ServerControl::RemoteInputQueued(RemoteInputQueued {
+                room_id: 1,
+                stream_id: 9,
+                publisher_id: 2,
+                queued_events: 1,
+                dropped_events: 0,
+            }),
+        );
+        let poll = ClientEnvelope::new(
+            9,
+            ClientControl::PollRemoteInput(PollRemoteInput {
+                room_id: 1,
+                stream_id: 9,
+                max_events: 16,
+            }),
+        );
+        let batch = ServerEnvelope::new(
+            9,
+            ServerControl::RemoteInputBatch(RemoteInputBatch {
+                room_id: 1,
+                stream_id: 9,
+                events: vec![RemoteInputEvent {
+                    sender_user_id: 7,
+                    sequence_number: 3,
+                    event_time_micros: 1_234,
+                    kind: RemoteInputKind::Key {
+                        key_code: 13,
+                        pressed: false,
+                    },
+                }],
+            }),
+        );
+
+        assert_eq!(
+            decode_client_envelope(&encode_client_envelope(&request).unwrap()).unwrap(),
+            request
+        );
+        assert_eq!(
+            decode_server_envelope(&encode_server_envelope(&queued).unwrap()).unwrap(),
+            queued
+        );
+        assert_eq!(
+            decode_client_envelope(&encode_client_envelope(&poll).unwrap()).unwrap(),
+            poll
+        );
+        assert_eq!(
+            decode_server_envelope(&encode_server_envelope(&batch).unwrap()).unwrap(),
+            batch
+        );
     }
 
     #[test]

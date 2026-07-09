@@ -45,6 +45,7 @@ Current control messages cover:
 - leave room
 - voice state updates for mute/deafen/push-to-talk
 - keyframe request
+- remote input send/poll for subscribed screen viewers and screen publishers
 - stream config
 - stream metrics
 - publisher feedback
@@ -68,6 +69,8 @@ The relay can bound room state with `--max-rooms`, `--max-participants-per-room`
 Room participants can send `SetVoiceState` with `muted`, `deafened`, `push_to_talk`, and `speaking` flags. The relay stores that room-scoped voice state, removes it when the participant leaves, rejects voice datagrams from muted or inactive push-to-talk publishers, and suppresses voice datagrams for deafened viewers. The desktop broadcaster uses `--muted` to stop sending voice frames, `--push-to-talk` plus `--ptt-active` to model a pressed talk key, and the desktop viewer uses `--deafened` to avoid waiting for or playing voice media.
 
 Keyframe requests are accepted from subscribed viewers and are also registered automatically when a viewer first subscribes to a stream. The relay exposes those requests to the publisher through `PublisherFeedback.keyframe_requested`; the publisher consumes the pending request when it polls feedback and should make the next encoded video frame a keyframe.
+
+Remote input is carried on the reliable control plane. A subscribed screen viewer can send `SendRemoteInput` with pointer, key, wheel, or text input for a screen stream. The relay verifies that the sender is a room participant subscribed to that screen stream, stamps the event with the sender's user id, bounds each stream's pending input queue, and drops the oldest queued input events when the queue is full. Only the screen stream publisher can call `PollRemoteInput`; the response returns a bounded `RemoteInputBatch` and removes those events from the relay queue. Voice streams reject remote input with `media_kind_mismatch`.
 
 Publishers can set their current target bitrate and framerate. `PublisherFeedback` returns the relay's current bitrate/FPS/resolution target; if most subscribed viewers report degraded stats, the relay lowers bitrate first, then framerate, then screen resolution once the earlier targets are already at their floor. The desktop publisher adapts future encoded frames and sends an updated `StreamConfig` when feedback changes width/height.
 
