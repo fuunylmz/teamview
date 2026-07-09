@@ -312,6 +312,8 @@ mod tests {
             frame_id,
             media_timestamp: 21_000,
             sender_capture_time_micros: 1_234,
+            sender_encode_done_time_micros: 0,
+            sender_send_time_micros: 0,
             server_receive_time_micros: 0,
             server_send_time_micros: 0,
             codec: CodecId::H264,

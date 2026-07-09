@@ -11,6 +11,8 @@ pub struct EncodedFrame {
     pub frame_id: u32,
     pub media_timestamp: u64,
     pub sender_capture_time_micros: u64,
+    pub sender_encode_done_time_micros: u64,
+    pub sender_send_time_micros: u64,
     pub server_receive_time_micros: u64,
     pub server_send_time_micros: u64,
     pub codec: CodecId,
@@ -88,6 +90,8 @@ pub fn packetize_frame_with_type(
         header.fragment_count = fragment_count as u16;
         header.media_timestamp = frame.media_timestamp;
         header.sender_capture_time_micros = frame.sender_capture_time_micros;
+        header.sender_encode_done_time_micros = frame.sender_encode_done_time_micros;
+        header.sender_send_time_micros = frame.sender_send_time_micros;
         header.server_receive_time_micros = frame.server_receive_time_micros;
         header.server_send_time_micros = frame.server_send_time_micros;
 
@@ -171,6 +175,8 @@ pub fn reassemble_frame(
     }
 
     let is_keyframe = first.flags.contains(PacketFlags::KEYFRAME);
+    let mut sender_encode_done_time_micros = first.sender_encode_done_time_micros;
+    let mut sender_send_time_micros = first.sender_send_time_micros;
     let mut server_receive_time_micros = min_nonzero(first.server_receive_time_micros, 0);
     let mut server_send_time_micros = first.server_send_time_micros;
     let mut bytes = Vec::new();
@@ -197,6 +203,10 @@ pub fn reassemble_frame(
         {
             return Err(FrameReassemblyError::FragmentMetadataMismatch);
         }
+        sender_encode_done_time_micros =
+            sender_encode_done_time_micros.max(packet.header.sender_encode_done_time_micros);
+        sender_send_time_micros =
+            sender_send_time_micros.max(packet.header.sender_send_time_micros);
         server_receive_time_micros = min_nonzero(
             server_receive_time_micros,
             packet.header.server_receive_time_micros,
@@ -217,6 +227,8 @@ pub fn reassemble_frame(
         frame_id: first.frame_id,
         media_timestamp: first.media_timestamp,
         sender_capture_time_micros: first.sender_capture_time_micros,
+        sender_encode_done_time_micros,
+        sender_send_time_micros,
         server_receive_time_micros,
         server_send_time_micros,
         codec: first.codec,
@@ -271,6 +283,8 @@ mod tests {
             frame_id: 7,
             media_timestamp: 960,
             sender_capture_time_micros: 1_234_567,
+            sender_encode_done_time_micros: 0,
+            sender_send_time_micros: 0,
             server_receive_time_micros: 0,
             server_send_time_micros: 0,
             codec: CodecId::Opus,
@@ -345,6 +359,10 @@ mod tests {
     fn reassembly_preserves_relay_timestamp_span() {
         let frame = sample_frame(64);
         let mut packets = packetize_frame(&frame, 1, 17).unwrap();
+        packets[0].header.sender_encode_done_time_micros = 800;
+        packets[0].header.sender_send_time_micros = 850;
+        packets[1].header.sender_encode_done_time_micros = 800;
+        packets[1].header.sender_send_time_micros = 875;
         packets[0].header.server_receive_time_micros = 1_000;
         packets[0].header.server_send_time_micros = 1_500;
         packets[1].header.server_receive_time_micros = 900;
@@ -352,6 +370,8 @@ mod tests {
 
         let reassembled = reassemble_frame(packets).unwrap();
 
+        assert_eq!(reassembled.sender_encode_done_time_micros, 800);
+        assert_eq!(reassembled.sender_send_time_micros, 875);
         assert_eq!(reassembled.server_receive_time_micros, 900);
         assert_eq!(reassembled.server_send_time_micros, 1_700);
     }
@@ -375,6 +395,8 @@ mod tests {
             frame_id: 7,
             media_timestamp: 90_000,
             sender_capture_time_micros: 1_234_567,
+            sender_encode_done_time_micros: 0,
+            sender_send_time_micros: 0,
             server_receive_time_micros: 0,
             server_send_time_micros: 0,
             codec: CodecId::H264,

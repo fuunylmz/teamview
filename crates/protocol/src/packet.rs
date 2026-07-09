@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PROTOCOL_VERSION, codec::CodecId};
 
-pub const MEDIA_PACKET_HEADER_LEN: usize = 57;
+pub const MEDIA_PACKET_HEADER_LEN: usize = 73;
 pub const DEFAULT_DATAGRAM_PAYLOAD_TARGET: usize = 1_150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +76,8 @@ pub struct MediaPacketHeader {
     pub fragment_count: u16,
     pub media_timestamp: u64,
     pub sender_capture_time_micros: u64,
+    pub sender_encode_done_time_micros: u64,
+    pub sender_send_time_micros: u64,
     pub server_receive_time_micros: u64,
     pub server_send_time_micros: u64,
     pub codec: CodecId,
@@ -102,6 +104,8 @@ impl MediaPacketHeader {
             fragment_count: 1,
             media_timestamp: 0,
             sender_capture_time_micros: 0,
+            sender_encode_done_time_micros: 0,
+            sender_send_time_micros: 0,
             server_receive_time_micros: 0,
             server_send_time_micros: 0,
             codec,
@@ -122,6 +126,8 @@ impl MediaPacketHeader {
         dst.put_u16(self.fragment_count);
         dst.put_u64(self.media_timestamp);
         dst.put_u64(self.sender_capture_time_micros);
+        dst.put_u64(self.sender_encode_done_time_micros);
+        dst.put_u64(self.sender_send_time_micros);
         dst.put_u64(self.server_receive_time_micros);
         dst.put_u64(self.server_send_time_micros);
         dst.put_u8(self.codec.into());
@@ -163,6 +169,8 @@ impl MediaPacketHeader {
         let fragment_count = buf.get_u16();
         let media_timestamp = buf.get_u64();
         let sender_capture_time_micros = buf.get_u64();
+        let sender_encode_done_time_micros = buf.get_u64();
+        let sender_send_time_micros = buf.get_u64();
         let server_receive_time_micros = buf.get_u64();
         let server_send_time_micros = buf.get_u64();
         let codec = CodecId::try_from(buf.get_u8())
@@ -181,6 +189,8 @@ impl MediaPacketHeader {
             fragment_count,
             media_timestamp,
             sender_capture_time_micros,
+            sender_encode_done_time_micros,
+            sender_send_time_micros,
             server_receive_time_micros,
             server_send_time_micros,
             codec,
@@ -336,6 +346,8 @@ mod tests {
             fragment_count: 2,
             media_timestamp: 123_456,
             sender_capture_time_micros: 654_321,
+            sender_encode_done_time_micros: 655_000,
+            sender_send_time_micros: 656_000,
             server_receive_time_micros: 777_000,
             server_send_time_micros: 778_000,
             codec: CodecId::H264,

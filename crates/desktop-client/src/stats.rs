@@ -80,9 +80,13 @@ pub struct ClientMediaStats {
     pub dropped_frames: u64,
     pub jitter_buffer_ms: u16,
     pub estimated_latency_ms: u16,
+    pub sender_encode_ms: u16,
+    pub sender_send_ms: u16,
     pub server_queue_ms: u16,
     last_sequence_number: Option<u32>,
     reassembly_samples_ms: LatencySamples,
+    sender_encode_samples_ms: LatencySamples,
+    sender_send_samples_ms: LatencySamples,
     server_queue_samples_ms: LatencySamples,
     decode_samples_ms: LatencySamples,
     render_samples_ms: LatencySamples,
@@ -147,6 +151,45 @@ impl ClientMediaStats {
             .saturating_div(1_000)
             .min(u16::MAX as u64) as u16;
         self.estimated_latency_ms = latency_ms;
+    }
+
+    pub fn record_sender_timestamps(
+        &mut self,
+        sender_capture_time_micros: u64,
+        sender_encode_done_time_micros: u64,
+        sender_send_time_micros: u64,
+    ) {
+        if sender_capture_time_micros == 0 {
+            return;
+        }
+        if sender_encode_done_time_micros >= sender_capture_time_micros {
+            let encode_ms =
+                micros_delta_to_millis(sender_capture_time_micros, sender_encode_done_time_micros);
+            self.sender_encode_ms = encode_ms;
+            self.sender_encode_samples_ms.push(encode_ms);
+        }
+        if sender_send_time_micros >= sender_capture_time_micros {
+            let send_ms =
+                micros_delta_to_millis(sender_capture_time_micros, sender_send_time_micros);
+            self.sender_send_ms = send_ms;
+            self.sender_send_samples_ms.push(send_ms);
+        }
+    }
+
+    pub fn sender_encode_ms_p50(self) -> u16 {
+        self.sender_encode_samples_ms.percentile(50)
+    }
+
+    pub fn sender_encode_ms_p95(self) -> u16 {
+        self.sender_encode_samples_ms.percentile(95)
+    }
+
+    pub fn sender_send_ms_p50(self) -> u16 {
+        self.sender_send_samples_ms.percentile(50)
+    }
+
+    pub fn sender_send_ms_p95(self) -> u16 {
+        self.sender_send_samples_ms.percentile(95)
     }
 
     pub fn record_server_queue_latency(
@@ -251,6 +294,13 @@ fn duration_to_millis(duration: Duration) -> u16 {
     duration.as_millis().min(u16::MAX as u128) as u16
 }
 
+fn micros_delta_to_millis(start_micros: u64, end_micros: u64) -> u16 {
+    end_micros
+        .saturating_sub(start_micros)
+        .saturating_div(1_000)
+        .min(u16::MAX as u64) as u16
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
@@ -287,6 +337,7 @@ mod tests {
         stats.record_dropped_frame();
         stats.jitter_buffer_ms = 42;
         stats.estimated_latency_ms = 88;
+        stats.record_sender_timestamps(900_000, 903_000, 905_000);
         stats.record_server_queue_latency(1_000_000, 1_005_000);
 
         let report = stats.to_viewer_report(7, 9);
@@ -305,6 +356,12 @@ mod tests {
         assert_eq!(report.dropped_frames, 1);
         assert_eq!(report.jitter_buffer_ms, 42);
         assert_eq!(report.estimated_latency_ms, 88);
+        assert_eq!(stats.sender_encode_ms, 3);
+        assert_eq!(stats.sender_send_ms, 5);
+        assert_eq!(stats.sender_encode_ms_p50(), 3);
+        assert_eq!(stats.sender_encode_ms_p95(), 3);
+        assert_eq!(stats.sender_send_ms_p50(), 5);
+        assert_eq!(stats.sender_send_ms_p95(), 5);
         assert_eq!(stats.server_queue_ms, 5);
         assert_eq!(stats.server_queue_ms_p50(), 5);
         assert_eq!(stats.server_queue_ms_p95(), 5);
@@ -330,6 +387,23 @@ mod tests {
         stats.record_estimated_latency(2_000_000, 1_123_456);
 
         assert_eq!(stats.estimated_latency_ms, 42);
+    }
+
+    #[test]
+    fn media_stats_ignores_missing_or_reversed_sender_timestamps() {
+        let mut stats = ClientMediaStats {
+            sender_encode_ms: 4,
+            sender_send_ms: 6,
+            ..Default::default()
+        };
+
+        stats.record_sender_timestamps(0, 2_000, 3_000);
+        stats.record_sender_timestamps(2_000, 1_000, 1_500);
+
+        assert_eq!(stats.sender_encode_ms, 4);
+        assert_eq!(stats.sender_send_ms, 6);
+        assert_eq!(stats.sender_encode_ms_p50(), 0);
+        assert_eq!(stats.sender_send_ms_p50(), 0);
     }
 
     #[test]
