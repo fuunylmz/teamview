@@ -21,6 +21,57 @@ impl ClientPipelineStats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BroadcasterTimingSnapshot {
+    pub capture_ms_p50: u16,
+    pub capture_ms_p95: u16,
+    pub encode_ms_p50: u16,
+    pub encode_ms_p95: u16,
+    pub packetize_ms_p50: u16,
+    pub packetize_ms_p95: u16,
+    pub send_ms_p50: u16,
+    pub send_ms_p95: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClientBroadcasterStats {
+    capture_samples_ms: LatencySamples,
+    encode_samples_ms: LatencySamples,
+    packetize_samples_ms: LatencySamples,
+    send_samples_ms: LatencySamples,
+}
+
+impl ClientBroadcasterStats {
+    pub fn record_capture_duration(&mut self, duration: Duration) {
+        self.capture_samples_ms.push(duration_to_millis(duration));
+    }
+
+    pub fn record_encode_duration(&mut self, duration: Duration) {
+        self.encode_samples_ms.push(duration_to_millis(duration));
+    }
+
+    pub fn record_packetize_duration(&mut self, duration: Duration) {
+        self.packetize_samples_ms.push(duration_to_millis(duration));
+    }
+
+    pub fn record_send_duration(&mut self, duration: Duration) {
+        self.send_samples_ms.push(duration_to_millis(duration));
+    }
+
+    pub fn timing_snapshot(self) -> BroadcasterTimingSnapshot {
+        BroadcasterTimingSnapshot {
+            capture_ms_p50: self.capture_samples_ms.percentile(50),
+            capture_ms_p95: self.capture_samples_ms.percentile(95),
+            encode_ms_p50: self.encode_samples_ms.percentile(50),
+            encode_ms_p95: self.encode_samples_ms.percentile(95),
+            packetize_ms_p50: self.packetize_samples_ms.percentile(50),
+            packetize_ms_p95: self.packetize_samples_ms.percentile(95),
+            send_ms_p50: self.send_samples_ms.percentile(50),
+            send_ms_p95: self.send_samples_ms.percentile(95),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClientMediaStats {
     pub received_packets: u64,
     pub lost_packets: u64,
@@ -238,6 +289,36 @@ mod tests {
         stats.record_estimated_latency(2_000_000, 1_123_456);
 
         assert_eq!(stats.estimated_latency_ms, 42);
+    }
+
+    #[test]
+    fn broadcaster_stats_builds_timing_snapshot() {
+        let mut stats = ClientBroadcasterStats::default();
+        stats.record_capture_duration(Duration::from_millis(2));
+        stats.record_capture_duration(Duration::from_millis(6));
+        stats.record_encode_duration(Duration::from_millis(3));
+        stats.record_encode_duration(Duration::from_millis(9));
+        stats.record_packetize_duration(Duration::from_millis(1));
+        stats.record_send_duration(Duration::from_millis(4));
+        stats.record_send_duration(Duration::from_millis(5));
+
+        let snapshot = stats.timing_snapshot();
+
+        assert_eq!(snapshot.capture_ms_p50, 6);
+        assert_eq!(snapshot.capture_ms_p95, 6);
+        assert_eq!(snapshot.encode_ms_p50, 9);
+        assert_eq!(snapshot.encode_ms_p95, 9);
+        assert_eq!(snapshot.packetize_ms_p50, 1);
+        assert_eq!(snapshot.packetize_ms_p95, 1);
+        assert_eq!(snapshot.send_ms_p50, 5);
+        assert_eq!(snapshot.send_ms_p95, 5);
+    }
+
+    #[test]
+    fn broadcaster_stats_empty_snapshot_is_zero() {
+        let snapshot = ClientBroadcasterStats::default().timing_snapshot();
+
+        assert_eq!(snapshot, BroadcasterTimingSnapshot::default());
     }
 
     #[test]

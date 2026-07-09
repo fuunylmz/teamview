@@ -38,7 +38,7 @@ use crate::{
     decode::{FrameReassemblyBuffer, VideoDecoder, h264::H264Decoder},
     encode::{VideoEncoder, h264::H264Encoder},
     playback::{FramePlayback, VideoPlayback},
-    stats::ClientMediaStats,
+    stats::{ClientBroadcasterStats, ClientMediaStats},
     transport::quic::{build_client_endpoint, connect_control_client},
 };
 
@@ -593,35 +593,53 @@ async fn run_synthetic_screen_broadcaster_media(
     let mut active_fps = args.media_fps;
     let mut sent_packets = 0_u64;
     let mut next_sequence_number = 1_u32;
+    let mut timing = ClientBroadcasterStats::default();
     for frame_id in 1..=media_frames {
         ticker.tick().await;
+        let capture_start = Instant::now();
         let Some(captured) = capture_screen_frame(&mut capture, args)? else {
             continue;
         };
+        let capture_duration = capture_start.elapsed();
+        timing.record_capture_duration(capture_duration);
         let captured_width = captured.width;
         let captured_height = captured.height;
+        let encode_start = Instant::now();
         let Some(frame) = encoder.encode(captured, args.stream_id)? else {
+            timing.record_encode_duration(encode_start.elapsed());
             continue;
         };
+        let encode_duration = encode_start.elapsed();
+        timing.record_encode_duration(encode_duration);
+        let packetize_start = Instant::now();
         let packets = packetize_frame_for_datagram_target(
             &frame,
             next_sequence_number,
             args.max_datagram_payload,
         )?;
+        let packetize_duration = packetize_start.elapsed();
+        timing.record_packetize_duration(packetize_duration);
         next_sequence_number = next_sequence_number.wrapping_add(packets.len() as u32);
+        let send_start = Instant::now();
         for packet in &packets {
             control.send_media_packet(packet)?;
             sent_packets += 1;
         }
+        let send_duration = send_start.elapsed();
+        timing.record_send_duration(send_duration);
         println!(
-            "media-send frame_id={} fragments={} bytes={} target_bytes={} screen_input={:?} capture_width={} capture_height={}",
+            "media-send frame_id={} fragments={} bytes={} target_bytes={} screen_input={:?} capture_width={} capture_height={} capture_ms={} encode_ms={} packetize_ms={} send_ms={}",
             frame.frame_id,
             packets.len(),
             frame.bytes.len(),
             args.media_frame_bytes,
             args.screen_input,
             captured_width,
-            captured_height
+            captured_height,
+            millis_for_log(capture_duration),
+            millis_for_log(encode_duration),
+            millis_for_log(packetize_duration),
+            millis_for_log(send_duration)
         );
         if args.feedback_interval_frames > 0
             && frame_id.is_multiple_of(args.feedback_interval_frames)
@@ -652,9 +670,21 @@ async fn run_synthetic_screen_broadcaster_media(
         stream_metrics.subscriber_count,
         stream_metrics.last_ingress_time_micros
     );
+    let timing = timing.timing_snapshot();
     println!(
-        "media-summary role=broadcaster frames={} packets={} fps={} run_ms={}",
-        media_frames, sent_packets, args.media_fps, args.media_run_ms
+        "media-summary role=broadcaster frames={} packets={} fps={} run_ms={} capture_ms_p50={} capture_ms_p95={} encode_ms_p50={} encode_ms_p95={} packetize_ms_p50={} packetize_ms_p95={} send_ms_p50={} send_ms_p95={}",
+        media_frames,
+        sent_packets,
+        args.media_fps,
+        args.media_run_ms,
+        timing.capture_ms_p50,
+        timing.capture_ms_p95,
+        timing.encode_ms_p50,
+        timing.encode_ms_p95,
+        timing.packetize_ms_p50,
+        timing.packetize_ms_p95,
+        timing.send_ms_p50,
+        timing.send_ms_p95
     );
     if args.media_end_linger_ms > 0 {
         tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
@@ -695,26 +725,44 @@ async fn run_synthetic_voice_broadcaster_media(
     let mut active_fps = args.media_fps;
     let mut sent_packets = 0_u64;
     let mut next_sequence_number = 1_u32;
+    let mut timing = ClientBroadcasterStats::default();
     for frame_id in 1..=media_frames {
         ticker.tick().await;
-        let frame = encoder.encode(frame_id, unix_time_micros(), args.stream_id)?;
+        let capture_start = Instant::now();
+        let capture_time_micros = unix_time_micros();
+        let capture_duration = capture_start.elapsed();
+        timing.record_capture_duration(capture_duration);
+        let encode_start = Instant::now();
+        let frame = encoder.encode(frame_id, capture_time_micros, args.stream_id)?;
+        let encode_duration = encode_start.elapsed();
+        timing.record_encode_duration(encode_duration);
+        let packetize_start = Instant::now();
         let packets = packetize_frame_with_type_for_datagram_target(
             &frame,
             PacketType::Audio,
             next_sequence_number,
             args.max_datagram_payload,
         )?;
+        let packetize_duration = packetize_start.elapsed();
+        timing.record_packetize_duration(packetize_duration);
         next_sequence_number = next_sequence_number.wrapping_add(packets.len() as u32);
+        let send_start = Instant::now();
         for packet in &packets {
             control.send_media_packet(packet)?;
             sent_packets += 1;
         }
+        let send_duration = send_start.elapsed();
+        timing.record_send_duration(send_duration);
         println!(
-            "audio-send frame_id={} fragments={} bytes={} target_bytes={}",
+            "audio-send frame_id={} fragments={} bytes={} target_bytes={} capture_ms={} encode_ms={} packetize_ms={} send_ms={}",
             frame.frame_id,
             packets.len(),
             frame.bytes.len(),
-            encoder.config.synthetic_payload_bytes
+            encoder.config.synthetic_payload_bytes,
+            millis_for_log(capture_duration),
+            millis_for_log(encode_duration),
+            millis_for_log(packetize_duration),
+            millis_for_log(send_duration)
         );
         if args.feedback_interval_frames > 0
             && frame_id.is_multiple_of(args.feedback_interval_frames)
@@ -736,9 +784,21 @@ async fn run_synthetic_voice_broadcaster_media(
         stream_metrics.subscriber_count,
         stream_metrics.last_ingress_time_micros
     );
+    let timing = timing.timing_snapshot();
     println!(
-        "media-summary role=broadcaster kind=voice frames={} packets={} fps={} run_ms={}",
-        media_frames, sent_packets, args.media_fps, args.media_run_ms
+        "media-summary role=broadcaster kind=voice frames={} packets={} fps={} run_ms={} capture_ms_p50={} capture_ms_p95={} encode_ms_p50={} encode_ms_p95={} packetize_ms_p50={} packetize_ms_p95={} send_ms_p50={} send_ms_p95={}",
+        media_frames,
+        sent_packets,
+        args.media_fps,
+        args.media_run_ms,
+        timing.capture_ms_p50,
+        timing.capture_ms_p95,
+        timing.encode_ms_p50,
+        timing.encode_ms_p95,
+        timing.packetize_ms_p50,
+        timing.packetize_ms_p95,
+        timing.send_ms_p50,
+        timing.send_ms_p95
     );
     if args.media_end_linger_ms > 0 {
         tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
