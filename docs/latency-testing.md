@@ -154,6 +154,18 @@ Example output:
 quic-sample-forward frames=2 fragments=14 reassembled=4 delivered=28 dropped=0
 ```
 
+To validate channel-level screen plus voice routing in one in-process relay/client run:
+
+```bash
+cargo run -p load-test -- --mode quic-channel-media --viewers 2 --packets 2 --max-payload 700
+```
+
+Expected output:
+
+```text
+quic-channel-media screen_frames=2 voice_frames=2 screen_fragments=14 voice_fragments=2 screen_reassembled=4 voice_reassembled=4 delivered=32 dropped=0
+```
+
 ## Desktop synthetic session checks
 
 The desktop client can run a paced synthetic media session over the relay. During startup it sends multiple `TimeSync` samples, logs each sample's relay RTT and `clock_offset_micros`, and uses the lowest-RTT sample for initial media timing. During media runs it refreshes the relay-clock offset every `--time-sync-refresh-ms` milliseconds, defaulting to 5000 and allowing `0` to disable refreshes. The broadcaster uses a frame interval derived from `--media-fps`, stamps synthetic captures, copies its current relay-clock offset estimate into media packets, stamps encode completion and datagram send time with Unix epoch microseconds, keeps sequence numbers continuous across fragments, records capture/encode/packetize/send timing percentiles, and lingers briefly after finite sends so in-flight datagrams can drain. The relay stamps forwarded datagrams with server receive/send timestamps. The viewer reassembles frames with a local incomplete-frame media-time cap from `--jitter-buffer-max-ms`, defaulting to 150, parses synthetic Annex B H.264-like NAL units into BGRA preview frames, renders them into a latest-frame playback sink or optional native Win32 preview window, estimates capture-to-viewer latency from `sender_capture_time_micros`, computes `calibrated_latency_ms` from sender and viewer relay-clock offsets, logs publisher capture-to-encode/send timing and relay receive-to-send queue delay, tracks packet loss from sequence gaps, records reassembly/decode/render timing percentiles and render FPS, periodically sends `ViewerStats` over the control stream, and sends control-plane keepalives while waiting for delayed media.

@@ -123,6 +123,8 @@ Expected output includes `room ...`, `stream ...`, and `participant ... muted=..
 
 `--channel-name` and `--channel-id` are the preferred CLI names for channel media sessions. The older `--room-name` and `--room-id` flags remain supported as protocol-compatible aliases.
 
+The first frontend workspace is a static channel console at `apps/desktop-ui/index.html`. It models the desktop channel UI for screen sharing, voice controls, participant state, and channel switching while the native Rust media path remains the source of truth for relay/client behavior.
+
 To exercise live primary-monitor acquisition through the desktop broadcaster, start a relay and run one live screen frame:
 
 ```bash
@@ -159,6 +161,14 @@ Expected output shows fragmented synthetic H.264-like frames sent through the re
 ```text
 quic-sample-forward frames=2 fragments=14 reassembled=4 delivered=28 dropped=0
 ```
+
+For an in-process relay/client channel smoke that publishes both screen and voice streams through one channel:
+
+```bash
+cargo run -p load-test -- --mode quic-channel-media --viewers 2 --packets 2 --max-payload 700
+```
+
+Expected output includes separate screen and voice reassembly counts, for example `quic-channel-media screen_frames=2 voice_frames=2 ... screen_reassembled=4 voice_reassembled=4 ... dropped=0`.
 
 For a local desktop-client synthetic media session, start the relay, then start a broadcaster and viewer in separate terminals:
 

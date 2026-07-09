@@ -14,9 +14,13 @@ use teamview_protocol::{
     control::UserId,
     control::{
         ClientControl, ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind, PublishStream,
-        ServerControl, SubscribeStream, decode_server_envelope, encode_client_envelope,
+        ServerControl, StreamConfig, SubscribeStream, decode_server_envelope,
+        encode_client_envelope,
     },
-    frame::{EncodedFrame, packetize_frame, packetize_frame_for_datagram_target, reassemble_frame},
+    frame::{
+        EncodedFrame, packetize_frame, packetize_frame_for_datagram_target,
+        packetize_frame_with_type_for_datagram_target, reassemble_frame,
+    },
     packet::{
         DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, MediaPacketHeader, PacketFlags, PacketType,
     },
@@ -28,6 +32,7 @@ enum Mode {
     Fanout,
     SampleForward,
     QuicSampleForward,
+    QuicChannelMedia,
 }
 
 #[derive(Debug, Parser)]
@@ -98,6 +103,21 @@ async fn main() -> anyhow::Result<()> {
                 result.total_dropped
             );
         }
+        Mode::QuicChannelMedia => {
+            let result = run_quic_channel_media(&args).await?;
+            info!(?args, ?result, "load-test QUIC channel media complete");
+            println!(
+                "quic-channel-media screen_frames={} voice_frames={} screen_fragments={} voice_fragments={} screen_reassembled={} voice_reassembled={} delivered={} dropped={}",
+                result.screen_frames,
+                result.voice_frames,
+                result.screen_fragments,
+                result.voice_fragments,
+                result.screen_reassembled_frames,
+                result.voice_reassembled_frames,
+                result.total_delivered,
+                result.total_dropped
+            );
+        }
     }
 
     Ok(())
@@ -147,6 +167,18 @@ struct SampleForwardResult {
     frames: u32,
     fragments: u64,
     reassembled_frames: u64,
+    total_delivered: u64,
+    total_dropped: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ChannelMediaResult {
+    screen_frames: u32,
+    voice_frames: u32,
+    screen_fragments: u64,
+    voice_fragments: u64,
+    screen_reassembled_frames: u64,
+    voice_reassembled_frames: u64,
     total_delivered: u64,
     total_dropped: u64,
 }
@@ -340,6 +372,272 @@ async fn run_quic_sample_forward(args: &Args) -> anyhow::Result<SampleForwardRes
 
     Ok(result)
 }
+
+async fn run_quic_channel_media(args: &Args) -> anyhow::Result<ChannelMediaResult> {
+    let server = build_server_endpoint("127.0.0.1:0")?;
+    let server_addr = server.local_addr()?;
+    let runtime = ControlRuntime::new();
+    let server_task = tokio::spawn(async move {
+        runtime.serve_endpoint(server).await;
+    });
+
+    let publisher_endpoint = build_client_endpoint()?;
+    let publisher = publisher_endpoint
+        .connect(server_addr, "localhost")?
+        .await
+        .context("publisher failed to connect")?;
+
+    let mut viewer_endpoints = Vec::new();
+    let mut viewers = Vec::new();
+    for _ in 0..args.viewers {
+        let endpoint = build_client_endpoint()?;
+        let connection = endpoint
+            .connect(server_addr, "localhost")?
+            .await
+            .context("viewer failed to connect")?;
+        viewer_endpoints.push(endpoint);
+        viewers.push(connection);
+    }
+
+    send_control_request(
+        &publisher,
+        ClientEnvelope::new(
+            1,
+            ClientControl::Hello(Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "load-test-channel-publisher".to_owned(),
+            }),
+        ),
+    )
+    .await?;
+    let created = send_control_request(
+        &publisher,
+        ClientEnvelope::new(
+            2,
+            ClientControl::CreateRoom(CreateRoom {
+                name: "load-test-channel".to_owned(),
+            }),
+        ),
+    )
+    .await?;
+    let room_id = match created.message {
+        ServerControl::RoomCreated(room) => room.room_id,
+        other => anyhow::bail!("unexpected create room response: {other:?}"),
+    };
+    send_control_request(
+        &publisher,
+        ClientEnvelope::new(3, ClientControl::JoinRoom(JoinRoom { room_id })),
+    )
+    .await?;
+    publish_channel_streams(&publisher, room_id).await?;
+
+    for (index, viewer) in viewers.iter().enumerate() {
+        send_control_request(
+            viewer,
+            ClientEnvelope::new(
+                1,
+                ClientControl::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_name: format!("load-test-channel-viewer-{index}"),
+                }),
+            ),
+        )
+        .await?;
+        send_control_request(
+            viewer,
+            ClientEnvelope::new(2, ClientControl::JoinRoom(JoinRoom { room_id })),
+        )
+        .await?;
+        subscribe_channel_streams(viewer, room_id).await?;
+    }
+
+    let mut result = ChannelMediaResult::default();
+    let mut screen_sequence_number = 1_u32;
+    let mut voice_sequence_number = 10_000_u32;
+    for frame_index in 0..args.packets {
+        let screen_frame = sample_h264_frame(frame_index + 1);
+        let voice_frame = sample_opus_frame(frame_index + 1);
+        let screen_packets = packetize_frame_for_datagram_target(
+            &screen_frame,
+            screen_sequence_number,
+            args.max_payload,
+        )?;
+        let voice_packets = packetize_frame_with_type_for_datagram_target(
+            &voice_frame,
+            PacketType::Audio,
+            voice_sequence_number,
+            args.max_payload,
+        )?;
+        screen_sequence_number = screen_sequence_number.wrapping_add(screen_packets.len() as u32);
+        voice_sequence_number = voice_sequence_number.wrapping_add(voice_packets.len() as u32);
+        result.screen_frames += 1;
+        result.voice_frames += 1;
+        result.screen_fragments += screen_packets.len() as u64;
+        result.voice_fragments += voice_packets.len() as u64;
+
+        for packet in screen_packets.iter().chain(voice_packets.iter()) {
+            publisher.send_datagram(packet.encode()?)?;
+        }
+
+        for viewer in &viewers {
+            let (received_screen, received_voice) =
+                receive_channel_frame_packets(viewer, screen_packets.len(), voice_packets.len())
+                    .await?;
+            let reassembled_screen = reassemble_frame(received_screen)?;
+            let reassembled_voice = reassemble_frame(received_voice)?;
+            if reassembled_screen.bytes != screen_frame.bytes {
+                anyhow::bail!(
+                    "screen frame bytes differ for frame {}",
+                    screen_frame.frame_id
+                );
+            }
+            if reassembled_voice.bytes != voice_frame.bytes {
+                anyhow::bail!(
+                    "voice frame bytes differ for frame {}",
+                    voice_frame.frame_id
+                );
+            }
+            if reassembled_screen.codec != CodecId::H264 || reassembled_voice.codec != CodecId::Opus
+            {
+                anyhow::bail!(
+                    "unexpected codecs after reassembly: screen={:?} voice={:?}",
+                    reassembled_screen.codec,
+                    reassembled_voice.codec
+                );
+            }
+            result.screen_reassembled_frames += 1;
+            result.voice_reassembled_frames += 1;
+            result.total_delivered += (screen_packets.len() + voice_packets.len()) as u64;
+        }
+    }
+
+    publisher.close(0_u32.into(), b"done");
+    for viewer in viewers {
+        viewer.close(0_u32.into(), b"done");
+    }
+    drop(viewer_endpoints);
+    drop(publisher_endpoint);
+    server_task.abort();
+
+    Ok(result)
+}
+
+async fn publish_channel_streams(connection: &Connection, room_id: u64) -> anyhow::Result<()> {
+    send_control_request(
+        connection,
+        ClientEnvelope::new(
+            4,
+            ClientControl::PublishStream(PublishStream {
+                room_id,
+                stream_id: 1,
+                codec: CodecId::H264,
+                media_kind: MediaKind::Screen,
+            }),
+        ),
+    )
+    .await?;
+    send_control_request(
+        connection,
+        ClientEnvelope::new(
+            5,
+            ClientControl::SetStreamConfig(StreamConfig {
+                room_id,
+                stream_id: 1,
+                codec: CodecId::H264,
+                width: 1280,
+                height: 720,
+                frames_per_second: 30,
+                timebase_hz: 90_000,
+            }),
+        ),
+    )
+    .await?;
+    send_control_request(
+        connection,
+        ClientEnvelope::new(
+            6,
+            ClientControl::PublishStream(PublishStream {
+                room_id,
+                stream_id: 2,
+                codec: CodecId::Opus,
+                media_kind: MediaKind::Voice,
+            }),
+        ),
+    )
+    .await?;
+    send_control_request(
+        connection,
+        ClientEnvelope::new(
+            7,
+            ClientControl::SetStreamConfig(StreamConfig {
+                room_id,
+                stream_id: 2,
+                codec: CodecId::Opus,
+                width: 0,
+                height: 0,
+                frames_per_second: 50,
+                timebase_hz: 48_000,
+            }),
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn subscribe_channel_streams(connection: &Connection, room_id: u64) -> anyhow::Result<()> {
+    send_control_request(
+        connection,
+        ClientEnvelope::new(
+            3,
+            ClientControl::SubscribeStream(SubscribeStream {
+                room_id,
+                stream_id: 1,
+            }),
+        ),
+    )
+    .await?;
+    send_control_request(
+        connection,
+        ClientEnvelope::new(
+            4,
+            ClientControl::SubscribeStream(SubscribeStream {
+                room_id,
+                stream_id: 2,
+            }),
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn receive_channel_frame_packets(
+    viewer: &Connection,
+    expected_screen_packets: usize,
+    expected_voice_packets: usize,
+) -> anyhow::Result<(Vec<MediaPacket>, Vec<MediaPacket>)> {
+    let expected_packets = expected_screen_packets + expected_voice_packets;
+    let mut screen_packets = Vec::with_capacity(expected_screen_packets);
+    let mut voice_packets = Vec::with_capacity(expected_voice_packets);
+    while screen_packets.len() + voice_packets.len() < expected_packets {
+        let bytes = tokio::time::timeout(Duration::from_secs(2), viewer.read_datagram())
+            .await
+            .context("timed out waiting for forwarded channel datagram")??;
+        let packet = MediaPacket::decode(&bytes)?;
+        match (packet.header.room_stream_id, packet.header.packet_type) {
+            (1, PacketType::Video) => screen_packets.push(packet),
+            (2, PacketType::Audio) => voice_packets.push(packet),
+            (stream_id, packet_type) => {
+                anyhow::bail!(
+                    "unexpected channel media packet stream_id={} packet_type={:?}",
+                    stream_id,
+                    packet_type
+                );
+            }
+        }
+    }
+    Ok((screen_packets, voice_packets))
+}
+
 fn sample_h264_frame(frame_id: u32) -> EncodedFrame {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f]);
@@ -361,6 +659,34 @@ fn sample_h264_frame(frame_id: u32) -> EncodedFrame {
         server_send_time_micros: 0,
         codec: CodecId::H264,
         is_keyframe: frame_id == 1,
+        bytes: Bytes::from(bytes),
+    }
+}
+
+fn sample_opus_frame(frame_id: u32) -> EncodedFrame {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"TVO1");
+    bytes.extend_from_slice(&frame_id.to_le_bytes());
+    bytes.extend_from_slice(&48_000_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&960_u16.to_le_bytes());
+    bytes.extend_from_slice(&(frame_id as u64 * 20_000).to_le_bytes());
+    for idx in 0..256 {
+        bytes.push(frame_id.wrapping_mul(13).wrapping_add(idx).to_le_bytes()[0]);
+    }
+
+    EncodedFrame {
+        room_stream_id: 2,
+        frame_id,
+        media_timestamp: frame_id as u64 * 960,
+        sender_capture_time_micros: frame_id as u64 * 20_000,
+        sender_clock_offset_micros: 0,
+        sender_encode_done_time_micros: 0,
+        sender_send_time_micros: 0,
+        server_receive_time_micros: 0,
+        server_send_time_micros: 0,
+        codec: CodecId::Opus,
+        is_keyframe: false,
         bytes: Bytes::from(bytes),
     }
 }
@@ -516,6 +842,28 @@ mod tests {
         assert_eq!(result.frames, 2);
         assert_eq!(result.reassembled_frames, 4);
         assert!(result.fragments > result.frames as u64);
+        assert_eq!(result.total_dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn quic_channel_media_forwards_screen_and_voice() {
+        let args = Args {
+            mode: Mode::QuicChannelMedia,
+            publishers: 1,
+            viewers: 2,
+            packets: 2,
+            media_duration_ms: 20,
+            max_payload: 700,
+            include_slow_viewer: false,
+        };
+
+        let result = run_quic_channel_media(&args).await.unwrap();
+
+        assert_eq!(result.screen_frames, 2);
+        assert_eq!(result.voice_frames, 2);
+        assert_eq!(result.screen_reassembled_frames, 4);
+        assert_eq!(result.voice_reassembled_frames, 4);
+        assert!(result.screen_fragments > result.screen_frames as u64);
         assert_eq!(result.total_dropped, 0);
     }
 
