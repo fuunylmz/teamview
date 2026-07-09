@@ -80,8 +80,30 @@ cargo run -p desktop-client -- --mode broadcaster --capture-source primary-monit
 
 On Windows, expected output includes `capture_supported=true`.
 
+## Synthetic QUIC forwarding checks
+
+The current relay/client smoke path validates QUIC datagram media forwarding with synthetic H.264-like frames before live capture, hardware encoding, native decoding, or rendering exists.
+
+Run:
+
+```bash
+cargo run -p load-test -- --mode quic-sample-forward --viewers 2 --packets 2 --max-payload 700
+```
+
+Expected behavior:
+
+- A publisher creates a room, publishes a screen stream, and sends fragmented synthetic frames as QUIC datagrams.
+- Each viewer joins, subscribes, receives every forwarded fragment, and reassembles each frame byte-for-byte.
+- Relay forwarding rejects media from non-publishers and packet types/codecs that do not match the published stream.
+
+Example output:
+
+```text
+quic-sample-forward frames=2 fragments=14 reassembled=4 delivered=28 dropped=0
+```
+
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, and capture queue behavior. Later milestones add real capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
+Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, and synthetic QUIC forwarding behavior. Later milestones add real capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.

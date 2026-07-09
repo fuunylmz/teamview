@@ -290,6 +290,7 @@ name = "desktop-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "quinn",
  "rustls",
@@ -500,8 +501,11 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "quinn",
  "relay-server",
+ "rustls",
  "teamview-protocol",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

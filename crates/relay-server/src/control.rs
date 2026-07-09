@@ -4,8 +4,8 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     control::{
         ClientControl, ClientEnvelope, ControlError, HelloAccepted, RoomCreated, RoomId,
-        RoomJoined, RoomLeft, ServerControl, ServerEnvelope, StreamPublished, StreamSubscribed,
-        StreamUnsubscribed, UserId,
+        RoomJoined, RoomLeft, ServerControl, ServerEnvelope, StreamId, StreamPublished,
+        StreamSubscribed, StreamUnsubscribed, UserId,
     },
 };
 
@@ -67,15 +67,20 @@ impl ControlState {
                 }
                 None => ServerControl::Error(ControlError::new("not_ready", "send Hello first")),
             },
-            ClientControl::CreateRoom(create) => {
-                let room_id = self.next_room_id;
-                self.next_room_id += 1;
-                self.rooms.insert(room_id, Room::new(room_id, &create.name));
-                ServerControl::RoomCreated(RoomCreated {
-                    room_id,
-                    name: create.name,
-                })
-            }
+            ClientControl::CreateRoom(create) => match session.user_id {
+                Some(_) => {
+                    let room_id = self.next_room_id;
+                    self.next_room_id += 1;
+                    self.rooms.insert(room_id, Room::new(room_id, &create.name));
+                    ServerControl::RoomCreated(RoomCreated {
+                        room_id,
+                        name: create.name,
+                    })
+                }
+                None => {
+                    ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"))
+                }
+            },
             ClientControl::JoinRoom(join) => match self.rooms.get_mut(&join.room_id) {
                 Some(room) => match session.user_id {
                     Some(user_id) => {
@@ -94,31 +99,43 @@ impl ControlState {
                     ServerControl::Error(ControlError::new("room_not_found", "room does not exist"))
                 }
             },
-            ClientControl::PublishStream(publish) => match self.rooms.get_mut(&publish.room_id) {
-                Some(room) => match session.user_id {
-                    Some(user_id) if room.participants.contains(&user_id) => {
-                        room.publish_stream(PublishedStream {
-                            stream_id: publish.stream_id,
-                            publisher_id: user_id,
-                        });
-                        ServerControl::StreamPublished(StreamPublished {
-                            room_id: publish.room_id,
-                            stream_id: publish.stream_id,
-                        })
+            ClientControl::PublishStream(publish) => {
+                if self.publisher_for_stream(publish.stream_id).is_some() {
+                    ServerControl::Error(ControlError::new(
+                        "stream_id_conflict",
+                        "stream id is already published",
+                    ))
+                } else {
+                    match self.rooms.get_mut(&publish.room_id) {
+                        Some(room) => match session.user_id {
+                            Some(user_id) if room.participants.contains(&user_id) => {
+                                room.publish_stream(PublishedStream {
+                                    stream_id: publish.stream_id,
+                                    publisher_id: user_id,
+                                    codec: publish.codec,
+                                    media_kind: publish.media_kind,
+                                });
+                                ServerControl::StreamPublished(StreamPublished {
+                                    room_id: publish.room_id,
+                                    stream_id: publish.stream_id,
+                                })
+                            }
+                            Some(_) => ServerControl::Error(ControlError::new(
+                                "not_in_room",
+                                "join room before publishing",
+                            )),
+                            None => ServerControl::Error(ControlError::new(
+                                "unauthenticated",
+                                "send Hello first",
+                            )),
+                        },
+                        None => ServerControl::Error(ControlError::new(
+                            "room_not_found",
+                            "room does not exist",
+                        )),
                     }
-                    Some(_) => ServerControl::Error(ControlError::new(
-                        "not_in_room",
-                        "join room before publishing",
-                    )),
-                    None => ServerControl::Error(ControlError::new(
-                        "unauthenticated",
-                        "send Hello first",
-                    )),
-                },
-                None => {
-                    ServerControl::Error(ControlError::new("room_not_found", "room does not exist"))
                 }
-            },
+            }
             ClientControl::SubscribeStream(subscribe) => {
                 match self.rooms.get_mut(&subscribe.room_id) {
                     Some(room) => match session.user_id {
@@ -195,6 +212,47 @@ impl ControlState {
     pub fn room(&self, room_id: RoomId) -> Option<&Room> {
         self.rooms.get(&room_id)
     }
+
+    pub fn published_stream(&self, stream_id: StreamId) -> Option<&PublishedStream> {
+        self.rooms
+            .values()
+            .find_map(|room| room.published_streams.get(&stream_id))
+    }
+
+    pub fn publisher_for_stream(&self, stream_id: StreamId) -> Option<UserId> {
+        self.published_stream(stream_id)
+            .map(|stream| stream.publisher_id)
+    }
+
+    pub fn subscribers_for_stream(&self, stream_id: StreamId) -> Vec<UserId> {
+        self.rooms
+            .values()
+            .filter(|room| room.published_streams.contains_key(&stream_id))
+            .flat_map(|room| {
+                room.subscriptions
+                    .get(&stream_id)
+                    .into_iter()
+                    .flat_map(|subscribers| subscribers.iter().copied())
+            })
+            .collect()
+    }
+
+    pub fn disconnect_user(&mut self, user_id: UserId) {
+        for room in self.rooms.values_mut() {
+            room.leave(user_id);
+            let published_by_user = room
+                .published_streams
+                .iter()
+                .filter_map(|(stream_id, stream)| {
+                    (stream.publisher_id == user_id).then_some(*stream_id)
+                })
+                .collect::<Vec<_>>();
+            for stream_id in published_by_user {
+                room.published_streams.remove(&stream_id);
+                room.subscriptions.remove(&stream_id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +266,81 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn create_room_requires_hello() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+
+        let response = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                1,
+                ClientControl::CreateRoom(CreateRoom {
+                    name: "stage1".to_owned(),
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "unauthenticated"),
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert!(state.room(1).is_none());
+    }
+
+    #[test]
+    fn duplicate_stream_id_is_rejected_across_rooms() {
+        let mut state = ControlState::new();
+        let mut first = Session::anonymous(1);
+        let mut second = Session::anonymous(2);
+        authenticate(&mut state, &mut first, "first");
+        authenticate(&mut state, &mut second, "second");
+        let first_room = create_room(&mut state, &mut first, "first-room");
+        let second_room = create_room(&mut state, &mut second, "second-room");
+        join_room(&mut state, &mut first, first_room);
+        join_room(&mut state, &mut second, second_room);
+        publish_stream(&mut state, &mut first, first_room, 9);
+
+        let duplicate = state.handle_client_envelope(
+            &mut second,
+            ClientEnvelope::new(
+                7,
+                ClientControl::PublishStream(PublishStream {
+                    room_id: second_room,
+                    stream_id: 9,
+                    codec: CodecId::H264,
+                    media_kind: MediaKind::Screen,
+                }),
+            ),
+        );
+
+        match duplicate.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "stream_id_conflict"),
+            other => panic!("unexpected duplicate stream response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disconnect_user_removes_participation_subscriptions_and_streams() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        state.disconnect_user(publisher.user_id.unwrap());
+
+        let room = state.room(room_id).unwrap();
+        assert!(!room.participants.contains(&publisher.user_id.unwrap()));
+        assert!(!room.published_streams.contains_key(&9));
+        assert!(!room.subscriptions.contains_key(&9));
+    }
 
     #[test]
     fn create_join_publish_subscribe_flow_updates_state() {
@@ -291,5 +424,86 @@ mod tests {
         assert_eq!(room.participants.len(), 2);
         assert_eq!(room.published_streams.len(), 1);
         assert_eq!(room.subscriptions.get(&9).unwrap().len(), 1);
+    }
+
+    fn authenticate(state: &mut ControlState, session: &mut Session, client_name: &str) {
+        let response = state.handle_client_envelope(
+            session,
+            ClientEnvelope::new(
+                1,
+                ClientControl::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_name: client_name.to_owned(),
+                }),
+            ),
+        );
+        assert!(matches!(response.message, ServerControl::HelloAccepted(_)));
+    }
+
+    fn create_room(state: &mut ControlState, session: &mut Session, name: &str) -> RoomId {
+        let response = state.handle_client_envelope(
+            session,
+            ClientEnvelope::new(
+                2,
+                ClientControl::CreateRoom(CreateRoom {
+                    name: name.to_owned(),
+                }),
+            ),
+        );
+        match response.message {
+            ServerControl::RoomCreated(room) => room.room_id,
+            other => panic!("unexpected create room response: {other:?}"),
+        }
+    }
+
+    fn join_room(state: &mut ControlState, session: &mut Session, room_id: RoomId) {
+        let response = state.handle_client_envelope(
+            session,
+            ClientEnvelope::new(3, ClientControl::JoinRoom(JoinRoom { room_id })),
+        );
+        assert!(matches!(response.message, ServerControl::RoomJoined(_)));
+    }
+
+    fn publish_stream(
+        state: &mut ControlState,
+        session: &mut Session,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) {
+        let response = state.handle_client_envelope(
+            session,
+            ClientEnvelope::new(
+                4,
+                ClientControl::PublishStream(PublishStream {
+                    room_id,
+                    stream_id,
+                    codec: CodecId::H264,
+                    media_kind: MediaKind::Screen,
+                }),
+            ),
+        );
+        assert!(matches!(
+            response.message,
+            ServerControl::StreamPublished(_)
+        ));
+    }
+
+    fn subscribe_stream(
+        state: &mut ControlState,
+        session: &mut Session,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) {
+        let response = state.handle_client_envelope(
+            session,
+            ClientEnvelope::new(
+                5,
+                ClientControl::SubscribeStream(SubscribeStream { room_id, stream_id }),
+            ),
+        );
+        assert!(matches!(
+            response.message,
+            ServerControl::StreamSubscribed(_)
+        ));
     }
 }

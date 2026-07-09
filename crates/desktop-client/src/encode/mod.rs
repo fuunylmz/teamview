@@ -1,6 +1,7 @@
 pub mod h264;
 
-use teamview_protocol::codec::CodecId;
+use crate::capture::CaptureFrame;
+use teamview_protocol::{codec::CodecId, frame::EncodedFrame as ProtocolEncodedFrame};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedFrame {
@@ -12,6 +13,11 @@ pub struct EncodedFrame {
 }
 
 pub trait VideoEncoder {
+    fn encode(
+        &mut self,
+        frame: CaptureFrame,
+        stream_id: u32,
+    ) -> anyhow::Result<Option<ProtocolEncodedFrame>>;
     fn request_keyframe(&mut self);
     fn update_bitrate(&mut self, bitrate_bps: u32);
 }

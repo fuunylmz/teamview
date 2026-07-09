@@ -2,9 +2,13 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use super::RelayEndpoint;
 use anyhow::Context;
-use quinn::{ClientConfig, Endpoint};
-use teamview_protocol::control::{
-    ClientEnvelope, ServerEnvelope, decode_server_envelope, encode_client_envelope,
+use quinn::{ClientConfig, Connection, Endpoint};
+use teamview_protocol::{
+    control::{
+        ClientControl, ClientEnvelope, RequestId, ServerEnvelope, decode_server_envelope,
+        encode_client_envelope,
+    },
+    packet::MediaPacket,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,11 +38,10 @@ pub fn build_client_endpoint(bind_addr: &str) -> anyhow::Result<Endpoint> {
     Ok(endpoint)
 }
 
-pub async fn send_control_request(
+pub async fn connect_control_client(
     endpoint: &Endpoint,
     relay_addr: &str,
-    request: &ClientEnvelope,
-) -> anyhow::Result<ServerEnvelope> {
+) -> anyhow::Result<ControlClient> {
     let relay_addr: SocketAddr = relay_addr
         .parse()
         .with_context(|| format!("invalid relay address {relay_addr}"))?;
@@ -47,6 +50,64 @@ pub async fn send_control_request(
         .context("failed to start QUIC connection")?
         .await
         .context("failed to connect to relay")?;
+    Ok(ControlClient::new(connection))
+}
+
+#[derive(Debug)]
+pub struct ControlClient {
+    connection: Connection,
+    next_request_id: RequestId,
+}
+
+impl ControlClient {
+    pub fn new(connection: Connection) -> Self {
+        Self {
+            connection,
+            next_request_id: 1,
+        }
+    }
+
+    pub async fn send(&mut self, message: ClientControl) -> anyhow::Result<ServerEnvelope> {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_envelope(&ClientEnvelope::new(request_id, message))
+            .await
+    }
+
+    pub async fn send_envelope(&self, request: &ClientEnvelope) -> anyhow::Result<ServerEnvelope> {
+        send_control_request_on_connection(&self.connection, request).await
+    }
+
+    pub fn send_media_packet(&self, packet: &MediaPacket) -> anyhow::Result<()> {
+        let bytes = packet.encode().context("failed to encode media packet")?;
+        self.connection
+            .send_datagram(bytes)
+            .context("failed to send media datagram")
+    }
+
+    pub async fn recv_media_packet(&self) -> anyhow::Result<MediaPacket> {
+        let bytes = self
+            .connection
+            .read_datagram()
+            .await
+            .context("failed to read media datagram")?;
+        MediaPacket::decode(&bytes).context("failed to decode media packet")
+    }
+}
+
+pub async fn send_control_request(
+    endpoint: &Endpoint,
+    relay_addr: &str,
+    request: &ClientEnvelope,
+) -> anyhow::Result<ServerEnvelope> {
+    let client = connect_control_client(endpoint, relay_addr).await?;
+    client.send_envelope(request).await
+}
+
+async fn send_control_request_on_connection(
+    connection: &Connection,
+    request: &ClientEnvelope,
+) -> anyhow::Result<ServerEnvelope> {
     let (mut send, mut recv) = connection
         .open_bi()
         .await

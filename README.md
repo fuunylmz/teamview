@@ -76,8 +76,20 @@ cargo run -p desktop-client -- --mode broadcaster --capture-source primary-monit
 
 Expected output includes `capture_supported=true` on Windows.
 
+For the synthetic QUIC media forwarding smoke test:
+
+```bash
+cargo run -p load-test -- --mode quic-sample-forward --viewers 2 --packets 2 --max-payload 700
+```
+
+Expected output shows fragmented synthetic H.264-like frames sent through the relay over QUIC datagrams and reassembled by every viewer:
+
+```text
+quic-sample-forward frames=2 fragments=14 reassembled=4 delivered=28 dropped=0
+```
+
 ## Current stage
 
-Stage 4: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup.
+Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers, and the client/load-test paths can packetize, send, receive, reassemble, and mock-decode synthetic H.264-like frames.
 
-Actual Windows Graphics Capture frame acquisition, hardware encode, decode, rendering, and real QUIC media datagram I/O are later stages.
+Actual Windows Graphics Capture frame acquisition, hardware encode, native decode, real rendering, and production egress queueing are later stages.

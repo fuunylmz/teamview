@@ -1,10 +1,22 @@
+use std::{sync::Arc, time::Duration};
+
+use anyhow::Context;
+
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
-use relay_server::router::StreamFanout;
+use quinn::{ClientConfig, Connection, Endpoint};
+use relay_server::{
+    control_stream::ControlRuntime, router::StreamFanout, transport::build_server_endpoint,
+};
 use teamview_protocol::{
+    PROTOCOL_VERSION,
     codec::CodecId,
     control::UserId,
-    frame::{EncodedFrame, packetize_frame, reassemble_frame},
+    control::{
+        ClientControl, ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind, PublishStream,
+        ServerControl, SubscribeStream, decode_server_envelope, encode_client_envelope,
+    },
+    frame::{EncodedFrame, packetize_frame, packetize_frame_for_datagram_target, reassemble_frame},
     packet::{
         DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, MediaPacketHeader, PacketFlags, PacketType,
     },
@@ -15,6 +27,7 @@ use tracing::info;
 enum Mode {
     Fanout,
     SampleForward,
+    QuicSampleForward,
 }
 
 #[derive(Debug, Parser)]
@@ -42,7 +55,8 @@ struct Args {
     include_slow_viewer: bool,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
@@ -65,6 +79,18 @@ fn main() -> anyhow::Result<()> {
             info!(?args, ?result, "load-test sample forward complete");
             println!(
                 "sample-forward frames={} fragments={} reassembled={} delivered={} dropped={}",
+                result.frames,
+                result.fragments,
+                result.reassembled_frames,
+                result.total_delivered,
+                result.total_dropped
+            );
+        }
+        Mode::QuicSampleForward => {
+            let result = run_quic_sample_forward(&args).await?;
+            info!(?args, ?result, "load-test QUIC sample forward complete");
+            println!(
+                "quic-sample-forward frames={} fragments={} reassembled={} delivered={} dropped={}",
                 result.frames,
                 result.fragments,
                 result.reassembled_frames,
@@ -169,6 +195,151 @@ fn run_sample_forward(args: &Args) -> anyhow::Result<SampleForwardResult> {
     Ok(result)
 }
 
+async fn run_quic_sample_forward(args: &Args) -> anyhow::Result<SampleForwardResult> {
+    let server = build_server_endpoint("127.0.0.1:0")?;
+    let server_addr = server.local_addr()?;
+    let runtime = ControlRuntime::new();
+    let server_task = tokio::spawn(async move {
+        runtime.serve_endpoint(server).await;
+    });
+
+    let publisher_endpoint = build_client_endpoint()?;
+    let publisher = publisher_endpoint
+        .connect(server_addr, "localhost")?
+        .await
+        .context("publisher failed to connect")?;
+
+    let mut viewer_endpoints = Vec::new();
+    let mut viewers = Vec::new();
+    for _ in 0..args.viewers {
+        let endpoint = build_client_endpoint()?;
+        let connection = endpoint
+            .connect(server_addr, "localhost")?
+            .await
+            .context("viewer failed to connect")?;
+        viewer_endpoints.push(endpoint);
+        viewers.push(connection);
+    }
+
+    send_control_request(
+        &publisher,
+        ClientEnvelope::new(
+            1,
+            ClientControl::Hello(Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "load-test-publisher".to_owned(),
+            }),
+        ),
+    )
+    .await?;
+    let created = send_control_request(
+        &publisher,
+        ClientEnvelope::new(
+            2,
+            ClientControl::CreateRoom(CreateRoom {
+                name: "load-test".to_owned(),
+            }),
+        ),
+    )
+    .await?;
+    let room_id = match created.message {
+        ServerControl::RoomCreated(room) => room.room_id,
+        other => anyhow::bail!("unexpected create room response: {other:?}"),
+    };
+    send_control_request(
+        &publisher,
+        ClientEnvelope::new(3, ClientControl::JoinRoom(JoinRoom { room_id })),
+    )
+    .await?;
+    send_control_request(
+        &publisher,
+        ClientEnvelope::new(
+            4,
+            ClientControl::PublishStream(PublishStream {
+                room_id,
+                stream_id: 1,
+                codec: CodecId::H264,
+                media_kind: MediaKind::Screen,
+            }),
+        ),
+    )
+    .await?;
+
+    for (index, viewer) in viewers.iter().enumerate() {
+        send_control_request(
+            viewer,
+            ClientEnvelope::new(
+                1,
+                ClientControl::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_name: format!("load-test-viewer-{index}"),
+                }),
+            ),
+        )
+        .await?;
+        send_control_request(
+            viewer,
+            ClientEnvelope::new(2, ClientControl::JoinRoom(JoinRoom { room_id })),
+        )
+        .await?;
+        send_control_request(
+            viewer,
+            ClientEnvelope::new(
+                3,
+                ClientControl::SubscribeStream(SubscribeStream {
+                    room_id,
+                    stream_id: 1,
+                }),
+            ),
+        )
+        .await?;
+    }
+
+    let mut result = SampleForwardResult::default();
+    for frame_index in 0..args.packets {
+        let frame = sample_h264_frame(frame_index + 1);
+        let packets = packetize_frame_for_datagram_target(
+            &frame,
+            frame_index.saturating_mul(100),
+            args.max_payload,
+        )?;
+        result.frames += 1;
+        result.fragments += packets.len() as u64;
+
+        for packet in &packets {
+            publisher.send_datagram(packet.encode()?)?;
+        }
+
+        for viewer in &viewers {
+            let mut received = Vec::with_capacity(packets.len());
+            for _ in 0..packets.len() {
+                let bytes = tokio::time::timeout(Duration::from_secs(2), viewer.read_datagram())
+                    .await
+                    .context("timed out waiting for forwarded datagram")??;
+                received.push(MediaPacket::decode(&bytes)?);
+            }
+            let reassembled = reassemble_frame(received)?;
+            if reassembled.bytes != frame.bytes {
+                anyhow::bail!(
+                    "QUIC reassembled frame bytes differ for frame {}",
+                    frame.frame_id
+                );
+            }
+            result.reassembled_frames += 1;
+            result.total_delivered += packets.len() as u64;
+        }
+    }
+
+    publisher.close(0_u32.into(), b"done");
+    for viewer in viewers {
+        viewer.close(0_u32.into(), b"done");
+    }
+    drop(viewer_endpoints);
+    drop(publisher_endpoint);
+    server_task.abort();
+
+    Ok(result)
+}
 fn sample_h264_frame(frame_id: u32) -> EncodedFrame {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f]);
@@ -201,6 +372,85 @@ fn synthetic_packet(stream_id: u32, sequence_number: u32, frame_id: u32) -> Medi
     header.frame_id = frame_id;
     header.flags = PacketFlags::empty().with(PacketFlags::END_OF_FRAME);
     MediaPacket { header, payload }
+}
+
+fn build_client_endpoint() -> anyhow::Result<Endpoint> {
+    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap())?;
+    endpoint.set_default_client_config(build_insecure_local_client_config());
+    Ok(endpoint)
+}
+
+async fn send_control_request(
+    connection: &Connection,
+    request: ClientEnvelope,
+) -> anyhow::Result<teamview_protocol::control::ServerEnvelope> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("failed to open control stream")?;
+    send.write_all(&encode_client_envelope(&request)?)
+        .await
+        .context("failed to write control request")?;
+    send.finish().context("failed to finish control request")?;
+    let response_bytes = recv
+        .read_to_end(64 * 1024)
+        .await
+        .context("failed to read control response")?;
+    Ok(decode_server_envelope(&response_bytes)?)
+}
+
+fn build_insecure_local_client_config() -> ClientConfig {
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"teamview-stage1".to_vec()];
+    ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+            .expect("valid local QUIC client config"),
+    ))
+}
+
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -242,6 +492,26 @@ mod tests {
         assert_eq!(result.slow_viewer_dropped, 9);
         assert_eq!(result.total_dropped, 9);
         assert_eq!(result.total_delivered, 31);
+    }
+
+    #[tokio::test]
+    async fn quic_sample_forward_reassembles_for_each_viewer() {
+        let args = Args {
+            mode: Mode::QuicSampleForward,
+            publishers: 1,
+            viewers: 2,
+            packets: 2,
+            media_duration_ms: 20,
+            max_payload: 700,
+            include_slow_viewer: false,
+        };
+
+        let result = run_quic_sample_forward(&args).await.unwrap();
+
+        assert_eq!(result.frames, 2);
+        assert_eq!(result.reassembled_frames, 4);
+        assert!(result.fragments > result.frames as u64);
+        assert_eq!(result.total_dropped, 0);
     }
 
     #[test]
