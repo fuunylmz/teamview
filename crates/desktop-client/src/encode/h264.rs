@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use teamview_protocol::{codec::CodecId, frame::EncodedFrame};
 
+use std::fmt;
+
 use crate::capture::{CaptureFrame, CaptureFrameStorage, CapturePixelFormat};
 
 use super::VideoEncoder;
@@ -42,6 +44,141 @@ impl Default for H264EncoderConfig {
 pub struct H264Encoder {
     pub config: H264EncoderConfig,
     pub keyframe_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum H264VideoEncoderBackend {
+    Synthetic,
+    MediaFoundation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct H264EncoderBackendStatus {
+    pub backend: H264VideoEncoderBackend,
+    pub available: bool,
+    pub hardware: bool,
+    pub detail: String,
+}
+
+#[derive(Debug)]
+pub enum H264VideoEncoder {
+    Synthetic(H264Encoder),
+    MediaFoundation(MediaFoundationH264Encoder),
+}
+
+impl H264VideoEncoder {
+    pub fn new(
+        backend: H264VideoEncoderBackend,
+        config: H264EncoderConfig,
+    ) -> anyhow::Result<Self> {
+        match backend {
+            H264VideoEncoderBackend::Synthetic => Ok(Self::Synthetic(H264Encoder {
+                config,
+                keyframe_requested: false,
+            })),
+            H264VideoEncoderBackend::MediaFoundation => Ok(Self::MediaFoundation(
+                MediaFoundationH264Encoder::new(config)?,
+            )),
+        }
+    }
+}
+
+impl VideoEncoder for H264VideoEncoder {
+    fn encode(
+        &mut self,
+        frame: CaptureFrame,
+        stream_id: u32,
+    ) -> anyhow::Result<Option<EncodedFrame>> {
+        match self {
+            Self::Synthetic(encoder) => encoder.encode(frame, stream_id),
+            Self::MediaFoundation(encoder) => encoder.encode(frame, stream_id),
+        }
+    }
+
+    fn request_keyframe(&mut self) {
+        match self {
+            Self::Synthetic(encoder) => encoder.request_keyframe(),
+            Self::MediaFoundation(encoder) => encoder.request_keyframe(),
+        }
+    }
+
+    fn update_bitrate(&mut self, bitrate_bps: u32) {
+        match self {
+            Self::Synthetic(encoder) => encoder.update_bitrate(bitrate_bps),
+            Self::MediaFoundation(encoder) => encoder.update_bitrate(bitrate_bps),
+        }
+    }
+
+    fn update_frame_rate(&mut self, frames_per_second: u16) {
+        match self {
+            Self::Synthetic(encoder) => encoder.update_frame_rate(frames_per_second),
+            Self::MediaFoundation(encoder) => encoder.update_frame_rate(frames_per_second),
+        }
+    }
+
+    fn update_resolution(&mut self, width: u32, height: u32) {
+        match self {
+            Self::Synthetic(encoder) => encoder.update_resolution(width, height),
+            Self::MediaFoundation(encoder) => encoder.update_resolution(width, height),
+        }
+    }
+
+    fn bitrate_bps(&self) -> u32 {
+        match self {
+            Self::Synthetic(encoder) => encoder.bitrate_bps(),
+            Self::MediaFoundation(encoder) => encoder.bitrate_bps(),
+        }
+    }
+
+    fn target_payload_bytes(&self) -> usize {
+        match self {
+            Self::Synthetic(encoder) => encoder.target_payload_bytes(),
+            Self::MediaFoundation(encoder) => encoder.target_payload_bytes(),
+        }
+    }
+
+    fn set_target_payload_bytes(&mut self, bytes: usize) {
+        match self {
+            Self::Synthetic(encoder) => encoder.set_target_payload_bytes(bytes),
+            Self::MediaFoundation(encoder) => encoder.set_target_payload_bytes(bytes),
+        }
+    }
+}
+
+pub fn h264_encoder_backend_status(backend: H264VideoEncoderBackend) -> H264EncoderBackendStatus {
+    match backend {
+        H264VideoEncoderBackend::Synthetic => H264EncoderBackendStatus {
+            backend,
+            available: true,
+            hardware: false,
+            detail: "synthetic Annex B test encoder".to_owned(),
+        },
+        H264VideoEncoderBackend::MediaFoundation => media_foundation_h264_encoder_status(),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaFoundationH264Encoder {
+    config: H264EncoderConfig,
+    target_payload_bytes: usize,
+    keyframe_requested: bool,
+}
+
+impl MediaFoundationH264Encoder {
+    pub fn new(config: H264EncoderConfig) -> anyhow::Result<Self> {
+        let status = media_foundation_h264_encoder_status();
+        if !status.available {
+            anyhow::bail!(
+                "Media Foundation H.264 encoder is unavailable: {}",
+                status.detail
+            );
+        }
+        Ok(Self {
+            target_payload_bytes: config.synthetic_payload_bytes,
+            config,
+            keyframe_requested: true,
+        })
+    }
 }
 
 impl VideoEncoder for H264Encoder {
@@ -100,6 +237,270 @@ impl VideoEncoder for H264Encoder {
 
     fn update_bitrate(&mut self, bitrate_bps: u32) {
         self.config.bitrate_bps = bitrate_bps;
+    }
+
+    fn update_frame_rate(&mut self, frames_per_second: u16) {
+        self.config.frames_per_second = frames_per_second.max(1);
+    }
+
+    fn update_resolution(&mut self, width: u32, height: u32) {
+        self.config.width = width;
+        self.config.height = height;
+    }
+
+    fn bitrate_bps(&self) -> u32 {
+        self.config.bitrate_bps
+    }
+
+    fn target_payload_bytes(&self) -> usize {
+        self.config.synthetic_payload_bytes
+    }
+
+    fn set_target_payload_bytes(&mut self, bytes: usize) {
+        self.config.synthetic_payload_bytes = bytes;
+    }
+}
+
+impl VideoEncoder for MediaFoundationH264Encoder {
+    fn encode(
+        &mut self,
+        _frame: CaptureFrame,
+        _stream_id: u32,
+    ) -> anyhow::Result<Option<EncodedFrame>> {
+        anyhow::bail!(
+            "Media Foundation H.264 encoder was selected and detected, but frame submission is not wired yet"
+        );
+    }
+
+    fn request_keyframe(&mut self) {
+        self.keyframe_requested = true;
+    }
+
+    fn update_bitrate(&mut self, bitrate_bps: u32) {
+        self.config.bitrate_bps = bitrate_bps;
+    }
+
+    fn update_frame_rate(&mut self, frames_per_second: u16) {
+        self.config.frames_per_second = frames_per_second.max(1);
+    }
+
+    fn update_resolution(&mut self, width: u32, height: u32) {
+        self.config.width = width;
+        self.config.height = height;
+        self.request_keyframe();
+    }
+
+    fn bitrate_bps(&self) -> u32 {
+        self.config.bitrate_bps
+    }
+
+    fn target_payload_bytes(&self) -> usize {
+        self.target_payload_bytes
+    }
+
+    fn set_target_payload_bytes(&mut self, bytes: usize) {
+        self.target_payload_bytes = bytes;
+    }
+}
+
+impl fmt::Display for H264VideoEncoderBackend {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Synthetic => formatter.write_str("synthetic"),
+            Self::MediaFoundation => formatter.write_str("media-foundation"),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn media_foundation_h264_encoder_status() -> H264EncoderBackendStatus {
+    H264EncoderBackendStatus {
+        backend: H264VideoEncoderBackend::MediaFoundation,
+        available: false,
+        hardware: true,
+        detail: "Media Foundation H.264 encoding is only available on Windows".to_owned(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn media_foundation_h264_encoder_status() -> H264EncoderBackendStatus {
+    match media_foundation::probe_hardware_h264_encoder_count() {
+        Ok(count) if count > 0 => H264EncoderBackendStatus {
+            backend: H264VideoEncoderBackend::MediaFoundation,
+            available: true,
+            hardware: true,
+            detail: format!("{count} hardware H.264 encoder MFT(s) available"),
+        },
+        Ok(_) => H264EncoderBackendStatus {
+            backend: H264VideoEncoderBackend::MediaFoundation,
+            available: false,
+            hardware: true,
+            detail: "Media Foundation started, but no hardware H.264 encoder MFT was enumerated"
+                .to_owned(),
+        },
+        Err(error) => H264EncoderBackendStatus {
+            backend: H264VideoEncoderBackend::MediaFoundation,
+            available: false,
+            hardware: true,
+            detail: error.to_string(),
+        },
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod media_foundation {
+    use std::{ffi::c_void, mem, ptr};
+
+    use anyhow::Context;
+    use windows_sys::{
+        Win32::{
+            Foundation::HMODULE,
+            System::LibraryLoader::{GetProcAddress, LoadLibraryA},
+        },
+        core::{GUID, HRESULT, IUnknown_Vtbl},
+    };
+
+    const MF_VERSION: u32 = 0x0002_0070;
+    const MFSTARTUP_FULL: u32 = 0;
+    const MFT_ENUM_FLAG_HARDWARE: u32 = 0x0000_0004;
+    const MFT_ENUM_FLAG_SORTANDFILTER: u32 = 0x0000_0040;
+    const MFT_CATEGORY_VIDEO_ENCODER: GUID =
+        GUID::from_u128(0xf79eac7d_e545_4387_bdee_d647d7bde42a);
+    const MF_MEDIA_TYPE_VIDEO: GUID = GUID::from_u128(0x73646976_0000_0010_8000_00aa00389b71);
+    const MF_VIDEO_FORMAT_H264: GUID = GUID::from_u128(0x34363248_0000_0010_8000_00aa00389b71);
+
+    type MFStartupFn = unsafe extern "system" fn(u32, u32) -> HRESULT;
+    type MFShutdownFn = unsafe extern "system" fn() -> HRESULT;
+    type MFTEnumExFn = unsafe extern "system" fn(
+        GUID,
+        u32,
+        *const MftRegisterTypeInfo,
+        *const MftRegisterTypeInfo,
+        *mut *mut *mut c_void,
+        *mut u32,
+    ) -> HRESULT;
+    type CoTaskMemFreeFn = unsafe extern "system" fn(*const c_void);
+
+    #[repr(C)]
+    struct MftRegisterTypeInfo {
+        guid_major_type: GUID,
+        guid_sub_type: GUID,
+    }
+
+    pub fn probe_hardware_h264_encoder_count() -> anyhow::Result<u32> {
+        let mfplat = load_library(b"mfplat.dll\0").context("failed to load mfplat.dll")?;
+        let startup: MFStartupFn = load_proc(mfplat, b"MFStartup\0")?;
+        let shutdown: MFShutdownFn = load_proc(mfplat, b"MFShutdown\0")?;
+        let enum_ex: MFTEnumExFn = load_proc(mfplat, b"MFTEnumEx\0")?;
+
+        hr_result("MFStartup", unsafe { startup(MF_VERSION, MFSTARTUP_FULL) })?;
+        let _guard = MediaFoundationShutdown { shutdown };
+
+        let input_type = MftRegisterTypeInfo {
+            guid_major_type: MF_MEDIA_TYPE_VIDEO,
+            guid_sub_type: GUID::default(),
+        };
+        let output_type = MftRegisterTypeInfo {
+            guid_major_type: MF_MEDIA_TYPE_VIDEO,
+            guid_sub_type: MF_VIDEO_FORMAT_H264,
+        };
+        let mut activates: *mut *mut c_void = ptr::null_mut();
+        let mut count = 0_u32;
+        hr_result("MFTEnumEx", unsafe {
+            enum_ex(
+                MFT_CATEGORY_VIDEO_ENCODER,
+                MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                &input_type,
+                &output_type,
+                &mut activates,
+                &mut count,
+            )
+        })?;
+
+        unsafe {
+            release_activates(activates, count);
+            free_cotaskmem(activates.cast());
+        }
+        Ok(count)
+    }
+
+    struct MediaFoundationShutdown {
+        shutdown: MFShutdownFn,
+    }
+
+    impl Drop for MediaFoundationShutdown {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = (self.shutdown)();
+            }
+        }
+    }
+
+    fn load_library(name: &'static [u8]) -> anyhow::Result<HMODULE> {
+        let module = unsafe { LoadLibraryA(name.as_ptr()) };
+        if module.is_null() {
+            anyhow::bail!(
+                "LoadLibraryA({}) failed",
+                String::from_utf8_lossy(c_string_name(name))
+            );
+        }
+        Ok(module)
+    }
+
+    fn load_proc<T: Copy>(module: HMODULE, name: &'static [u8]) -> anyhow::Result<T> {
+        let proc = unsafe { GetProcAddress(module, name.as_ptr()) };
+        let Some(proc) = proc else {
+            anyhow::bail!(
+                "GetProcAddress({}) failed",
+                String::from_utf8_lossy(c_string_name(name))
+            );
+        };
+        Ok(unsafe { mem::transmute_copy(&proc) })
+    }
+
+    fn c_string_name(bytes: &'static [u8]) -> &'static [u8] {
+        bytes.strip_suffix(&[0]).unwrap_or(bytes)
+    }
+
+    fn hr_result(action: &str, hr: HRESULT) -> anyhow::Result<()> {
+        if hr >= 0 {
+            Ok(())
+        } else {
+            anyhow::bail!("{action} failed with HRESULT 0x{:08x}", hr as u32)
+        }
+    }
+
+    unsafe fn release_activates(activates: *mut *mut c_void, count: u32) {
+        if activates.is_null() {
+            return;
+        }
+        for index in 0..count as usize {
+            let activate = unsafe { *activates.add(index) };
+            if activate.is_null() {
+                continue;
+            }
+            let vtbl = unsafe { *(activate as *mut *mut IUnknown_Vtbl) };
+            if !vtbl.is_null() {
+                unsafe {
+                    ((*vtbl).Release)(activate);
+                }
+            }
+        }
+    }
+
+    unsafe fn free_cotaskmem(memory: *const c_void) {
+        if memory.is_null() {
+            return;
+        }
+        let Ok(ole32) = load_library(b"ole32.dll\0") else {
+            return;
+        };
+        let Ok(free) = load_proc::<CoTaskMemFreeFn>(ole32, b"CoTaskMemFree\0") else {
+            return;
+        };
+        unsafe {
+            free(memory);
+        }
     }
 }
 

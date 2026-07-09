@@ -42,7 +42,13 @@ use crate::{
         CaptureConfig, CaptureSource, CaptureSourceInfo, CaptureSourceKind, ScreenCapture, windows,
     },
     decode::{FrameReassemblyBuffer, VideoDecoder, h264::H264Decoder},
-    encode::{VideoEncoder, h264::H264Encoder},
+    encode::{
+        VideoEncoder,
+        h264::{
+            H264Encoder, H264EncoderConfig, H264VideoEncoder, H264VideoEncoderBackend,
+            h264_encoder_backend_status,
+        },
+    },
     playback::{FramePlayback, VideoPlayback},
     stats::{ClientBroadcasterStats, ClientMediaStats},
     transport::quic::{build_client_endpoint, connect_control_client},
@@ -77,6 +83,12 @@ enum MediaKindArg {
 enum ScreenInputArg {
     Synthetic,
     Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VideoEncoderArg {
+    Synthetic,
+    MediaFoundation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -119,6 +131,9 @@ struct Args {
     list_audio_sources: bool,
 
     #[arg(long)]
+    list_codec_backends: bool,
+
+    #[arg(long)]
     list_rooms: bool,
 
     #[arg(long)]
@@ -156,6 +171,9 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = ScreenInputArg::Synthetic)]
     screen_input: ScreenInputArg,
+
+    #[arg(long, value_enum, default_value_t = VideoEncoderArg::Synthetic)]
+    video_encoder: VideoEncoderArg,
 
     #[arg(long, value_enum, default_value_t = VoiceInputArg::Synthetic)]
     voice_input: VoiceInputArg,
@@ -234,6 +252,10 @@ async fn main() -> anyhow::Result<()> {
         print_audio_sources()?;
         return Ok(());
     }
+    if args.list_codec_backends {
+        print_codec_backends();
+        return Ok(());
+    }
 
     let endpoint = build_client_endpoint("127.0.0.1:0")?;
     let local_addr = endpoint.local_addr()?;
@@ -246,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
         capture_supported,
         ?args.capture_source,
         ?args.screen_input,
+        ?args.video_encoder,
         ?args.voice_input,
         ?args.render_output,
         ?args.audio_output,
@@ -253,13 +276,14 @@ async fn main() -> anyhow::Result<()> {
         "desktop client endpoint and capture foundation ready"
     );
     println!(
-        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} voice_input={:?} render_output={:?} audio_output={:?} muted={} deafened={} push_to_talk={} speaking={}",
+        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} video_encoder={:?} voice_input={:?} render_output={:?} audio_output={:?} muted={} deafened={} push_to_talk={} speaking={}",
         args.mode,
         args.relay,
         local_addr,
         capture_supported,
         args.capture_source,
         args.screen_input,
+        args.video_encoder,
         args.voice_input,
         args.render_output,
         args.audio_output,
@@ -1100,12 +1124,7 @@ async fn run_synthetic_screen_broadcaster_media(
 
     let mut capture =
         windows::WindowsGraphicsCapture::new(args.capture_source()?, args.capture_config())?;
-    let mut encoder = H264Encoder::default();
-    encoder.config.synthetic_payload_bytes = args.media_frame_bytes;
-    encoder.config.bitrate_bps = args.synthetic_bitrate_bps();
-    encoder.config.frames_per_second = args.media_fps;
-    encoder.config.width = target_width;
-    encoder.config.height = target_height;
+    let mut encoder = args.video_encoder(target_width, target_height)?;
     encoder.request_keyframe();
 
     let mut ticker = tokio::time::interval(frame_interval);
@@ -1520,7 +1539,7 @@ async fn set_screen_stream_config(
 
 fn apply_publisher_feedback(
     feedback: &PublisherFeedback,
-    encoder: &mut H264Encoder,
+    encoder: &mut dyn VideoEncoder,
     active_fps: &mut u16,
     target_width: &mut u32,
     target_height: &mut u32,
@@ -1529,17 +1548,21 @@ fn apply_publisher_feedback(
     let mut adapted = false;
     let mut resolution_changed = false;
     let target_bitrate = feedback.aggregate_available_bitrate_bps;
-    if target_bitrate > 0 && target_bitrate != encoder.config.bitrate_bps {
+    if target_bitrate > 0 && target_bitrate != encoder.bitrate_bps() {
         encoder.update_bitrate(target_bitrate);
-        encoder.config.synthetic_payload_bytes =
-            synthetic_payload_bytes_for_bitrate(target_bitrate, (*active_fps).max(1));
+        encoder.set_target_payload_bytes(synthetic_payload_bytes_for_bitrate(
+            target_bitrate,
+            (*active_fps).max(1),
+        ));
         adapted = true;
     }
     if feedback.target_frames_per_second > 0 && feedback.target_frames_per_second != *active_fps {
         *active_fps = feedback.target_frames_per_second;
-        encoder.config.frames_per_second = *active_fps;
-        encoder.config.synthetic_payload_bytes =
-            synthetic_payload_bytes_for_bitrate(encoder.config.bitrate_bps, (*active_fps).max(1));
+        encoder.update_frame_rate(*active_fps);
+        encoder.set_target_payload_bytes(synthetic_payload_bytes_for_bitrate(
+            encoder.bitrate_bps(),
+            (*active_fps).max(1),
+        ));
         *ticker = tokio::time::interval(Duration::from_micros(media_interval_micros(*active_fps)));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         adapted = true;
@@ -1550,8 +1573,7 @@ fn apply_publisher_feedback(
     {
         *target_width = feedback.target_width;
         *target_height = feedback.target_height;
-        encoder.config.width = *target_width;
-        encoder.config.height = *target_height;
+        encoder.update_resolution(*target_width, *target_height);
         encoder.request_keyframe();
         adapted = true;
         resolution_changed = true;
@@ -1560,11 +1582,11 @@ fn apply_publisher_feedback(
         println!(
             "publisher-adapt stream_id={} bitrate_bps={} fps={} width={} height={} frame_bytes={}",
             feedback.stream_id,
-            encoder.config.bitrate_bps,
+            encoder.bitrate_bps(),
             *active_fps,
             *target_width,
             *target_height,
-            encoder.config.synthetic_payload_bytes
+            encoder.target_payload_bytes()
         );
     }
     resolution_changed
@@ -2423,6 +2445,23 @@ fn print_audio_sources() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_codec_backends() {
+    print_h264_backend(H264VideoEncoderBackend::Synthetic, true);
+    print_h264_backend(H264VideoEncoderBackend::MediaFoundation, false);
+    println!(
+        "codec-backend kind=audio codec=Opus backend=synthetic available=true hardware=false default=true detail={:?}",
+        "synthetic Opus-like test encoder"
+    );
+}
+
+fn print_h264_backend(backend: H264VideoEncoderBackend, is_default: bool) {
+    let status = h264_encoder_backend_status(backend);
+    println!(
+        "codec-backend kind=video codec=H264 backend={} available={} hardware={} default={} detail={:?}",
+        status.backend, status.available, status.hardware, is_default, status.detail
+    );
+}
+
 fn format_capture_source(source: &CaptureSourceInfo) -> String {
     match (&source.kind, &source.source) {
         (CaptureSourceKind::Monitor, CaptureSource::Monitor { id }) => format!(
@@ -2519,6 +2558,26 @@ impl Args {
             .saturating_mul(self.media_fps.max(1) as u128)
             .saturating_mul(8);
         bitrate.min(u32::MAX as u128) as u32
+    }
+
+    fn video_encoder_backend(&self) -> H264VideoEncoderBackend {
+        match self.video_encoder {
+            VideoEncoderArg::Synthetic => H264VideoEncoderBackend::Synthetic,
+            VideoEncoderArg::MediaFoundation => H264VideoEncoderBackend::MediaFoundation,
+        }
+    }
+
+    fn video_encoder(&self, width: u32, height: u32) -> anyhow::Result<H264VideoEncoder> {
+        H264VideoEncoder::new(
+            self.video_encoder_backend(),
+            H264EncoderConfig {
+                width,
+                height,
+                frames_per_second: self.media_fps.max(1),
+                bitrate_bps: self.synthetic_bitrate_bps(),
+                synthetic_payload_bytes: self.media_frame_bytes,
+            },
+        )
     }
 
     fn protocol_media_kind(&self) -> anyhow::Result<MediaKind> {
@@ -2718,6 +2777,13 @@ mod tests {
     }
 
     #[test]
+    fn list_codec_backends_flag_parses_without_relay_options() {
+        let args = Args::try_parse_from(["desktop-client", "--list-codec-backends"]).unwrap();
+
+        assert!(args.list_codec_backends);
+    }
+
+    #[test]
     fn list_rooms_flag_parses_without_media_options() {
         let args = Args::try_parse_from(["desktop-client", "--list-rooms"]).unwrap();
 
@@ -2797,6 +2863,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.audio_output, AudioOutputArg::Speaker);
+    }
+
+    #[test]
+    fn video_encoder_flag_selects_media_foundation_backend() {
+        let args = Args::try_parse_from(["desktop-client", "--video-encoder", "media-foundation"])
+            .unwrap();
+
+        assert_eq!(args.video_encoder, VideoEncoderArg::MediaFoundation);
+        assert_eq!(
+            args.video_encoder_backend(),
+            H264VideoEncoderBackend::MediaFoundation
+        );
     }
 
     #[test]

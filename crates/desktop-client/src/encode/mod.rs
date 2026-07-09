@@ -20,4 +20,9 @@ pub trait VideoEncoder {
     ) -> anyhow::Result<Option<ProtocolEncodedFrame>>;
     fn request_keyframe(&mut self);
     fn update_bitrate(&mut self, bitrate_bps: u32);
+    fn update_frame_rate(&mut self, frames_per_second: u16);
+    fn update_resolution(&mut self, width: u32, height: u32);
+    fn bitrate_bps(&self) -> u32;
+    fn target_payload_bytes(&self) -> usize;
+    fn set_target_payload_bytes(&mut self, bytes: usize);
 }
