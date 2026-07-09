@@ -126,6 +126,7 @@ Expected behavior:
 - The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.
 - New subscribers, packet loss, and decoder recovery can register keyframe requests with the relay.
 - The broadcaster polls aggregated `PublisherFeedback`; when feedback requests a keyframe, the synthetic encoder marks the next frame as a keyframe.
+- The broadcaster polls relay `StreamMetrics` at the end of the run to report server-observed ingress, queued egress, and dropped egress datagrams.
 - When most viewers are degraded, relay feedback lowers the synthetic target bitrate, and the broadcaster shrinks subsequent synthetic frame payloads.
 - The final viewer summary reports zero loss and drops on a healthy local run.
 

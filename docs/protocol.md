@@ -41,6 +41,7 @@ Current control messages cover:
 - leave room
 - keyframe request
 - stream config
+- stream metrics
 - publisher feedback
 - viewer stats
 - target bitrate/framerate updates
@@ -50,6 +51,8 @@ JSON-line framing is intentionally a Stage 1 choice. Later stages can replace it
 Keyframe requests are accepted from subscribed viewers and are also registered automatically when a viewer first subscribes to a stream. The relay exposes those requests to the publisher through `PublisherFeedback.keyframe_requested`; the publisher consumes the pending request when it polls feedback and should make the next encoded video frame a keyframe.
 
 Publishers can set their current target bitrate and framerate. `PublisherFeedback` returns the relay's current bitrate/FPS target; if most subscribed viewers report degraded stats, the relay lowers the bitrate target before returning feedback so the publisher can adapt future encoded frames.
+
+Room participants can poll `StreamMetrics` for a published stream. The relay reports server-observed ingress packets/bytes, queued and dropped egress datagrams, subscriber count, and the last server ingress timestamp.
 
 ## Media plane
 

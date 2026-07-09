@@ -8,9 +8,12 @@ use teamview_protocol::{
         SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId, StreamPublished,
         StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
     },
+    packet::MediaPacket,
 };
 
 use crate::{
+    media::MediaForwardSummary,
+    metrics::StreamForwardingMetrics,
     room::{PublishedStream, Room},
     session::Session,
 };
@@ -28,6 +31,7 @@ pub struct ControlState {
     rooms: BTreeMap<RoomId, Room>,
     viewer_stats: BTreeMap<StreamId, BTreeMap<UserId, ViewerStatsReport>>,
     pending_keyframe_requests: BTreeMap<StreamId, KeyframeReason>,
+    stream_metrics: BTreeMap<StreamId, StreamForwardingMetrics>,
     next_room_id: RoomId,
     next_user_id: UserId,
 }
@@ -44,6 +48,7 @@ impl ControlState {
             rooms: BTreeMap::new(),
             viewer_stats: BTreeMap::new(),
             pending_keyframe_requests: BTreeMap::new(),
+            stream_metrics: BTreeMap::new(),
             next_room_id: 1,
             next_user_id: 1,
         }
@@ -241,6 +246,9 @@ impl ControlState {
             ClientControl::PollStreamConfig(poll) => {
                 self.poll_stream_config(session, poll.room_id, poll.stream_id)
             }
+            ClientControl::PollStreamMetrics(poll) => {
+                self.poll_stream_metrics(session, poll.room_id, poll.stream_id)
+            }
             ClientControl::RequestKeyframe(request) => self.request_keyframe(session, request),
             ClientControl::ViewerStats(report) => {
                 if let Some(user_id) = session.user_id {
@@ -306,6 +314,7 @@ impl ControlState {
                 room.subscriptions.remove(&stream_id);
                 self.viewer_stats.remove(&stream_id);
                 self.pending_keyframe_requests.remove(&stream_id);
+                self.stream_metrics.remove(&stream_id);
             }
         }
         for stream_viewer_stats in self.viewer_stats.values_mut() {
@@ -313,6 +322,28 @@ impl ControlState {
         }
         self.viewer_stats
             .retain(|_, stream_viewer_stats| !stream_viewer_stats.is_empty());
+    }
+
+    pub fn record_media_forward_summary(
+        &mut self,
+        packet: &MediaPacket,
+        summary: MediaForwardSummary,
+        ingress_bytes: usize,
+        received_at_micros: u64,
+    ) {
+        let stream_id = packet.header.room_stream_id;
+        if self.published_stream(stream_id).is_none() {
+            return;
+        }
+        self.stream_metrics
+            .entry(stream_id)
+            .or_default()
+            .record_forwarding(
+                ingress_bytes,
+                summary.queued,
+                summary.dropped,
+                received_at_micros,
+            );
     }
 
     fn aggregate_publisher_feedback(
@@ -616,6 +647,47 @@ impl ControlState {
             )),
         }
     }
+
+    fn poll_stream_metrics(
+        &self,
+        session: &Session,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) -> ServerControl {
+        let Some(user_id) = session.user_id else {
+            return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
+        };
+        let Some(room) = self.rooms.get(&room_id) else {
+            return ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            ));
+        };
+        if !room.participants.contains(&user_id) {
+            return ServerControl::Error(ControlError::new(
+                "not_in_room",
+                "join room before polling stream metrics",
+            ));
+        }
+        if !room.published_streams.contains_key(&stream_id) {
+            return ServerControl::Error(ControlError::new(
+                "stream_not_found",
+                "stream does not exist",
+            ));
+        }
+        let subscriber_count = room
+            .subscriptions
+            .get(&stream_id)
+            .map(|subscribers| subscribers.len() as u32)
+            .unwrap_or_default();
+        ServerControl::StreamMetrics(
+            self.stream_metrics
+                .get(&stream_id)
+                .copied()
+                .unwrap_or_default()
+                .snapshot(room_id, stream_id, subscriber_count),
+        )
+    }
 }
 
 fn viewer_is_degraded(report: &ViewerStatsReport) -> bool {
@@ -632,9 +704,11 @@ mod tests {
         codec::CodecId,
         control::{
             ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind, Ping,
-            PollPublisherFeedback, PollStreamConfig, PublishStream, RequestKeyframe,
-            SetTargetBitrate, SetTargetFramerate, StreamConfig, SubscribeStream, ViewerStatsReport,
+            PollPublisherFeedback, PollStreamConfig, PollStreamMetrics, PublishStream,
+            RequestKeyframe, SetTargetBitrate, SetTargetFramerate, StreamConfig, SubscribeStream,
+            ViewerStatsReport,
         },
+        packet::{MediaPacket, MediaPacketHeader, PacketFlags, PacketType},
     };
 
     use super::*;
@@ -742,6 +816,86 @@ mod tests {
         assert!(!room.participants.contains(&publisher.user_id.unwrap()));
         assert!(!room.published_streams.contains_key(&9));
         assert!(!room.subscriptions.contains_key(&9));
+    }
+
+    #[test]
+    fn publisher_can_poll_recorded_stream_metrics() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        let packet = synthetic_packet(9);
+        let ingress_bytes = packet.encode().unwrap().len();
+        state.record_media_forward_summary(
+            &packet,
+            MediaForwardSummary {
+                stream_id: 9,
+                queued: 1,
+                dropped: 1,
+            },
+            ingress_bytes,
+            1_700_000,
+        );
+
+        let response = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                6,
+                ClientControl::PollStreamMetrics(PollStreamMetrics {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::StreamMetrics(metrics) => {
+                assert_eq!(metrics.room_id, room_id);
+                assert_eq!(metrics.stream_id, 9);
+                assert_eq!(metrics.ingress_packets, 1);
+                assert_eq!(metrics.ingress_bytes, ingress_bytes as u64);
+                assert_eq!(metrics.egress_queued_packets, 1);
+                assert_eq!(metrics.egress_dropped_packets, 1);
+                assert_eq!(metrics.subscriber_count, 1);
+                assert_eq!(metrics.last_ingress_time_micros, 1_700_000);
+            }
+            other => panic!("unexpected stream metrics response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_participant_cannot_poll_stream_metrics() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut outsider = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut outsider, "outsider");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut outsider,
+            ClientEnvelope::new(
+                6,
+                ClientControl::PollStreamMetrics(PollStreamMetrics {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_in_room"),
+            other => panic!("unexpected stream metrics response: {other:?}"),
+        }
     }
 
     #[test]
@@ -1422,5 +1576,19 @@ mod tests {
             frames_per_second: 30,
             timebase_hz: 90_000,
         }
+    }
+
+    fn synthetic_packet(stream_id: StreamId) -> MediaPacket {
+        let payload = bytes::Bytes::from_static(b"synthetic");
+        let mut header = MediaPacketHeader::new(
+            PacketType::Video,
+            CodecId::H264,
+            stream_id,
+            1,
+            payload.len() as u16,
+        );
+        header.frame_id = 1;
+        header.flags = PacketFlags::empty().with(PacketFlags::END_OF_FRAME);
+        MediaPacket { header, payload }
     }
 }

@@ -17,7 +17,9 @@ use teamview_protocol::{
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::{control::ControlState, media::MediaRelay, session::Session};
+use crate::{
+    control::ControlState, media::MediaRelay, metrics::unix_time_micros, session::Session,
+};
 
 const CONTROL_STREAM_READ_LIMIT: usize = 64 * 1024;
 const CONTROL_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -159,9 +161,10 @@ impl ControlRuntime {
                 return;
             }
         };
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         let media = self.media.lock().await;
         let summary = media.forward_media_packet(&state, user_id, &packet);
+        state.record_media_forward_summary(&packet, summary, bytes.len(), unix_time_micros());
         debug!(
             session_id,
             user_id,
@@ -211,8 +214,9 @@ mod tests {
         PROTOCOL_VERSION,
         codec::CodecId,
         control::{
-            ClientControl, ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind, PublishStream,
-            ServerControl, SubscribeStream, decode_server_envelope, encode_client_envelope,
+            ClientControl, ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind,
+            PollStreamMetrics, PublishStream, ServerControl, SubscribeStream,
+            decode_server_envelope, encode_client_envelope,
         },
         packet::{MediaPacket, MediaPacketHeader, PacketFlags, PacketType},
     };
@@ -495,6 +499,32 @@ mod tests {
             .expect("datagram read succeeds");
 
         assert_eq!(MediaPacket::decode(&forwarded).unwrap(), packet);
+
+        let metrics = send_control_request(
+            &publisher,
+            ClientEnvelope::new(
+                5,
+                ClientControl::PollStreamMetrics(PollStreamMetrics {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        )
+        .await;
+        match metrics.message {
+            ServerControl::StreamMetrics(metrics) => {
+                assert_eq!(metrics.room_id, room_id);
+                assert_eq!(metrics.stream_id, 9);
+                assert_eq!(metrics.ingress_packets, 1);
+                assert_eq!(metrics.egress_queued_packets, 1);
+                assert_eq!(metrics.egress_dropped_packets, 0);
+                assert_eq!(metrics.subscriber_count, 1);
+                assert!(metrics.ingress_bytes > 0);
+                assert!(metrics.last_ingress_time_micros > 0);
+            }
+            other => panic!("unexpected metrics response: {other:?}"),
+        }
+
         publisher.close(0_u32.into(), b"done");
         viewer.close(0_u32.into(), b"done");
         server_task.abort();

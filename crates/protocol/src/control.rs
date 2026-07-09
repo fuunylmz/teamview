@@ -37,6 +37,7 @@ pub enum ClientControl {
     LeaveRoom(LeaveRoom),
     SetStreamConfig(StreamConfig),
     PollStreamConfig(PollStreamConfig),
+    PollStreamMetrics(PollStreamMetrics),
     RequestKeyframe(RequestKeyframe),
     ViewerStats(ViewerStatsReport),
     PollPublisherFeedback(PollPublisherFeedback),
@@ -57,6 +58,7 @@ pub enum ServerControl {
     RoomLeft(RoomLeft),
     RequestKeyframe(RequestKeyframe),
     StreamConfig(StreamConfig),
+    StreamMetrics(StreamMetricsSnapshot),
     PublisherFeedback(PublisherFeedback),
     Error(ControlError),
 }
@@ -189,6 +191,24 @@ pub struct StreamConfig {
 pub struct PollStreamConfig {
     pub room_id: RoomId,
     pub stream_id: StreamId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PollStreamMetrics {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamMetricsSnapshot {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+    pub ingress_packets: u64,
+    pub ingress_bytes: u64,
+    pub egress_queued_packets: u64,
+    pub egress_dropped_packets: u64,
+    pub subscriber_count: u32,
+    pub last_ingress_time_micros: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -380,6 +400,27 @@ mod tests {
         let encoded = encode_client_envelope(&envelope).unwrap();
 
         assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn stream_metrics_round_trips_from_server() {
+        let envelope = ServerEnvelope::new(
+            9,
+            ServerControl::StreamMetrics(StreamMetricsSnapshot {
+                room_id: 1,
+                stream_id: 9,
+                ingress_packets: 3,
+                ingress_bytes: 900,
+                egress_queued_packets: 6,
+                egress_dropped_packets: 1,
+                subscriber_count: 2,
+                last_ingress_time_micros: 1_700_000,
+            }),
+        );
+
+        let encoded = encode_server_envelope(&envelope).unwrap();
+
+        assert_eq!(decode_server_envelope(&encoded).unwrap(), envelope);
     }
 
     #[test]

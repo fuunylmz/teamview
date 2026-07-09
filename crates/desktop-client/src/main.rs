@@ -17,9 +17,10 @@ use teamview_protocol::{
     codec::CodecId,
     control::{
         ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind, Ping,
-        PollPublisherFeedback, PollStreamConfig, PublishStream, PublisherFeedback, RequestKeyframe,
-        RoomId, ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig,
-        StreamId, SubscribeStream, ViewerStatsReport,
+        PollPublisherFeedback, PollStreamConfig, PollStreamMetrics, PublishStream,
+        PublisherFeedback, RequestKeyframe, RoomId, ServerControl, ServerEnvelope,
+        SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId, StreamMetricsSnapshot,
+        SubscribeStream, ViewerStatsReport,
     },
     frame::packetize_frame_for_datagram_target,
     packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket},
@@ -344,6 +345,17 @@ async fn run_synthetic_broadcaster_media(
         );
     }
     apply_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
+    let stream_metrics = poll_stream_metrics(control, room_id, args.stream_id).await?;
+    println!(
+        "stream-metrics stream_id={} ingress_packets={} ingress_bytes={} egress_queued={} egress_dropped={} subscribers={} last_ingress_time_micros={}",
+        stream_metrics.stream_id,
+        stream_metrics.ingress_packets,
+        stream_metrics.ingress_bytes,
+        stream_metrics.egress_queued_packets,
+        stream_metrics.egress_dropped_packets,
+        stream_metrics.subscriber_count,
+        stream_metrics.last_ingress_time_micros
+    );
     println!(
         "media-summary role=broadcaster frames={} packets={} fps={} run_ms={}",
         media_frames, sent_packets, args.media_fps, args.media_run_ms
@@ -448,6 +460,25 @@ async fn poll_publisher_feedback(
         ServerControl::PublisherFeedback(feedback) => Ok(feedback),
         ServerControl::Error(error) => bail!("poll publisher feedback failed: {}", error.message),
         other => bail!("unexpected publisher feedback response: {other:?}"),
+    }
+}
+
+async fn poll_stream_metrics(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+) -> anyhow::Result<StreamMetricsSnapshot> {
+    let response = control
+        .send(ClientControl::PollStreamMetrics(PollStreamMetrics {
+            room_id,
+            stream_id,
+        }))
+        .await?;
+    print_control_response("stream-metrics", &response);
+    match response.message {
+        ServerControl::StreamMetrics(metrics) => Ok(metrics),
+        ServerControl::Error(error) => bail!("poll stream metrics failed: {}", error.message),
+        other => bail!("unexpected stream metrics response: {other:?}"),
     }
 }
 

@@ -16,7 +16,7 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-use crate::control::ControlState;
+use crate::{control::ControlState, metrics::unix_time_micros};
 
 const DEFAULT_EGRESS_QUEUE_CAPACITY: usize = 256;
 
@@ -205,9 +205,10 @@ pub async fn serve_media_datagrams(
                 continue;
             }
         };
-        let state = state.lock().await;
+        let mut state = state.lock().await;
         let media = media.lock().await;
         let summary = media.forward_media_packet(&state, user_id, &packet);
+        state.record_media_forward_summary(&packet, summary, bytes.len(), unix_time_micros());
         debug!(
             user_id,
             stream_id = summary.stream_id,
