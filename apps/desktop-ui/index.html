@@ -21,8 +21,12 @@
           <div>
             <p class="eyebrow">Channel</p>
             <h1 id="channelTitle">General</h1>
+            <p class="subtle" id="channelMeta">0 participants</p>
           </div>
-          <div class="status-pill" id="connectionState">Connected</div>
+          <div class="connection">
+            <span class="status-pill" id="connectionState">Connected</span>
+            <span class="relay-pill" id="relayState">127.0.0.1:4433</span>
+          </div>
         </header>
 
         <section class="preview-panel">
@@ -30,11 +34,14 @@
             <div>
               <p class="eyebrow">Screen</p>
               <h2 id="screenTitle">Primary monitor</h2>
+              <p class="subtle" id="screenPublisher">Stream 1</p>
             </div>
             <div class="metrics">
+              <span id="screenCodecMetric">H264</span>
               <span id="resolutionMetric">1280x720</span>
               <span id="fpsMetric">30 fps</span>
               <span id="latencyMetric">42 ms</span>
+              <span id="dropMetric">0 drops</span>
             </div>
           </div>
           <canvas id="screenPreview" width="1280" height="720"></canvas>
@@ -65,8 +72,14 @@
           <div>
             <p class="eyebrow">Voice</p>
             <h2 id="voiceState">Speaking</h2>
+            <p class="subtle" id="voiceDeviceState">Default microphone</p>
           </div>
           <canvas id="voiceCanvas" width="360" height="96"></canvas>
+          <div class="voice-stats">
+            <span id="voiceCodecMetric">Opus</span>
+            <span id="voiceLatencyMetric">0 ms</span>
+            <span id="voiceDropMetric">0 drops</span>
+          </div>
         </section>
         <section class="participants">
           <div class="section-head">

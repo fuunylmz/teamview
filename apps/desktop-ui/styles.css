@@ -81,7 +81,7 @@ button {
 .channel {
   width: 100%;
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
   padding: 10px;
@@ -99,7 +99,22 @@ button {
 }
 
 .channel-name {
+  display: block;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-body {
+  min-width: 0;
+}
+
+.channel-activity {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -134,6 +149,12 @@ button {
   text-transform: uppercase;
 }
 
+.subtle {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 h1,
 h2 {
   margin: 0;
@@ -148,9 +169,18 @@ h2 {
   font-size: 16px;
 }
 
+.connection {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .status-pill,
+.relay-pill,
 .metrics span,
-.participant-badge {
+.participant-badge,
+.voice-stats span {
   border: 1px solid var(--line);
   border-radius: 999px;
   color: var(--muted);
@@ -163,6 +193,18 @@ h2 {
   background: var(--teal);
   border-color: var(--teal);
   font-weight: 700;
+}
+
+.status-pill[data-status="connecting"] {
+  color: #141006;
+  background: var(--amber);
+  border-color: var(--amber);
+}
+
+.status-pill[data-status="disconnected"] {
+  color: #160909;
+  background: var(--red);
+  border-color: var(--red);
 }
 
 .preview-panel,
@@ -232,6 +274,11 @@ h2 {
   color: var(--red);
 }
 
+.control:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .icon {
   font-size: 18px;
   line-height: 1;
@@ -255,6 +302,13 @@ h2 {
   margin-top: 10px;
 }
 
+.voice-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .participants {
   min-height: 0;
   overflow: auto;
@@ -274,7 +328,7 @@ h2 {
 
 .participant {
   display: grid;
-  grid-template-columns: 34px 1fr auto;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
   gap: 10px;
   align-items: center;
   min-height: 54px;
@@ -298,6 +352,10 @@ h2 {
   color: #06110e;
 }
 
+.participant-body {
+  min-width: 0;
+}
+
 .participant-name {
   min-width: 0;
   overflow: hidden;
@@ -310,6 +368,19 @@ h2 {
   margin-top: 3px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.participant-badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  max-width: 140px;
+}
+
+.participant-badge.voice {
+  color: var(--teal);
+  border-color: rgba(44, 198, 164, 0.45);
 }
 
 .participant-badge.screen {

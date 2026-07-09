@@ -1,36 +1,113 @@
-const appState = {
+const LOCAL_USER_ID = 101;
+
+const clientApp = {
+  role: "broadcaster",
+  connection: "connected",
+  relayAddr: "127.0.0.1:4433",
   selectedChannelId: 1,
-  connected: true,
-  sharing: true,
-  muted: false,
-  deafened: false,
-  pushToTalk: false,
   frame: 0,
+  localVoice: {
+    muted: false,
+    deafened: false,
+    pushToTalk: false,
+    pttActive: false,
+    inputLabel: "Default microphone",
+    outputLabel: "Default speaker",
+  },
+  localScreenShare: {
+    sharing: true,
+    streamId: 1,
+    sourceLabel: "Primary monitor",
+    targetWidth: 1280,
+    targetHeight: 720,
+    targetFps: 30,
+  },
   channels: [
     {
-      id: 1,
+      channelId: 1,
       name: "General",
-      screen: { title: "Primary monitor", width: 1280, height: 720, fps: 30, latency: 42 },
       participants: [
-        { id: 7, name: "Alice", speaking: true, muted: false, screen: true },
-        { id: 8, name: "Ben", speaking: false, muted: false, screen: false },
-        { id: 9, name: "Chen", speaking: false, muted: true, screen: false },
+        participant(LOCAL_USER_ID, "You", { speaking: true, sharingScreen: true }),
+        participant(7, "Alice", { speaking: true }),
+        participant(8, "Ben"),
+        participant(9, "Chen", { muted: true }),
       ],
+      screenStream: {
+        streamId: 1,
+        publisherId: LOCAL_USER_ID,
+        codec: "H264",
+        title: "Primary monitor",
+        width: 1280,
+        height: 720,
+        framesPerSecond: 30,
+        subscribed: true,
+        renderedFrames: 2840,
+        droppedFrames: 0,
+        latencyMs: 28,
+        bitrateBps: 192000,
+      },
+      voiceStream: {
+        streamId: 2,
+        publisherId: LOCAL_USER_ID,
+        codec: "Opus",
+        framesPerSecond: 50,
+        subscribed: true,
+        decodedFrames: 4680,
+        droppedFrames: 0,
+        latencyMs: 8,
+        bitrateBps: 38400,
+      },
     },
     {
-      id: 2,
+      channelId: 2,
       name: "Ops Review",
-      screen: { title: "Window capture", width: 1600, height: 900, fps: 24, latency: 58 },
       participants: [
-        { id: 10, name: "Dana", speaking: true, muted: false, screen: true },
-        { id: 11, name: "Mina", speaking: false, muted: false, screen: false },
+        participant(LOCAL_USER_ID, "You"),
+        participant(10, "Dana", { speaking: true, sharingScreen: true }),
+        participant(11, "Mina"),
       ],
+      screenStream: {
+        streamId: 4,
+        publisherId: 10,
+        codec: "H264",
+        title: "Window capture",
+        width: 1600,
+        height: 900,
+        framesPerSecond: 24,
+        subscribed: true,
+        renderedFrames: 1612,
+        droppedFrames: 2,
+        latencyMs: 54,
+        bitrateBps: 307200,
+      },
+      voiceStream: {
+        streamId: 5,
+        publisherId: 10,
+        codec: "Opus",
+        framesPerSecond: 50,
+        subscribed: true,
+        decodedFrames: 2390,
+        droppedFrames: 0,
+        latencyMs: 11,
+        bitrateBps: 38400,
+      },
     },
     {
-      id: 3,
+      channelId: 3,
       name: "Quiet Room",
-      screen: null,
-      participants: [{ id: 12, name: "Noah", speaking: false, muted: false, screen: false }],
+      participants: [participant(LOCAL_USER_ID, "You"), participant(12, "Noah")],
+      screenStream: null,
+      voiceStream: {
+        streamId: 7,
+        publisherId: 12,
+        codec: "Opus",
+        framesPerSecond: 50,
+        subscribed: true,
+        decodedFrames: 530,
+        droppedFrames: 0,
+        latencyMs: 9,
+        bitrateBps: 38400,
+      },
     },
   ],
 };
@@ -38,122 +115,306 @@ const appState = {
 const elements = {
   channelList: document.querySelector("#channelList"),
   channelTitle: document.querySelector("#channelTitle"),
+  channelMeta: document.querySelector("#channelMeta"),
   connectionState: document.querySelector("#connectionState"),
+  relayState: document.querySelector("#relayState"),
   screenTitle: document.querySelector("#screenTitle"),
+  screenPublisher: document.querySelector("#screenPublisher"),
+  screenCodecMetric: document.querySelector("#screenCodecMetric"),
   resolutionMetric: document.querySelector("#resolutionMetric"),
   fpsMetric: document.querySelector("#fpsMetric"),
   latencyMetric: document.querySelector("#latencyMetric"),
+  dropMetric: document.querySelector("#dropMetric"),
   shareButton: document.querySelector("#shareButton"),
   muteButton: document.querySelector("#muteButton"),
   deafenButton: document.querySelector("#deafenButton"),
   pttButton: document.querySelector("#pttButton"),
   voiceState: document.querySelector("#voiceState"),
+  voiceDeviceState: document.querySelector("#voiceDeviceState"),
+  voiceCodecMetric: document.querySelector("#voiceCodecMetric"),
+  voiceLatencyMetric: document.querySelector("#voiceLatencyMetric"),
+  voiceDropMetric: document.querySelector("#voiceDropMetric"),
   participantCount: document.querySelector("#participantCount"),
   participantList: document.querySelector("#participantList"),
   screenPreview: document.querySelector("#screenPreview"),
   voiceCanvas: document.querySelector("#voiceCanvas"),
 };
 
+function participant(userId, displayName, overrides = {}) {
+  return {
+    userId,
+    displayName,
+    muted: false,
+    deafened: false,
+    pushToTalk: false,
+    speaking: false,
+    sharingScreen: false,
+    ...overrides,
+  };
+}
+
 function selectedChannel() {
-  return appState.channels.find((channel) => channel.id === appState.selectedChannelId);
+  return clientApp.channels.find((channel) => channel.channelId === clientApp.selectedChannelId);
 }
 
 function render() {
   const channel = selectedChannel();
+  syncChannelState(channel);
   renderChannels(channel);
   renderTopbar(channel);
-  renderControls();
+  renderScreenMetrics(channel);
+  renderControls(channel);
   renderParticipants(channel);
   drawScreen(channel);
   drawVoice(channel);
 }
 
+function syncChannelState(channel) {
+  for (const item of clientApp.channels) {
+    const localParticipant = item.participants.find((entry) => entry.userId === LOCAL_USER_ID);
+    if (localParticipant && item.channelId !== channel.channelId) {
+      localParticipant.speaking = false;
+      localParticipant.sharingScreen = false;
+    }
+    if (item.channelId !== channel.channelId && item.screenStream?.publisherId === LOCAL_USER_ID) {
+      item.screenStream = null;
+    }
+    if (item.channelId !== channel.channelId && item.voiceStream?.publisherId === LOCAL_USER_ID) {
+      item.voiceStream = null;
+    }
+  }
+
+  const localParticipant = ensureLocalParticipant(channel);
+  localParticipant.muted = clientApp.localVoice.muted;
+  localParticipant.deafened = clientApp.localVoice.deafened;
+  localParticipant.pushToTalk = clientApp.localVoice.pushToTalk;
+  localParticipant.speaking = localSpeaking();
+  localParticipant.sharingScreen = clientApp.localScreenShare.sharing;
+
+  if (clientApp.localScreenShare.sharing) {
+    const previous = channel.screenStream?.publisherId === LOCAL_USER_ID ? channel.screenStream : {};
+    channel.screenStream = {
+      streamId: clientApp.localScreenShare.streamId,
+      publisherId: LOCAL_USER_ID,
+      codec: "H264",
+      title: clientApp.localScreenShare.sourceLabel,
+      width: clientApp.localScreenShare.targetWidth,
+      height: clientApp.localScreenShare.targetHeight,
+      framesPerSecond: clientApp.localScreenShare.targetFps,
+      subscribed: true,
+      renderedFrames: previous.renderedFrames ?? 0,
+      droppedFrames: previous.droppedFrames ?? 0,
+      latencyMs: previous.latencyMs ?? 28,
+      bitrateBps: 192000,
+    };
+  } else if (channel.screenStream?.publisherId === LOCAL_USER_ID) {
+    channel.screenStream = null;
+  }
+
+  const previousVoice = channel.voiceStream?.publisherId === LOCAL_USER_ID ? channel.voiceStream : {};
+  channel.voiceStream = {
+    streamId: 2,
+    publisherId: LOCAL_USER_ID,
+    codec: "Opus",
+    framesPerSecond: 50,
+    subscribed: !clientApp.localVoice.deafened,
+    decodedFrames: previousVoice.decodedFrames ?? 0,
+    droppedFrames: previousVoice.droppedFrames ?? 0,
+    latencyMs: previousVoice.latencyMs ?? 8,
+    bitrateBps: 38400,
+  };
+}
+
+function ensureLocalParticipant(channel) {
+  let localParticipant = channel.participants.find((entry) => entry.userId === LOCAL_USER_ID);
+  if (!localParticipant) {
+    localParticipant = participant(LOCAL_USER_ID, "You");
+    channel.participants.unshift(localParticipant);
+  }
+  return localParticipant;
+}
+
+function localSpeaking() {
+  const voice = clientApp.localVoice;
+  return !voice.muted && !voice.deafened && (!voice.pushToTalk || voice.pttActive);
+}
+
 function renderChannels(channel) {
   elements.channelList.replaceChildren(
-    ...appState.channels.map((item) => {
+    ...clientApp.channels.map((item) => {
       const button = document.createElement("button");
       button.type = "button";
-      button.className = item.id === channel.id ? "channel active" : "channel";
+      button.className = item.channelId === channel.channelId ? "channel active" : "channel";
       button.addEventListener("click", () => {
-        appState.selectedChannelId = item.id;
+        clientApp.selectedChannelId = item.channelId;
         render();
       });
+
+      const body = document.createElement("span");
+      body.className = "channel-body";
 
       const name = document.createElement("span");
       name.className = "channel-name";
       name.textContent = item.name;
 
+      const activity = document.createElement("span");
+      activity.className = "channel-activity";
+      activity.textContent = channelActivityLabel(item);
+
       const count = document.createElement("span");
       count.className = "channel-count";
       count.textContent = String(item.participants.length);
 
-      button.append(name, count);
+      body.append(name, activity);
+      button.append(body, count);
       return button;
     }),
   );
 }
 
+function channelActivityLabel(channel) {
+  const segments = [];
+  if (channel.screenStream) segments.push("screen");
+  const speakers = activeSpeakerCount(channel);
+  if (speakers > 0) segments.push(`${speakers} voice`);
+  return segments.length > 0 ? segments.join(" / ") : "idle";
+}
+
 function renderTopbar(channel) {
-  const screen = channel.screen;
+  const speakers = activeSpeakerCount(channel);
   elements.channelTitle.textContent = channel.name;
-  elements.connectionState.textContent = appState.connected ? "Connected" : "Offline";
-  elements.screenTitle.textContent = screen ? screen.title : "No screen stream";
-  elements.resolutionMetric.textContent = screen ? `${screen.width}x${screen.height}` : "0x0";
-  elements.fpsMetric.textContent = screen ? `${screen.fps} fps` : "0 fps";
-  elements.latencyMetric.textContent = screen ? `${screen.latency} ms` : "0 ms";
+  elements.channelMeta.textContent = `${channel.participants.length} participants / ${speakers} speaking`;
+  elements.connectionState.textContent = titleCase(clientApp.connection);
+  elements.connectionState.dataset.status = clientApp.connection;
+  elements.relayState.textContent = clientApp.relayAddr;
 }
 
-function renderControls() {
-  elements.shareButton.classList.toggle("active", appState.sharing);
-  elements.muteButton.classList.toggle("danger", appState.muted);
-  elements.deafenButton.classList.toggle("danger", appState.deafened);
-  elements.pttButton.classList.toggle("active", appState.pushToTalk);
-  elements.voiceState.textContent = voiceLabel();
+function renderScreenMetrics(channel) {
+  const stream = channel.screenStream;
+  elements.screenTitle.textContent = stream ? stream.title : "No screen stream";
+  elements.screenPublisher.textContent = stream
+    ? `Stream ${stream.streamId} / ${publisherName(channel, stream.publisherId)} / ${formatBitrate(stream.bitrateBps)}`
+    : "Waiting for a publisher";
+  elements.screenCodecMetric.textContent = stream ? stream.codec : "H264";
+  elements.resolutionMetric.textContent = stream ? `${stream.width}x${stream.height}` : "0x0";
+  elements.fpsMetric.textContent = stream ? `${stream.framesPerSecond} fps` : "0 fps";
+  elements.latencyMetric.textContent = stream ? `${stream.latencyMs} ms` : "0 ms";
+  elements.dropMetric.textContent = stream ? `${stream.droppedFrames} drops` : "0 drops";
 }
 
-function voiceLabel() {
-  if (appState.deafened) return "Deafened";
-  if (appState.muted) return "Muted";
-  if (appState.pushToTalk) return "PTT armed";
-  return "Speaking";
+function renderControls(channel) {
+  const voice = clientApp.localVoice;
+  elements.shareButton.classList.toggle("active", clientApp.localScreenShare.sharing);
+  elements.muteButton.classList.toggle("danger", voice.muted);
+  elements.deafenButton.classList.toggle("danger", voice.deafened);
+  elements.pttButton.classList.toggle("active", voice.pushToTalk);
+  elements.pttButton.disabled = voice.muted || voice.deafened;
+  elements.shareButton.setAttribute("aria-pressed", String(clientApp.localScreenShare.sharing));
+  elements.muteButton.setAttribute("aria-pressed", String(voice.muted));
+  elements.deafenButton.setAttribute("aria-pressed", String(voice.deafened));
+  elements.pttButton.setAttribute("aria-pressed", String(voice.pushToTalk));
+
+  setButtonLabel(elements.shareButton, clientApp.localScreenShare.sharing ? "Stop share" : "Share screen");
+  setButtonLabel(elements.muteButton, voice.muted ? "Unmute" : "Mute");
+  setButtonLabel(elements.deafenButton, voice.deafened ? "Undeafen" : "Deafen");
+  setButtonLabel(elements.pttButton, voice.pttActive ? "PTT active" : voice.pushToTalk ? "PTT ready" : "PTT");
+
+  const voiceStream = channel.voiceStream;
+  elements.voiceState.textContent = voiceLabel(channel);
+  elements.voiceDeviceState.textContent = `${voice.inputLabel} / ${voice.outputLabel}`;
+  elements.voiceCodecMetric.textContent = voiceStream
+    ? `${voiceStream.codec} / ${voiceStream.framesPerSecond} fps`
+    : "Opus / 0 fps";
+  elements.voiceLatencyMetric.textContent = voiceStream ? `${voiceStream.latencyMs} ms` : "0 ms";
+  elements.voiceDropMetric.textContent = voiceStream ? `${voiceStream.droppedFrames} drops` : "0 drops";
+}
+
+function setButtonLabel(button, label) {
+  button.querySelector("span:last-child").textContent = label;
+}
+
+function voiceLabel(channel) {
+  const voice = clientApp.localVoice;
+  if (voice.deafened) return "Deafened";
+  if (voice.muted) return "Muted";
+  if (voice.pushToTalk && voice.pttActive) return "PTT active";
+  if (voice.pushToTalk) return "PTT ready";
+  return activeSpeakerCount(channel) > 0 ? "Voice active" : "Idle";
 }
 
 function renderParticipants(channel) {
   elements.participantCount.textContent = String(channel.participants.length);
   elements.participantList.replaceChildren(
-    ...channel.participants.map((participant) => {
+    ...channel.participants.map((entry) => {
       const row = document.createElement("div");
-      row.className = participant.speaking ? "participant speaking" : "participant";
+      row.className = entry.speaking && !entry.muted ? "participant speaking" : "participant";
 
       const avatar = document.createElement("div");
       avatar.className = "avatar";
-      avatar.textContent = initials(participant.name);
+      avatar.textContent = initials(entry.displayName);
 
       const body = document.createElement("div");
+      body.className = "participant-body";
+
       const name = document.createElement("div");
       name.className = "participant-name";
-      name.textContent = participant.name;
+      name.textContent = entry.displayName;
+
       const meta = document.createElement("div");
       meta.className = "participant-meta";
-      meta.textContent = participant.speaking ? "voice active" : "idle";
+      meta.textContent = participantMeta(entry);
+
       body.append(name, meta);
 
-      const badge = document.createElement("span");
-      if (participant.screen) {
-        badge.className = "participant-badge screen";
-        badge.textContent = "screen";
-      } else if (participant.muted) {
-        badge.className = "participant-badge muted";
-        badge.textContent = "muted";
-      } else {
-        badge.className = "participant-badge";
-        badge.textContent = "voice";
+      const badges = document.createElement("div");
+      badges.className = "participant-badges";
+      for (const badge of participantBadges(entry)) {
+        const node = document.createElement("span");
+        node.className = `participant-badge ${badge.kind}`;
+        node.textContent = badge.label;
+        badges.append(node);
       }
 
-      row.append(avatar, body, badge);
+      row.append(avatar, body, badges);
       return row;
     }),
   );
+}
+
+function participantMeta(entry) {
+  const parts = [];
+  if (entry.speaking && !entry.muted) parts.push("voice active");
+  if (entry.sharingScreen) parts.push("screen live");
+  if (entry.pushToTalk) parts.push("ptt");
+  if (entry.muted) parts.push("muted");
+  if (entry.deafened) parts.push("deafened");
+  return parts.length > 0 ? parts.join(" / ") : "idle";
+}
+
+function participantBadges(entry) {
+  const badges = [];
+  if (entry.sharingScreen) badges.push({ kind: "screen", label: "screen" });
+  if (entry.muted) badges.push({ kind: "muted", label: "muted" });
+  if (entry.deafened) badges.push({ kind: "muted", label: "deaf" });
+  if (!entry.muted && !entry.deafened) badges.push({ kind: "voice", label: "voice" });
+  return badges;
+}
+
+function activeSpeakerCount(channel) {
+  return channel.participants.filter((entry) => entry.speaking && !entry.muted).length;
+}
+
+function publisherName(channel, publisherId) {
+  return channel.participants.find((entry) => entry.userId === publisherId)?.displayName ?? `User ${publisherId}`;
+}
+
+function formatBitrate(value) {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)} Mbps`;
+  return `${Math.round(value / 1000)} Kbps`;
+}
+
+function titleCase(value) {
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function initials(name) {
@@ -170,31 +431,34 @@ function drawScreen(channel) {
   const ctx = canvas.getContext("2d");
   const width = canvas.width;
   const height = canvas.height;
-  const screen = channel.screen;
+  const stream = channel.screenStream;
 
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#080a0d";
   ctx.fillRect(0, 0, width, height);
 
-  if (!screen) {
+  if (!stream) {
     ctx.fillStyle = "#9aa4b2";
     ctx.font = "42px system-ui";
     ctx.fillText("No active stream", 64, 110);
+    ctx.fillStyle = "#343b45";
+    ctx.fillRect(64, 150, 360, 12);
+    ctx.fillRect(64, 178, 270, 12);
     return;
   }
 
-  const offset = appState.frame % 180;
+  const offset = clientApp.frame % 180;
   const gradient = ctx.createLinearGradient(0, 0, width, height);
-  gradient.addColorStop(0, "#1e2934");
-  gradient.addColorStop(0.5, "#243a3b");
-  gradient.addColorStop(1, "#1b2130");
+  gradient.addColorStop(0, "#18222c");
+  gradient.addColorStop(0.52, "#1d3532");
+  gradient.addColorStop(1, "#202430");
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, width, height);
 
   drawWindow(ctx, 72, 72, 500, 284, "#2cc6a4", offset);
   drawWindow(ctx, 620, 110, 420, 220, "#4d8dff", offset * 0.6);
   drawTimeline(ctx, 72, 430, width - 144, 120, offset);
-  drawCursor(ctx, 860 + Math.sin(appState.frame / 18) * 160, 474 + Math.cos(appState.frame / 22) * 70);
+  drawCursor(ctx, 860 + Math.sin(clientApp.frame / 18) * 160, 474 + Math.cos(clientApp.frame / 22) * 70);
 }
 
 function drawWindow(ctx, x, y, width, height, accent, offset) {
@@ -250,14 +514,14 @@ function drawVoice(channel) {
   const ctx = canvas.getContext("2d");
   const width = canvas.width;
   const height = canvas.height;
-  const activeSpeakers = channel.participants.filter((participant) => participant.speaking).length;
+  const activeSpeakers = activeSpeakerCount(channel);
 
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#11161b";
   ctx.fillRect(0, 0, width, height);
   for (let index = 0; index < 36; index += 1) {
-    const wave = Math.sin((appState.frame + index * 9) / 9);
-    const gain = appState.muted || appState.deafened ? 0.2 : 0.55 + activeSpeakers * 0.14;
+    const wave = Math.sin((clientApp.frame + index * 9) / 9);
+    const gain = clientApp.localVoice.muted || clientApp.localVoice.deafened ? 0.18 : 0.48 + activeSpeakers * 0.12;
     const barHeight = Math.max(5, Math.abs(wave) * height * gain);
     ctx.fillStyle = index % 4 === 0 ? "#2cc6a4" : "#4d8dff";
     ctx.fillRect(index * 10, (height - barHeight) / 2, 5, barHeight);
@@ -265,31 +529,35 @@ function drawVoice(channel) {
 }
 
 elements.shareButton.addEventListener("click", () => {
-  appState.sharing = !appState.sharing;
+  clientApp.localScreenShare.sharing = !clientApp.localScreenShare.sharing;
   render();
 });
 
 elements.muteButton.addEventListener("click", () => {
-  appState.muted = !appState.muted;
-  if (appState.muted) appState.pushToTalk = false;
+  clientApp.localVoice.muted = !clientApp.localVoice.muted;
+  if (!clientApp.localVoice.muted) clientApp.localVoice.deafened = false;
+  if (clientApp.localVoice.muted) clientApp.localVoice.pttActive = false;
   render();
 });
 
 elements.deafenButton.addEventListener("click", () => {
-  appState.deafened = !appState.deafened;
-  if (appState.deafened) appState.muted = true;
-  render();
-});
-
-elements.pttButton.addEventListener("click", () => {
-  if (!appState.muted && !appState.deafened) {
-    appState.pushToTalk = !appState.pushToTalk;
+  clientApp.localVoice.deafened = !clientApp.localVoice.deafened;
+  if (clientApp.localVoice.deafened) {
+    clientApp.localVoice.muted = true;
+    clientApp.localVoice.pttActive = false;
   }
   render();
 });
 
+elements.pttButton.addEventListener("click", () => {
+  if (clientApp.localVoice.muted || clientApp.localVoice.deafened) return;
+  clientApp.localVoice.pushToTalk = !clientApp.localVoice.pushToTalk;
+  clientApp.localVoice.pttActive = clientApp.localVoice.pushToTalk;
+  render();
+});
+
 function animate() {
-  appState.frame += 1;
+  clientApp.frame += 1;
   drawScreen(selectedChannel());
   drawVoice(selectedChannel());
   requestAnimationFrame(animate);
