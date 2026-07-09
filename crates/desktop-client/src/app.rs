@@ -28,6 +28,7 @@ pub struct ClientApp {
     pub role: ClientRole,
     pub connection: ConnectionStatus,
     pub relay_addr: String,
+    pub local_user_id: Option<UserId>,
     pub selected_channel_id: Option<ChannelId>,
     pub channels: Vec<ChannelView>,
     pub local_voice: VoiceControlState,
@@ -116,6 +117,7 @@ pub struct ScreenShareControlState {
 pub struct ClientAppDiscovery<'a> {
     pub role: ClientRole,
     pub relay_addr: &'a str,
+    pub local_user_id: Option<UserId>,
     pub selected_channel_id: Option<ChannelId>,
     pub rooms: &'a [RoomSummary],
     pub streams: &'a [StreamSummary],
@@ -131,6 +133,7 @@ impl ClientApp {
             role,
             connection: ConnectionStatus::Disconnected,
             relay_addr: "127.0.0.1:4433".to_owned(),
+            local_user_id: None,
             selected_channel_id: None,
             channels: Vec::new(),
             local_voice: VoiceControlState::default(),
@@ -145,6 +148,7 @@ impl ClientApp {
         app.connection = ConnectionStatus::Connected;
         app.relay_addr = relay_addr.clone();
         app.status_line = format!("Connected to {relay_addr}");
+        app.local_user_id = discovery.local_user_id;
         app.local_voice = discovery.local_voice.clone();
         app.local_screen_share = discovery.local_screen_share.clone();
 
@@ -576,6 +580,7 @@ mod tests {
         let app = ClientApp::from_discovery(ClientAppDiscovery {
             role: ClientRole::Broadcaster,
             relay_addr: "127.0.0.1:4433",
+            local_user_id: Some(7),
             selected_channel_id: None,
             rooms: &[RoomSummary {
                 room_id: 1,
@@ -593,6 +598,7 @@ mod tests {
         let json = serde_json::to_string(&app).unwrap();
 
         assert!(json.contains(r#""selectedChannelId":1"#));
+        assert!(json.contains(r#""localUserId":7"#));
         assert!(json.contains(r#""localVoice""#));
         assert!(json.contains(r#""screenStream":null"#));
         assert!(json.contains(r#""role":"broadcaster""#));

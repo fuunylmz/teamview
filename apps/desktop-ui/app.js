@@ -114,6 +114,7 @@ const fallbackClientApp = {
 
 let clientApp = cloneState(fallbackClientApp);
 let localUserId = FALLBACK_LOCAL_USER_ID;
+let pendingChannelUpdate = false;
 let pendingVoiceUpdate = false;
 let pendingScreenShareUpdate = false;
 
@@ -193,7 +194,7 @@ function normalizeClientAppState(snapshot) {
       ...fallback.localScreenShare,
       ...(snapshot?.localScreenShare ?? {}),
     },
-    channels: Array.isArray(snapshot?.channels) && snapshot.channels.length > 0
+    channels: Array.isArray(snapshot?.channels)
       ? snapshot.channels.map(normalizeChannel)
       : fallback.channels.map(normalizeChannel),
   };
@@ -278,7 +279,9 @@ function selectedChannel() {
 
 function render() {
   const channel = selectedChannel();
-  if (channel.channelId !== clientApp.selectedChannelId) {
+  if (clientApp.channels.length === 0) {
+    clientApp.selectedChannelId = null;
+  } else if (channel.channelId !== clientApp.selectedChannelId) {
     clientApp.selectedChannelId = channel.channelId;
   }
   syncChannelState(channel);
@@ -368,14 +371,20 @@ function localSpeaking() {
 }
 
 function renderChannels(channel) {
+  const channelSwitchLocked =
+    pendingChannelUpdate ||
+    pendingVoiceUpdate ||
+    pendingScreenShareUpdate ||
+    clientApp.localScreenShare.sharing ||
+    localVoiceStreamPublished(channel);
   elements.channelList.replaceChildren(
     ...clientApp.channels.map((item) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = item.channelId === channel.channelId ? "channel active" : "channel";
-      button.addEventListener("click", () => {
-        clientApp.selectedChannelId = item.channelId;
-        render();
+      button.disabled = channelSwitchLocked && item.channelId !== channel.channelId;
+      button.addEventListener("click", async () => {
+        await selectChannel(item.channelId);
       });
 
       const body = document.createElement("span");
@@ -486,6 +495,31 @@ async function refreshStateFromServer() {
   const response = await fetch("state.json", { cache: "no-store" });
   if (!response.ok) throw new Error(`state refresh failed: ${response.status}`);
   applySnapshot(await response.json());
+}
+
+async function selectChannel(channelId) {
+  if (channelId === clientApp.selectedChannelId) return;
+  clientApp.selectedChannelId = channelId;
+  if (!canUseClientApi()) {
+    render();
+    return;
+  }
+  pendingChannelUpdate = true;
+  render();
+
+  try {
+    const response = await fetch("api/select-channel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ channelId }),
+    });
+    if (!response.ok) throw new Error(`channel selection failed: ${response.status}`);
+    applySnapshot(await response.json());
+  } catch {
+  } finally {
+    pendingChannelUpdate = false;
+    render();
+  }
 }
 
 async function updateVoiceState(nextVoice) {

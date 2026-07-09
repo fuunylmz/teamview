@@ -37,7 +37,7 @@ use teamview_protocol::{
         RoomId, RoomSummary, SendRemoteInput, ServerControl, ServerEnvelope, SetTargetBitrate,
         SetTargetFramerate, SetVoiceState, StreamConfig, StreamId, StreamMetricsSnapshot,
         StreamSummary, SubscribeStream, TimeSyncRequest, TimeSyncResponse, UnpublishStream,
-        UnsubscribeStream, ViewerStatsReport,
+        UnsubscribeStream, UserId, ViewerStatsReport,
     },
     frame::{packetize_frame_for_datagram_target, packetize_frame_with_type_for_datagram_target},
     packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, PacketType},
@@ -392,16 +392,17 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     print_control_response("hello", &response);
     ensure_not_error("hello", &response)?;
+    let (local_user_id, _local_display_name) = hello_identity(&response)?;
     let clock_sync = sync_control_clock(&control, &args).await?;
     if let Some(access_token) = &args.access_token {
         authenticate_control(&control, access_token).await?;
     }
     if args.print_ui_state || args.export_ui_state.is_some() {
-        run_ui_state_export_flow(&control, &args).await?;
+        run_ui_state_export_flow(&control, &args, local_user_id).await?;
         return Ok(());
     }
     if args.serve_ui {
-        run_ui_server_flow(&control, &args, clock_sync).await?;
+        run_ui_server_flow(&control, &args, clock_sync, local_user_id).await?;
         return Ok(());
     }
     if args.list_rooms {
@@ -601,6 +602,16 @@ fn select_best_clock_sync_estimate(
         .min_by_key(|(_, estimate)| estimate.rtt_micros)
 }
 
+fn hello_identity(response: &ServerEnvelope) -> anyhow::Result<(UserId, String)> {
+    match &response.message {
+        ServerControl::HelloAccepted(accepted) => {
+            Ok((accepted.user_id, accepted.display_name.clone()))
+        }
+        ServerControl::Error(error) => bail!("hello failed: {}", error.message),
+        other => bail!("unexpected hello response: {other:?}"),
+    }
+}
+
 async fn authenticate_control(
     control: &crate::transport::quic::ControlClient,
     access_token: &str,
@@ -725,8 +736,9 @@ async fn run_list_participants_flow(
 async fn run_ui_state_export_flow(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
+    local_user_id: UserId,
 ) -> anyhow::Result<()> {
-    let (json, app) = build_ui_state_json(control, args).await?;
+    let (json, app) = build_ui_state_json(control, args, local_user_id).await?;
 
     if let Some(path) = &args.export_ui_state {
         if let Some(parent) = path
@@ -759,28 +771,40 @@ async fn run_ui_state_export_flow(
 async fn build_ui_state_json(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
+    local_user_id: UserId,
 ) -> anyhow::Result<(String, ClientApp)> {
     build_ui_state_json_with_controls(
         control,
         args,
-        args.ui_voice_control_state(),
-        args.ui_screen_share_control_state(),
-        false,
-        false,
+        UiStateBuildOptions {
+            local_user_id,
+            selected_channel_override: None,
+            local_voice: args.ui_voice_control_state(),
+            local_screen_share: args.ui_screen_share_control_state(),
+            push_voice_state: false,
+            keep_room_joined: false,
+        },
     )
     .await
+}
+
+struct UiStateBuildOptions {
+    local_user_id: UserId,
+    selected_channel_override: Option<RoomId>,
+    local_voice: VoiceControlState,
+    local_screen_share: ScreenShareControlState,
+    push_voice_state: bool,
+    keep_room_joined: bool,
 }
 
 async fn build_ui_state_json_with_controls(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
-    local_voice: VoiceControlState,
-    local_screen_share: ScreenShareControlState,
-    push_voice_state: bool,
-    keep_room_joined: bool,
+    options: UiStateBuildOptions,
 ) -> anyhow::Result<(String, ClientApp)> {
     let rooms = list_rooms(control).await?;
-    let selected_channel_id = select_ui_state_channel_id(args, &rooms)?;
+    let selected_channel_id =
+        select_ui_state_channel_id(args, &rooms, options.selected_channel_override)?;
     let mut streams = Vec::new();
     let mut stream_configs = Vec::new();
     let mut participants = Vec::new();
@@ -791,8 +815,8 @@ async fn build_ui_state_json_with_controls(
             .await?;
         print_control_response("join-room", &joined);
         ensure_not_error("join room", &joined)?;
-        if push_voice_state {
-            set_voice_state(control, room_id, &local_voice).await?;
+        if options.push_voice_state {
+            set_voice_state(control, room_id, &options.local_voice).await?;
         } else {
             set_voice_state_if_requested(control, args, room_id).await?;
         }
@@ -800,7 +824,7 @@ async fn build_ui_state_json_with_controls(
         streams = list_room_streams(control, room_id).await?;
         stream_configs = poll_configured_streams(control, room_id, &streams).await?;
         participants = list_room_participants(control, room_id).await?;
-        if !keep_room_joined {
+        if !options.keep_room_joined {
             leave_room(control, room_id).await?;
         }
     }
@@ -808,13 +832,14 @@ async fn build_ui_state_json_with_controls(
     let app = ClientApp::from_discovery(ClientAppDiscovery {
         role: args.client_role(),
         relay_addr: &args.relay,
+        local_user_id: Some(options.local_user_id),
         selected_channel_id,
         rooms: &rooms,
         streams: &streams,
         stream_configs: &stream_configs,
         participants: &participants,
-        local_voice: &local_voice,
-        local_screen_share: &local_screen_share,
+        local_voice: &options.local_voice,
+        local_screen_share: &options.local_screen_share,
     });
     let json = serde_json::to_string_pretty(&app)?;
     Ok((json, app))
@@ -822,6 +847,7 @@ async fn build_ui_state_json_with_controls(
 
 #[derive(Clone)]
 struct UiServerState {
+    selected_channel_id: Arc<Mutex<Option<RoomId>>>,
     local_voice: Arc<Mutex<VoiceControlState>>,
     local_screen_share: Arc<Mutex<ScreenShareControlState>>,
     screen_media_task: Arc<Mutex<Option<UiScreenMediaTask>>>,
@@ -853,11 +879,18 @@ struct ScreenSharePatch {
     sharing: bool,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelSelectionPatch {
+    channel_id: RoomId,
+}
+
 impl UiServerState {
     fn new(args: &Args) -> Self {
         let mut local_screen_share = args.ui_screen_share_control_state();
         local_screen_share.sharing = false;
         Self {
+            selected_channel_id: Arc::new(Mutex::new(args.channel_id.or(args.room_id))),
             local_voice: Arc::new(Mutex::new(args.ui_voice_control_state())),
             local_screen_share: Arc::new(Mutex::new(local_screen_share)),
             screen_media_task: Arc::new(Mutex::new(None)),
@@ -870,6 +903,22 @@ impl UiServerState {
             .lock()
             .map(|state| state.clone())
             .map_err(|_| anyhow::anyhow!("UI voice state lock is poisoned"))
+    }
+
+    fn selected_channel_id(&self) -> anyhow::Result<Option<RoomId>> {
+        self.selected_channel_id
+            .lock()
+            .map(|state| *state)
+            .map_err(|_| anyhow::anyhow!("UI channel selection lock is poisoned"))
+    }
+
+    fn set_selected_channel_id(&self, channel_id: Option<RoomId>) -> anyhow::Result<()> {
+        let mut selected = self
+            .selected_channel_id
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UI channel selection lock is poisoned"))?;
+        *selected = channel_id;
+        Ok(())
     }
 
     fn local_screen_share(&self) -> anyhow::Result<ScreenShareControlState> {
@@ -966,6 +1015,7 @@ impl UiServerState {
 
     fn keep_room_joined(&self) -> anyhow::Result<bool> {
         Ok(self.local_screen_share()?.sharing
+            || self.selected_channel_id()?.is_some()
             || self.screen_media_active()?
             || self.voice_media_active()?)
     }
@@ -975,6 +1025,7 @@ async fn run_ui_server_flow(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
     clock_sync: ClockSyncEstimate,
+    local_user_id: UserId,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&args.ui_listen)
         .with_context(|| format!("failed to bind UI server on {}", args.ui_listen))?;
@@ -991,7 +1042,15 @@ async fn run_ui_server_flow(
     let state = UiServerState::new(&args);
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        serve_ui_http(listener, runtime, control, args, state, clock_sync)
+        serve_ui_http(
+            listener,
+            runtime,
+            control,
+            args,
+            state,
+            clock_sync,
+            local_user_id,
+        )
     })
     .await
     .context("UI server task failed")?
@@ -1004,6 +1063,7 @@ fn serve_ui_http(
     args: Args,
     state: UiServerState,
     clock_sync: ClockSyncEstimate,
+    local_user_id: UserId,
 ) -> anyhow::Result<()> {
     for stream in listener.incoming() {
         match stream {
@@ -1015,6 +1075,7 @@ fn serve_ui_http(
                     &args,
                     &state,
                     clock_sync,
+                    local_user_id,
                 ) {
                     eprintln!("ui-server request failed: {error:#}");
                 }
@@ -1032,6 +1093,7 @@ fn handle_ui_http_connection(
     args: &Args,
     state: &UiServerState,
     clock_sync: ClockSyncEstimate,
+    local_user_id: UserId,
 ) -> anyhow::Result<()> {
     let request = read_ui_http_request(stream)?;
     let method = ui_request_method(&request).unwrap_or("GET");
@@ -1061,7 +1123,12 @@ fn handle_ui_http_connection(
             false,
         ),
         ("GET" | "HEAD", UiRoute::State) => {
-            match runtime.block_on(build_ui_state_json_for_ui(control, args, state)) {
+            match runtime.block_on(build_ui_state_json_for_ui(
+                control,
+                args,
+                state,
+                local_user_id,
+            )) {
                 Ok((json, _)) => write_http_response(
                     stream,
                     "200 OK",
@@ -1084,6 +1151,38 @@ fn handle_ui_http_connection(
                 }
             }
         }
+        ("POST", UiRoute::SelectChannel) => {
+            let patch = match serde_json::from_str::<ChannelSelectionPatch>(body) {
+                Ok(patch) => patch,
+                Err(error) => {
+                    return write_json_error(
+                        stream,
+                        "400 Bad Request",
+                        &anyhow::anyhow!("failed to parse channel selection request: {error}"),
+                    );
+                }
+            };
+            if let Err(error) =
+                runtime.block_on(apply_ui_channel_selection(control, state, patch.channel_id))
+            {
+                return write_json_error(stream, "409 Conflict", &error);
+            }
+            match runtime.block_on(build_ui_state_json_for_ui(
+                control,
+                args,
+                state,
+                local_user_id,
+            )) {
+                Ok((json, _)) => write_http_response(
+                    stream,
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    json.as_bytes(),
+                    true,
+                ),
+                Err(error) => write_json_error(stream, "500 Internal Server Error", &error),
+            }
+        }
         ("POST", UiRoute::VoiceState) => {
             let patch = match serde_json::from_str::<VoiceStatePatch>(body) {
                 Ok(patch) => patch,
@@ -1104,7 +1203,12 @@ fn handle_ui_http_connection(
             )) {
                 return write_json_error(stream, "500 Internal Server Error", &error);
             }
-            match runtime.block_on(build_ui_state_json_for_ui(control, args, state)) {
+            match runtime.block_on(build_ui_state_json_for_ui(
+                control,
+                args,
+                state,
+                local_user_id,
+            )) {
                 Ok((json, _)) => write_http_response(
                     stream,
                     "200 OK",
@@ -1135,7 +1239,12 @@ fn handle_ui_http_connection(
             )) {
                 return write_json_error(stream, "500 Internal Server Error", &error);
             }
-            match runtime.block_on(build_ui_state_json_for_ui(control, args, state)) {
+            match runtime.block_on(build_ui_state_json_for_ui(
+                control,
+                args,
+                state,
+                local_user_id,
+            )) {
                 Ok((json, _)) => write_http_response(
                     stream,
                     "200 OK",
@@ -1152,6 +1261,7 @@ fn handle_ui_http_connection(
             | UiRoute::Script
             | UiRoute::Style
             | UiRoute::State
+            | UiRoute::SelectChannel
             | UiRoute::VoiceState
             | UiRoute::ScreenShare,
         ) => write_http_response(
@@ -1202,6 +1312,41 @@ fn read_ui_http_request(stream: &mut TcpStream) -> anyhow::Result<String> {
     String::from_utf8(request).context("UI HTTP request was not valid UTF-8")
 }
 
+async fn apply_ui_channel_selection(
+    control: &crate::transport::quic::ControlClient,
+    state: &UiServerState,
+    channel_id: RoomId,
+) -> anyhow::Result<()> {
+    if state.screen_media_active()? || state.voice_media_active()? {
+        bail!("stop screen sharing and voice before switching channels");
+    }
+
+    let rooms = list_rooms(control).await?;
+    if !rooms.iter().any(|room| room.room_id == channel_id) {
+        bail!(
+            "channel {} was not found; available channels: {}",
+            channel_id,
+            format_room_summaries(&rooms)
+        );
+    }
+
+    if let Some(previous_channel_id) = state.selected_channel_id()?
+        && previous_channel_id != channel_id
+    {
+        let _ = leave_room(control, previous_channel_id).await;
+    }
+
+    let joined = control
+        .send(ClientControl::JoinRoom(JoinRoom {
+            room_id: channel_id,
+        }))
+        .await?;
+    print_control_response("join-room", &joined);
+    ensure_not_error("join room", &joined)?;
+    set_voice_state(control, channel_id, &state.local_voice()?).await?;
+    state.set_selected_channel_id(Some(channel_id))
+}
+
 async fn apply_ui_screen_share_state(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
@@ -1237,7 +1382,7 @@ async fn start_ui_screen_share(
         return Ok(());
     }
 
-    let room_id = resolve_or_create_ui_channel_id(control, args).await?;
+    let room_id = resolve_or_create_ui_channel_id(control, args, state).await?;
     let joined = control
         .send(ClientControl::JoinRoom(JoinRoom { room_id }))
         .await?;
@@ -1256,6 +1401,7 @@ async fn start_ui_screen_share(
         return Err(error);
     }
 
+    state.set_selected_channel_id(Some(room_id))?;
     state.set_screen_sharing(true)?;
     start_ui_screen_media_task(control, args, state, room_id, clock_sync)?;
     Ok(())
@@ -1272,7 +1418,8 @@ async fn stop_ui_screen_share(
     }
 
     let rooms = list_rooms(control).await?;
-    let Some(room_id) = select_ui_state_channel_id(args, &rooms)? else {
+    let Some(room_id) = select_ui_state_channel_id(args, &rooms, state.selected_channel_id()?)?
+    else {
         stop_ui_screen_media_task(state).await?;
         state.set_screen_sharing(false)?;
         return Ok(());
@@ -1364,7 +1511,7 @@ async fn start_ui_voice_media(
         return Ok(());
     }
 
-    let room_id = resolve_or_create_ui_channel_id(control, args).await?;
+    let room_id = resolve_or_create_ui_channel_id(control, args, state).await?;
     let joined = control
         .send(ClientControl::JoinRoom(JoinRoom { room_id }))
         .await?;
@@ -1388,6 +1535,7 @@ async fn start_ui_voice_media(
         return Err(error);
     }
 
+    state.set_selected_channel_id(Some(room_id))?;
     start_ui_voice_media_task(control, args, state, room_id, voice_stream_id, clock_sync)
 }
 
@@ -1402,7 +1550,8 @@ async fn stop_ui_voice_media(
     }
 
     let rooms = list_rooms(control).await?;
-    let Some(room_id) = select_ui_state_channel_id(args, &rooms)? else {
+    let Some(room_id) = select_ui_state_channel_id(args, &rooms, state.selected_channel_id()?)?
+    else {
         stop_ui_voice_media_task(state).await?;
         return Ok(());
     };
@@ -1460,8 +1609,20 @@ async fn stop_ui_voice_media_task(state: &UiServerState) -> anyhow::Result<()> {
 async fn resolve_or_create_ui_channel_id(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
+    state: &UiServerState,
 ) -> anyhow::Result<RoomId> {
     let rooms = list_rooms(control).await?;
+    if let Some(room_id) = state.selected_channel_id()? {
+        if rooms.iter().any(|room| room.room_id == room_id) {
+            return Ok(room_id);
+        }
+        bail!(
+            "selected channel {} was not found; available channels: {}",
+            room_id,
+            format_room_summaries(&rooms)
+        );
+    }
+
     if let Some(room_id) = args.selected_room_id()? {
         if rooms.iter().any(|room| room.room_id == room_id) {
             return Ok(room_id);
@@ -1526,14 +1687,19 @@ async fn build_ui_state_json_for_ui(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
     state: &UiServerState,
+    local_user_id: UserId,
 ) -> anyhow::Result<(String, ClientApp)> {
     build_ui_state_json_with_controls(
         control,
         args,
-        state.local_voice()?,
-        state.local_screen_share()?,
-        true,
-        state.keep_room_joined()?,
+        UiStateBuildOptions {
+            local_user_id,
+            selected_channel_override: state.selected_channel_id()?,
+            local_voice: state.local_voice()?,
+            local_screen_share: state.local_screen_share()?,
+            push_voice_state: true,
+            keep_room_joined: state.keep_room_joined()?,
+        },
     )
     .await
 }
@@ -1562,6 +1728,7 @@ enum UiRoute {
     Script,
     Style,
     State,
+    SelectChannel,
     VoiceState,
     ScreenShare,
     NotFound,
@@ -1601,6 +1768,7 @@ fn ui_route_for_path(path: &str) -> UiRoute {
         "/app.js" => UiRoute::Script,
         "/styles.css" => UiRoute::Style,
         "/state.json" => UiRoute::State,
+        "/api/select-channel" => UiRoute::SelectChannel,
         "/api/voice-state" => UiRoute::VoiceState,
         "/api/screen-share" => UiRoute::ScreenShare,
         _ => UiRoute::NotFound,
@@ -1633,9 +1801,15 @@ fn write_http_response(
 fn select_ui_state_channel_id(
     args: &Args,
     rooms: &[RoomSummary],
+    selected_channel_override: Option<RoomId>,
 ) -> anyhow::Result<Option<RoomId>> {
     if rooms.is_empty() {
         return Ok(None);
+    }
+    if let Some(room_id) = selected_channel_override
+        && rooms.iter().any(|room| room.room_id == room_id)
+    {
+        return Ok(Some(room_id));
     }
     if let Some(room_id) = args.selected_room_id()? {
         if rooms.iter().any(|room| room.room_id == room_id) {
@@ -4552,6 +4726,10 @@ mod tests {
         assert_eq!(ui_route_for_path("/app.js"), UiRoute::Script);
         assert_eq!(ui_route_for_path("/styles.css"), UiRoute::Style);
         assert_eq!(ui_route_for_path("/state.json"), UiRoute::State);
+        assert_eq!(
+            ui_route_for_path("/api/select-channel"),
+            UiRoute::SelectChannel
+        );
         assert_eq!(ui_route_for_path("/api/voice-state"), UiRoute::VoiceState);
         assert_eq!(ui_route_for_path("/api/screen-share"), UiRoute::ScreenShare);
         assert_eq!(ui_route_for_path("/missing"), UiRoute::NotFound);
@@ -4707,7 +4885,14 @@ mod tests {
             },
         ];
 
-        assert_eq!(select_ui_state_channel_id(&args, &rooms).unwrap(), Some(2));
+        assert_eq!(
+            select_ui_state_channel_id(&args, &rooms, None).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            select_ui_state_channel_id(&args, &rooms, Some(1)).unwrap(),
+            Some(1)
+        );
     }
 
     #[test]

@@ -168,10 +168,12 @@ impl ControlState {
                     } else {
                         session.update_display_name(display_name.clone());
                     }
-                    self.display_names.insert(user_id, display_name);
+                    self.display_names.insert(user_id, display_name.clone());
                     ServerControl::HelloAccepted(HelloAccepted {
                         protocol_version: PROTOCOL_VERSION,
                         server_name: "teamview-relay".to_owned(),
+                        user_id,
+                        display_name,
                     })
                 }
             }
@@ -1628,6 +1630,33 @@ mod tests {
 
         let room_id = create_room(&mut state, &mut session, "stage1");
         assert_eq!(room_id, 1);
+    }
+
+    #[test]
+    fn hello_accepted_returns_identity() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+
+        let response = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                1,
+                ClientControl::Hello(Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    client_name: "  Alice   Screenshare  ".to_owned(),
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::HelloAccepted(accepted) => {
+                assert_eq!(accepted.user_id, 1);
+                assert_eq!(accepted.display_name, "Alice Screenshare");
+                assert_eq!(session.user_id, Some(1));
+                assert_eq!(session.display_name, "Alice Screenshare");
+            }
+            other => panic!("unexpected hello response: {other:?}"),
+        }
     }
 
     #[test]

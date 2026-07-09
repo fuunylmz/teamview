@@ -92,6 +92,8 @@ pub struct Hello {
 pub struct HelloAccepted {
     pub protocol_version: u8,
     pub server_name: String,
+    pub user_id: UserId,
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

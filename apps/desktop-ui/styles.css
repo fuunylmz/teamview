@@ -98,6 +98,11 @@ button {
   border-color: var(--line);
 }
 
+.channel:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
 .channel-name {
   display: block;
   overflow: hidden;
