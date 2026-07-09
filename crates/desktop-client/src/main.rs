@@ -250,6 +250,9 @@ struct Args {
 
     #[arg(long, default_value_t = DEFAULT_TIME_SYNC_SPACING_MS)]
     time_sync_spacing_ms: u64,
+
+    #[arg(long, default_value_t = 5_000)]
+    time_sync_refresh_ms: u64,
 }
 
 #[tokio::main]
@@ -349,6 +352,53 @@ struct ClockSyncEstimate {
     clock_offset_micros: i64,
 }
 
+#[derive(Debug, Clone)]
+struct ClockSyncTracker {
+    estimate: ClockSyncEstimate,
+    refresh_interval: Option<Duration>,
+    next_refresh_at: Instant,
+}
+
+impl ClockSyncTracker {
+    fn new(estimate: ClockSyncEstimate, refresh_interval: Option<Duration>) -> Self {
+        Self {
+            estimate,
+            refresh_interval,
+            next_refresh_at: refresh_interval
+                .map(next_clock_sync_refresh_at)
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    fn estimate(&self) -> ClockSyncEstimate {
+        self.estimate
+    }
+
+    async fn refresh_if_due(
+        &mut self,
+        control: &crate::transport::quic::ControlClient,
+        stage: &str,
+    ) -> anyhow::Result<ClockSyncEstimate> {
+        let Some(refresh_interval) = self.refresh_interval else {
+            return Ok(self.estimate);
+        };
+        if Instant::now() < self.next_refresh_at {
+            return Ok(self.estimate);
+        }
+
+        let refreshed = refresh_control_clock(control, stage).await?;
+        self.estimate = refreshed;
+        self.next_refresh_at = next_clock_sync_refresh_at(refresh_interval);
+        Ok(self.estimate)
+    }
+}
+
+fn next_clock_sync_refresh_at(refresh_interval: Duration) -> Instant {
+    Instant::now()
+        .checked_add(refresh_interval)
+        .unwrap_or_else(Instant::now)
+}
+
 async fn sync_control_clock(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
@@ -402,6 +452,39 @@ async fn sync_control_clock(
         estimate.clock_offset_micros
     );
     Ok(estimate)
+}
+
+async fn refresh_control_clock(
+    control: &crate::transport::quic::ControlClient,
+    stage: &str,
+) -> anyhow::Result<ClockSyncEstimate> {
+    let client_send_time_micros = unix_time_micros();
+    let response = control
+        .send(ClientControl::TimeSync(TimeSyncRequest {
+            client_send_time_micros,
+        }))
+        .await?;
+    let client_receive_time_micros = unix_time_micros();
+    print_control_response("time-sync-refresh", &response);
+    match response.message {
+        ServerControl::TimeSync(sync) => {
+            let estimate = estimate_clock_sync(&sync, client_receive_time_micros);
+            println!(
+                "time-sync-refresh stage={} client_send_time_micros={} client_receive_time_micros={} server_receive_time_micros={} server_send_time_micros={} rtt_micros={} rtt_ms={} clock_offset_micros={}",
+                stage,
+                sync.client_send_time_micros,
+                client_receive_time_micros,
+                sync.server_receive_time_micros,
+                sync.server_send_time_micros,
+                estimate.rtt_micros,
+                estimate.rtt_ms,
+                estimate.clock_offset_micros
+            );
+            Ok(estimate)
+        }
+        ServerControl::Error(error) => bail!("time sync refresh failed: {}", error.message),
+        other => bail!("unexpected time sync refresh response: {other:?}"),
+    }
 }
 
 fn estimate_clock_sync(
@@ -1148,6 +1231,7 @@ async fn run_synthetic_screen_broadcaster_media(
     let mut sent_packets = 0_u64;
     let mut next_sequence_number = 1_u32;
     let mut timing = ClientBroadcasterStats::default();
+    let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
     for frame_id in 1..=media_frames {
         ticker.tick().await;
         let capture_start = Instant::now();
@@ -1164,7 +1248,10 @@ async fn run_synthetic_screen_broadcaster_media(
             timing.record_encode_duration(encode_start.elapsed());
             continue;
         };
-        frame.sender_clock_offset_micros = clock_sync.clock_offset_micros;
+        let sync_estimate = clock_sync
+            .refresh_if_due(control, "screen-broadcaster")
+            .await?;
+        frame.sender_clock_offset_micros = sync_estimate.clock_offset_micros;
         frame.sender_encode_done_time_micros = unix_time_micros();
         let encode_duration = encode_start.elapsed();
         timing.record_encode_duration(encode_duration);
@@ -1376,6 +1463,7 @@ async fn run_synthetic_voice_broadcaster_media(
     let mut next_sequence_number = 1_u32;
     let mut empty_capture_ticks = 0_u32;
     let mut timing = ClientBroadcasterStats::default();
+    let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
     while sent_frames < media_frames {
         ticker.tick().await;
         let frame_id = sent_frames.saturating_add(1);
@@ -1416,7 +1504,10 @@ async fn run_synthetic_voice_broadcaster_media(
             )?,
             None => encoder.encode(frame_id, capture_time_micros, args.stream_id)?,
         };
-        frame.sender_clock_offset_micros = clock_sync.clock_offset_micros;
+        let sync_estimate = clock_sync
+            .refresh_if_due(control, "voice-broadcaster")
+            .await?;
+        frame.sender_clock_offset_micros = sync_estimate.clock_offset_micros;
         frame.sender_encode_done_time_micros = unix_time_micros();
         let encode_duration = encode_start.elapsed();
         timing.record_encode_duration(encode_duration);
@@ -1734,6 +1825,7 @@ async fn run_synthetic_dual_viewer_media(
     let target_voice_frames = if args.deafened { 0 } else { target_frames };
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
+    let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
 
     let mut screen_buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
     let mut screen_decoder = args.video_decoder()?;
@@ -1780,6 +1872,7 @@ async fn run_synthetic_dual_viewer_media(
             }
         };
         let packet_receive_time_micros = unix_time_micros();
+        let sync_estimate = clock_sync.refresh_if_due(control, "dual-viewer").await?;
         let packet_stream_id = packet.header.room_stream_id;
 
         if packet_stream_id == screen_stream_id && screen_reassembled_frames < target_frames {
@@ -1813,7 +1906,7 @@ async fn run_synthetic_dual_viewer_media(
                     frame.sender_capture_time_micros,
                     frame.sender_clock_offset_micros,
                     packet_receive_time_micros,
-                    clock_sync.clock_offset_micros,
+                    sync_estimate.clock_offset_micros,
                 );
                 screen_stats.record_sender_timestamps(
                     frame.sender_capture_time_micros,
@@ -1906,7 +1999,7 @@ async fn run_synthetic_dual_viewer_media(
                     frame.sender_capture_time_micros,
                     frame.sender_clock_offset_micros,
                     packet_receive_time_micros,
-                    clock_sync.clock_offset_micros,
+                    sync_estimate.clock_offset_micros,
                 );
                 voice_stats.record_sender_timestamps(
                     frame.sender_capture_time_micros,
@@ -2065,6 +2158,7 @@ async fn run_synthetic_screen_viewer_media(
     let target_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
+    let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
     let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
     let mut decoder = args.video_decoder()?;
     let mut playback = args.video_playback()?;
@@ -2090,6 +2184,7 @@ async fn run_synthetic_screen_viewer_media(
             }
         };
         let packet_receive_time_micros = unix_time_micros();
+        let sync_estimate = clock_sync.refresh_if_due(control, "screen-viewer").await?;
         let lost_packets_before = stats.lost_packets;
         stats.record_packet(&packet);
         received_packets += 1;
@@ -2113,7 +2208,7 @@ async fn run_synthetic_screen_viewer_media(
                 frame.sender_capture_time_micros,
                 frame.sender_clock_offset_micros,
                 packet_receive_time_micros,
-                clock_sync.clock_offset_micros,
+                sync_estimate.clock_offset_micros,
             );
             stats.record_sender_timestamps(
                 frame.sender_capture_time_micros,
@@ -2229,6 +2324,7 @@ async fn run_synthetic_voice_viewer_media(
     let target_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
+    let mut clock_sync = ClockSyncTracker::new(clock_sync, args.clock_sync_refresh_interval());
     let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
     let mut decoder = SyntheticOpusDecoder;
     let mut playback = args.audio_playback()?;
@@ -2253,6 +2349,7 @@ async fn run_synthetic_voice_viewer_media(
             }
         };
         let packet_receive_time_micros = unix_time_micros();
+        let sync_estimate = clock_sync.refresh_if_due(control, "voice-viewer").await?;
         stats.record_packet(&packet);
         received_packets += 1;
         let outcome = buffer.push_with_stats_at(packet, packet_receive_time_micros)?;
@@ -2270,7 +2367,7 @@ async fn run_synthetic_voice_viewer_media(
                 frame.sender_capture_time_micros,
                 frame.sender_clock_offset_micros,
                 packet_receive_time_micros,
-                clock_sync.clock_offset_micros,
+                sync_estimate.clock_offset_micros,
             );
             stats.record_sender_timestamps(
                 frame.sender_capture_time_micros,
@@ -2576,6 +2673,10 @@ impl Args {
             bail!("--media-fps must be greater than zero");
         }
         Ok(Duration::from_micros(media_interval_micros(self.media_fps)))
+    }
+
+    fn clock_sync_refresh_interval(&self) -> Option<Duration> {
+        (self.time_sync_refresh_ms > 0).then(|| Duration::from_millis(self.time_sync_refresh_ms))
     }
 
     fn synthetic_bitrate_bps(&self) -> u32 {
@@ -3121,6 +3222,31 @@ mod tests {
             select_best_clock_sync_estimate(&samples),
             Some((2, samples[1].1))
         );
+    }
+
+    #[test]
+    fn clock_sync_refresh_interval_can_be_disabled() {
+        let default_args = Args::try_parse_from(["desktop-client"]).unwrap();
+        let disabled_args =
+            Args::try_parse_from(["desktop-client", "--time-sync-refresh-ms", "0"]).unwrap();
+
+        assert_eq!(
+            default_args.clock_sync_refresh_interval(),
+            Some(Duration::from_millis(5_000))
+        );
+        assert_eq!(disabled_args.clock_sync_refresh_interval(), None);
+    }
+
+    #[test]
+    fn clock_sync_tracker_keeps_current_estimate_when_refresh_disabled() {
+        let estimate = ClockSyncEstimate {
+            rtt_micros: 1_000,
+            rtt_ms: 1,
+            clock_offset_micros: 42,
+        };
+        let tracker = ClockSyncTracker::new(estimate, None);
+
+        assert_eq!(tracker.estimate(), estimate);
     }
 
     #[tokio::test]
