@@ -4,6 +4,7 @@ use super::{DecodedFrame, DecodedPixelFormat, VideoDecoder};
 
 const SYNTHETIC_SPS_MAGIC: &[u8; 4] = b"TVS1";
 const SYNTHETIC_FRAME_MAGIC: &[u8; 4] = b"TVF1";
+const SYNTHETIC_PREVIEW_MAGIC: &[u8; 4] = b"TVB1";
 const NAL_NON_IDR_SLICE: u8 = 1;
 const NAL_IDR_SLICE: u8 = 5;
 const NAL_SPS: u8 = 7;
@@ -21,11 +22,19 @@ struct SyntheticStreamConfig {
     height: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SyntheticFrameInfo {
     frame_id: u32,
     width: u32,
     height: u32,
+    preview: Option<SyntheticPreview>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyntheticPreview {
+    width: u32,
+    height: u32,
+    pixels: Bytes,
 }
 
 impl VideoDecoder for H264Decoder {
@@ -47,7 +56,8 @@ impl VideoDecoder for H264Decoder {
             match header & 0x1f {
                 NAL_SPS => {
                     saw_sps = true;
-                    if let Some(config) = parse_synthetic_sps(payload) {
+                    let payload = annex_b_unescape_payload(payload);
+                    if let Some(config) = parse_synthetic_sps(&payload) {
                         self.config = Some(config);
                     }
                 }
@@ -55,11 +65,13 @@ impl VideoDecoder for H264Decoder {
                 NAL_IDR_SLICE => {
                     saw_idr = true;
                     saw_slice = true;
-                    frame_info = parse_synthetic_frame(payload).or(frame_info);
+                    let payload = annex_b_unescape_payload(payload);
+                    frame_info = parse_synthetic_frame(&payload).or(frame_info);
                 }
                 NAL_NON_IDR_SLICE => {
                     saw_slice = true;
-                    frame_info = parse_synthetic_frame(payload).or(frame_info);
+                    let payload = annex_b_unescape_payload(payload);
+                    frame_info = parse_synthetic_frame(&payload).or(frame_info);
                 }
                 _ => {}
             }
@@ -79,9 +91,20 @@ impl VideoDecoder for H264Decoder {
             frame_id: 0,
             width: config.width,
             height: config.height,
+            preview: None,
         });
-        let width = frame_info.width.max(1);
-        let height = frame_info.height.max(1);
+        let (width, height, pixels) = match frame_info.preview {
+            Some(preview) => (preview.width, preview.height, preview.pixels),
+            None => {
+                let width = frame_info.width.max(1);
+                let height = frame_info.height.max(1);
+                (
+                    width,
+                    height,
+                    synthetic_bgra_pixels(width, height, frame_info.frame_id, saw_idr),
+                )
+            }
+        };
         if width as u64 * height as u64 > MAX_SYNTHETIC_DECODED_PIXELS {
             anyhow::bail!("synthetic decoded frame exceeds maximum preview size");
         }
@@ -90,7 +113,7 @@ impl VideoDecoder for H264Decoder {
             width,
             height,
             pixel_format: DecodedPixelFormat::Bgra8,
-            pixels: synthetic_bgra_pixels(width, height, frame_info.frame_id, saw_idr),
+            pixels,
         }))
     }
 }
@@ -123,6 +146,32 @@ fn parse_synthetic_frame(payload: &[u8]) -> Option<SyntheticFrameInfo> {
         frame_id,
         width,
         height,
+        preview: parse_synthetic_preview(&payload[16..]),
+    })
+}
+
+fn parse_synthetic_preview(payload: &[u8]) -> Option<SyntheticPreview> {
+    let header = payload.get(..16)?;
+    if &header[..4] != SYNTHETIC_PREVIEW_MAGIC {
+        return None;
+    }
+    let width = u32::from_le_bytes(header[4..8].try_into().ok()?);
+    let height = u32::from_le_bytes(header[8..12].try_into().ok()?);
+    let byte_len = u32::from_le_bytes(header[12..16].try_into().ok()?) as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    if byte_len != expected_len {
+        return None;
+    }
+    let pixels = payload.get(16..16 + byte_len)?;
+    Some(SyntheticPreview {
+        width,
+        height,
+        pixels: Bytes::copy_from_slice(pixels),
     })
 }
 
@@ -188,6 +237,24 @@ fn start_code_len(bytes: &[u8]) -> Option<usize> {
     } else {
         None
     }
+}
+
+fn annex_b_unescape_payload(payload: &[u8]) -> Vec<u8> {
+    let mut unescaped = Vec::with_capacity(payload.len());
+    let mut consecutive_zeros = 0_u8;
+    for &byte in payload {
+        if consecutive_zeros >= 2 && byte == 0x03 {
+            consecutive_zeros = 0;
+            continue;
+        }
+        unescaped.push(byte);
+        if byte == 0 {
+            consecutive_zeros = consecutive_zeros.saturating_add(1);
+        } else {
+            consecutive_zeros = 0;
+        }
+    }
+    unescaped
 }
 
 #[cfg(test)]
@@ -266,11 +333,67 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_decoder_outputs_embedded_cpu_bgra_preview() {
+        let mut encoder = H264Encoder::default();
+        let pixels = (0_u8..32).collect::<Vec<_>>();
+        let encoded = encoder
+            .encode(
+                CaptureFrame::cpu_bgra(1, 4, 2, 123_456, pixels.clone()).unwrap(),
+                9,
+            )
+            .unwrap()
+            .unwrap();
+        let mut decoder = H264Decoder::default();
+
+        let decoded = decoder.decode(&encoded.bytes).unwrap().unwrap();
+
+        assert_eq!(decoded.frame_id, 1);
+        assert_eq!(decoded.width, 4);
+        assert_eq!(decoded.height, 2);
+        assert_eq!(decoded.pixel_format, DecodedPixelFormat::Bgra8);
+        assert_eq!(decoded.pixels, Bytes::from(pixels));
+    }
+
+    #[test]
+    fn synthetic_decoder_outputs_downsampled_live_preview() {
+        let mut encoder = H264Encoder::default();
+        let pixels = (0..640 * 360)
+            .flat_map(|index| {
+                let value = (index % 251) as u8;
+                [value, value.wrapping_add(1), value.wrapping_add(2), 0xff]
+            })
+            .collect::<Vec<_>>();
+        let encoded = encoder
+            .encode(
+                CaptureFrame::cpu_bgra(1, 640, 360, 123_456, pixels.clone()).unwrap(),
+                9,
+            )
+            .unwrap()
+            .unwrap();
+        let mut decoder = H264Decoder::default();
+
+        let decoded = decoder.decode(&encoded.bytes).unwrap().unwrap();
+
+        assert_eq!(decoded.width, 160);
+        assert_eq!(decoded.height, 90);
+        assert_eq!(&decoded.pixels[..4], &pixels[..4]);
+        assert_eq!(decoded.pixels.len(), 160 * 90 * 4);
+    }
+
+    #[test]
     fn annex_b_parser_accepts_three_byte_start_codes() {
         let bytes = [0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2];
         let nals = annex_b_nals(&bytes).collect::<Vec<_>>();
 
         assert_eq!(nals, vec![&[0x67, 1][..], &[0x68, 2][..]]);
+    }
+
+    #[test]
+    fn annex_b_unescape_restores_escaped_zero_sequences() {
+        assert_eq!(
+            annex_b_unescape_payload(&[0, 0, 3, 0, 0, 0, 3, 1, 0, 0, 3, 3]),
+            vec![0, 0, 0, 0, 0, 1, 0, 0, 3]
+        );
     }
 
     fn encode_frame(

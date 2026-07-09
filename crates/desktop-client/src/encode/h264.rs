@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use teamview_protocol::{codec::CodecId, frame::EncodedFrame};
 
-use crate::capture::CaptureFrame;
+use crate::capture::{CaptureFrame, CaptureFrameStorage, CapturePixelFormat};
 
 use super::VideoEncoder;
 
@@ -9,6 +9,9 @@ const ANNEX_B_START_CODE: &[u8; 4] = &[0x00, 0x00, 0x00, 0x01];
 const SYNTHETIC_SPS_MAGIC: &[u8; 4] = b"TVS1";
 const SYNTHETIC_PPS_MAGIC: &[u8; 4] = b"TVP1";
 const SYNTHETIC_FRAME_MAGIC: &[u8; 4] = b"TVF1";
+const SYNTHETIC_PREVIEW_MAGIC: &[u8; 4] = b"TVB1";
+const MAX_SYNTHETIC_PREVIEW_WIDTH: u32 = 160;
+const MAX_SYNTHETIC_PREVIEW_HEIGHT: u32 = 90;
 const NAL_SPS: u8 = 0x67;
 const NAL_PPS: u8 = 0x68;
 const NAL_IDR_SLICE: u8 = 0x65;
@@ -98,7 +101,25 @@ impl VideoEncoder for H264Encoder {
 fn append_nal(bytes: &mut Vec<u8>, nal_header: u8, payload: &[u8]) {
     bytes.extend_from_slice(ANNEX_B_START_CODE);
     bytes.push(nal_header);
-    bytes.extend_from_slice(payload);
+    bytes.extend_from_slice(&annex_b_escape_payload(payload));
+}
+
+fn annex_b_escape_payload(payload: &[u8]) -> Vec<u8> {
+    let mut escaped = Vec::with_capacity(payload.len());
+    let mut consecutive_zeros = 0_u8;
+    for &byte in payload {
+        if consecutive_zeros >= 2 && byte <= 3 {
+            escaped.push(0x03);
+            consecutive_zeros = 0;
+        }
+        escaped.push(byte);
+        if byte == 0 {
+            consecutive_zeros = consecutive_zeros.saturating_add(1);
+        } else {
+            consecutive_zeros = 0;
+        }
+    }
+    escaped
 }
 
 fn synthetic_sps_payload(width: u32, height: u32, frames_per_second: u16) -> Vec<u8> {
@@ -116,7 +137,75 @@ fn synthetic_frame_payload(frame: &CaptureFrame) -> Vec<u8> {
     payload.extend_from_slice(&(frame.frame_id as u32).to_le_bytes());
     payload.extend_from_slice(&frame.width.to_le_bytes());
     payload.extend_from_slice(&frame.height.to_le_bytes());
+    if let Some(preview) = synthetic_preview_payload(frame) {
+        payload.extend_from_slice(&preview);
+    }
     payload
+}
+
+fn synthetic_preview_payload(frame: &CaptureFrame) -> Option<Vec<u8>> {
+    let CaptureFrameStorage::CpuBytes(source_pixels) = &frame.storage else {
+        return None;
+    };
+    if frame.format != CapturePixelFormat::Bgra8 {
+        return None;
+    }
+    let expected_len = CaptureFrame::bgra_byte_len(frame.width, frame.height).ok()?;
+    if source_pixels.len() != expected_len {
+        return None;
+    }
+
+    let (preview_width, preview_height) = preview_dimensions(frame.width, frame.height);
+    let preview_pixels = downsample_bgra_nearest(
+        source_pixels,
+        frame.width,
+        frame.height,
+        preview_width,
+        preview_height,
+    )?;
+    let mut payload = Vec::with_capacity(16 + preview_pixels.len());
+    payload.extend_from_slice(SYNTHETIC_PREVIEW_MAGIC);
+    payload.extend_from_slice(&preview_width.to_le_bytes());
+    payload.extend_from_slice(&preview_height.to_le_bytes());
+    payload.extend_from_slice(&(preview_pixels.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&preview_pixels);
+    Some(payload)
+}
+
+fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
+    if width <= MAX_SYNTHETIC_PREVIEW_WIDTH && height <= MAX_SYNTHETIC_PREVIEW_HEIGHT {
+        return (width.max(1), height.max(1));
+    }
+
+    let height_by_width =
+        (height as u64 * MAX_SYNTHETIC_PREVIEW_WIDTH as u64 / width.max(1) as u64) as u32;
+    if height_by_width <= MAX_SYNTHETIC_PREVIEW_HEIGHT {
+        return (MAX_SYNTHETIC_PREVIEW_WIDTH, height_by_width.max(1));
+    }
+
+    let width_by_height =
+        (width as u64 * MAX_SYNTHETIC_PREVIEW_HEIGHT as u64 / height.max(1) as u64) as u32;
+    (width_by_height.max(1), MAX_SYNTHETIC_PREVIEW_HEIGHT)
+}
+
+fn downsample_bgra_nearest(
+    source_pixels: &[u8],
+    source_width: u32,
+    source_height: u32,
+    preview_width: u32,
+    preview_height: u32,
+) -> Option<Vec<u8>> {
+    let preview_len = CaptureFrame::bgra_byte_len(preview_width, preview_height).ok()?;
+    let mut preview = Vec::with_capacity(preview_len);
+    for y in 0..preview_height {
+        let source_y = y as u64 * source_height as u64 / preview_height as u64;
+        for x in 0..preview_width {
+            let source_x = x as u64 * source_width as u64 / preview_width as u64;
+            let offset = ((source_y * source_width as u64 + source_x) * 4) as usize;
+            preview.extend_from_slice(source_pixels.get(offset..offset + 4)?);
+        }
+    }
+    Some(preview)
 }
 
 #[cfg(test)]
@@ -187,5 +276,34 @@ mod tests {
 
         assert!(first.is_keyframe);
         assert!(!second.is_keyframe);
+    }
+
+    #[test]
+    fn synthetic_encoder_embeds_cpu_bgra_preview() {
+        let mut encoder = H264Encoder::default();
+        let pixels = (0_u8..32).collect::<Vec<_>>();
+        let frame = CaptureFrame::cpu_bgra(1, 4, 2, 123_456, pixels.clone()).unwrap();
+
+        let encoded = encoder.encode(frame, 9).unwrap().unwrap();
+
+        assert!(
+            encoded
+                .bytes
+                .windows(SYNTHETIC_PREVIEW_MAGIC.len())
+                .any(|window| window == SYNTHETIC_PREVIEW_MAGIC)
+        );
+        assert!(
+            encoded
+                .bytes
+                .windows(pixels.len())
+                .any(|window| window == pixels.as_slice())
+        );
+    }
+
+    #[test]
+    fn preview_dimensions_preserve_aspect_without_upscaling() {
+        assert_eq!(preview_dimensions(4, 2), (4, 2));
+        assert_eq!(preview_dimensions(1920, 1080), (160, 90));
+        assert_eq!(preview_dimensions(1080, 1920), (50, 90));
     }
 }

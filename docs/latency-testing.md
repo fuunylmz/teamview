@@ -37,7 +37,7 @@ synthetic-fanout publishers=1 viewers=4 packets=10 delivered=31 dropped=9 slow_v
 
 ## Stage 3 encoded sample forwarding checks
 
-Stage 3 validates encoded-frame packetization and reassembly before live capture or hardware encoding exists.
+Stage 3 validates encoded-frame packetization and reassembly before hardware encoding exists.
 
 Run:
 
@@ -63,7 +63,7 @@ sample-forward frames=3 fragments=18 reassembled=3 delivered=36 dropped=0
 
 Stage 4 validates capture-side latency policy without requiring interactive screen selection.
 
-The key invariant is that the capture queue keeps only the newest frame by default. If three frames arrive before encode/network consumes them, the first two are dropped and only the latest frame is returned. On Windows, the live primary-monitor path can also acquire CPU BGRA pixels for the current desktop; hardware encoding uses that frame storage in a later stage.
+The key invariant is that the capture queue keeps only the newest frame by default. If three frames arrive before encode/network consumes them, the first two are dropped and only the latest frame is returned. On Windows, the live primary-monitor path can also acquire CPU BGRA pixels for the current desktop; the temporary screen encoder carries a downsampled BGRA preview today, and hardware encoding uses the same frame storage in a later stage.
 
 Covered by unit tests:
 
@@ -88,7 +88,7 @@ cargo run -p relay-server -- --listen 127.0.0.1:4433
 cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --screen-input live --media-frames 1 --media-fps 1
 ```
 
-Expected output includes `screen_input=Live` and the captured `capture_width` / `capture_height`. The live frame currently feeds the synthetic H.264-like encoder so transport, stream config, timestamps, and relay metrics can be validated before hardware H.264 is added.
+Expected output includes `screen_input=Live` and the captured `capture_width` / `capture_height`. The live frame currently feeds the synthetic H.264-like encoder with a downsampled BGRA preview so transport, stream config, timestamps, viewer rendering, and relay metrics can be validated before hardware H.264 is added.
 
 ## Synthetic QUIC forwarding checks
 
