@@ -83,6 +83,14 @@ cargo run -p desktop-client -- --mode broadcaster --capture-source primary-monit
 
 Expected output includes `capture_supported=true` on Windows.
 
+To inspect available capture targets before broadcasting:
+
+```bash
+cargo run -p desktop-client -- --list-capture-sources
+```
+
+Expected output includes `capture-source kind=monitor ...` lines for displays and `capture-source kind=window ...` lines for visible titled windows.
+
 To exercise live primary-monitor acquisition through the desktop broadcaster, start a relay and run one live screen frame:
 
 ```bash
@@ -148,6 +156,6 @@ Expected voice output includes `audio-send`, `audio-recv`, `audio-play`, relay `
 
 ## Current stage
 
-Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, a latest-frame queue that keeps only the newest frame to avoid latency buildup, and live CPU BGRA acquisition paths for the primary monitor, indexed monitors, and exact-title visible windows behind `--screen-input live`. The temporary H.264-like screen encoder now embeds a downsampled BGRA preview for CPU-backed live frames, so the viewer can decode and render actual captured screen pixels through the relay path before hardware H.264 lands. The viewer can either record decoded frames in the latest-frame sink or show them in a native Win32 preview window with `--render-output window`. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers through independent bounded viewer egress queues, optionally require a shared access token, list rooms and streams for viewer discovery, store and serve stream config, clean up empty rooms and publisher-owned streams when clients leave or disconnect, expose stream ingress/egress metrics, aggregate viewer stats into publisher feedback, and the client/load-test paths can packetize, pace, send, receive, reassemble with stale-frame drops, parse synthetic Annex B H.264-like frames into BGRA preview frames, send and receive synthetic Opus-like voice frames, estimate capture-to-viewer latency from media timestamps, report viewer stats, poll publisher feedback and stream metrics, request synthetic keyframes for new subscribers, packet loss, or decoder recovery, adapt synthetic bitrate/FPS targets when viewers are degraded, send unsubscribe/leave messages on normal exit, and keep QUIC control connections alive while waiting for delayed media.
+Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, capture-source listing, frame metadata, a latest-frame queue that keeps only the newest frame to avoid latency buildup, and live CPU BGRA acquisition paths for the primary monitor, indexed monitors, and exact-title visible windows behind `--screen-input live`. The temporary H.264-like screen encoder now embeds a downsampled BGRA preview for CPU-backed live frames, so the viewer can decode and render actual captured screen pixels through the relay path before hardware H.264 lands. The viewer can either record decoded frames in the latest-frame sink or show them in a native Win32 preview window with `--render-output window`. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers through independent bounded viewer egress queues, optionally require a shared access token, list rooms and streams for viewer discovery, store and serve stream config, clean up empty rooms and publisher-owned streams when clients leave or disconnect, expose stream ingress/egress metrics, aggregate viewer stats into publisher feedback, and the client/load-test paths can packetize, pace, send, receive, reassemble with stale-frame drops, parse synthetic Annex B H.264-like frames into BGRA preview frames, send and receive synthetic Opus-like voice frames, estimate capture-to-viewer latency from media timestamps, report viewer stats, poll publisher feedback and stream metrics, request synthetic keyframes for new subscribers, packet loss, or decoder recovery, adapt synthetic bitrate/FPS targets when viewers are degraded, send unsubscribe/leave messages on normal exit, and keep QUIC control connections alive while waiting for delayed media.
 
 Interactive Windows Graphics Capture source picking/GPU texture capture, microphone capture, real Opus, hardware encode, native decode, production window controls, and production-grade adaptive media feedback are later stages.

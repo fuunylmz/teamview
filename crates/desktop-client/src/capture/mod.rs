@@ -81,6 +81,23 @@ pub enum CaptureSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureSourceKind {
+    PrimaryMonitor,
+    Monitor,
+    Window,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSourceInfo {
+    pub kind: CaptureSourceKind,
+    pub source: CaptureSource,
+    pub label: String,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CaptureConfig {
     pub queue_capacity: usize,
     pub cursor_visible: bool,

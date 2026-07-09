@@ -70,6 +70,8 @@ Covered by unit tests:
 - `latest_frame_queue_keeps_only_latest_frame_by_default`
 - `latest_frame_queue_capacity_is_never_zero`
 - `capture_returns_latest_queued_frame`
+- `list_capture_sources_includes_monitors`
+- `list_capture_sources_flag_parses_without_relay_options`
 - `support_detection_matches_target_os`
 - `primary_monitor_size_is_available_on_windows`
 - `capture_source_size_uses_primary_monitor_path`
@@ -86,6 +88,14 @@ cargo run -p desktop-client -- --mode broadcaster --capture-source primary-monit
 ```
 
 On Windows, expected output includes `capture_supported=true`.
+
+Capture source listing smoke test:
+
+```bash
+cargo run -p desktop-client -- --list-capture-sources
+```
+
+Expected output includes at least one `capture-source kind=monitor` line. Visible windows with titles are listed as `capture-source kind=window` lines.
 
 Live primary-monitor smoke test:
 

@@ -1,4 +1,7 @@
-use super::{CaptureConfig, CaptureFrame, CaptureSource, LatestFrameQueue, ScreenCapture};
+use super::{
+    CaptureConfig, CaptureFrame, CaptureSource, CaptureSourceInfo, CaptureSourceKind,
+    LatestFrameQueue, ScreenCapture,
+};
 
 #[cfg(target_os = "windows")]
 use std::{ffi::c_void, mem, ptr};
@@ -12,7 +15,10 @@ use windows_sys::Win32::{
         GetMonitorInfoW, GetWindowDC, HDC, HMONITOR, HORZRES, MONITORINFO, ReleaseDC, SRCCOPY,
         SelectObject, VERTRES,
     },
-    UI::WindowsAndMessaging::{FindWindowW, GetWindowRect, IsWindowVisible, MONITORINFOF_PRIMARY},
+    UI::WindowsAndMessaging::{
+        EnumWindows, FindWindowW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic,
+        IsWindowVisible, MONITORINFOF_PRIMARY,
+    },
 };
 
 #[cfg(target_os = "windows")]
@@ -23,6 +29,12 @@ const PRIMARY_MONITOR_SOURCE_LABEL: &str = "primary monitor";
 
 #[cfg(target_os = "windows")]
 const MONITOR_SOURCE_LABEL: &str = "monitor capture source";
+
+#[cfg(target_os = "windows")]
+const MIN_LISTED_WINDOW_WIDTH: u32 = 64;
+
+#[cfg(target_os = "windows")]
+const MIN_LISTED_WINDOW_HEIGHT: u32 = 64;
 
 #[cfg(not(target_os = "windows"))]
 const PRIMARY_MONITOR_SOURCE_LABEL: &str = "primary monitor";
@@ -111,6 +123,11 @@ pub fn capture_source_size(source: &CaptureSource) -> anyhow::Result<(u32, u32)>
     capture_source_size_impl(source)
 }
 
+pub fn list_capture_sources() -> anyhow::Result<Vec<CaptureSourceInfo>> {
+    ensure_supported()?;
+    list_capture_sources_impl()
+}
+
 #[cfg(target_os = "windows")]
 fn primary_monitor_size_impl() -> anyhow::Result<(u32, u32)> {
     with_screen_dc(|screen_dc| unsafe {
@@ -139,6 +156,37 @@ fn capture_source_size_impl(source: &CaptureSource) -> anyhow::Result<(u32, u32)
 
 #[cfg(not(target_os = "windows"))]
 fn capture_source_size_impl(_source: &CaptureSource) -> anyhow::Result<(u32, u32)> {
+    anyhow::bail!("Windows Graphics Capture is only available on Windows")
+}
+
+#[cfg(target_os = "windows")]
+fn list_capture_sources_impl() -> anyhow::Result<Vec<CaptureSourceInfo>> {
+    let mut sources = enumerate_monitors()?
+        .into_iter()
+        .map(|monitor| {
+            let (width, height) = monitor.size()?;
+            Ok(CaptureSourceInfo {
+                kind: CaptureSourceKind::Monitor,
+                source: CaptureSource::Monitor {
+                    id: monitor.index.to_string(),
+                },
+                label: if monitor.is_primary {
+                    format!("Monitor {} (primary)", monitor.index)
+                } else {
+                    format!("Monitor {}", monitor.index)
+                },
+                width,
+                height,
+                is_primary: monitor.is_primary,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    sources.extend(enumerate_visible_windows()?);
+    Ok(sources)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn list_capture_sources_impl() -> anyhow::Result<Vec<CaptureSourceInfo>> {
     anyhow::bail!("Windows Graphics Capture is only available on Windows")
 }
 
@@ -345,6 +393,66 @@ fn enumerate_monitors() -> anyhow::Result<Vec<MonitorBounds>> {
         anyhow::bail!("Windows did not report any display monitors");
     }
     Ok(monitors)
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_visible_windows() -> anyhow::Result<Vec<CaptureSourceInfo>> {
+    unsafe extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let windows = unsafe { &mut *(lparam as *mut Vec<CaptureSourceInfo>) };
+        if unsafe { IsWindowVisible(hwnd) } == 0 || unsafe { IsIconic(hwnd) } != 0 {
+            return 1;
+        }
+        let Some(title) = window_title(hwnd) else {
+            return 1;
+        };
+        let Ok((width, height)) = window_capture_size(hwnd) else {
+            return 1;
+        };
+        if width < MIN_LISTED_WINDOW_WIDTH || height < MIN_LISTED_WINDOW_HEIGHT {
+            return 1;
+        }
+        windows.push(CaptureSourceInfo {
+            kind: CaptureSourceKind::Window,
+            source: CaptureSource::Window {
+                id: title.clone(),
+                title: title.clone(),
+            },
+            label: title,
+            width,
+            height,
+            is_primary: false,
+        });
+        1
+    }
+
+    let mut windows = Vec::new();
+    let ok = unsafe {
+        EnumWindows(
+            Some(enum_window),
+            (&mut windows as *mut Vec<CaptureSourceInfo>) as LPARAM,
+        )
+    };
+    if ok == 0 {
+        anyhow::bail!("failed to enumerate visible windows");
+    }
+    Ok(windows)
+}
+
+#[cfg(target_os = "windows")]
+fn window_title(hwnd: HWND) -> Option<String> {
+    let len = unsafe { GetWindowTextLengthW(hwnd) };
+    if len <= 0 {
+        return None;
+    }
+    let mut buffer = vec![0_u16; len as usize + 1];
+    let copied = unsafe { GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32) };
+    if copied <= 0 {
+        return None;
+    }
+    let title = String::from_utf16_lossy(&buffer[..copied as usize])
+        .trim()
+        .to_owned();
+    (!title.is_empty()).then_some(title)
 }
 
 #[cfg(target_os = "windows")]
@@ -595,6 +703,18 @@ mod tests {
                 capture_source_size(&CaptureSource::Monitor { id: "0".to_owned() }).unwrap();
             assert!(width > 0);
             assert!(height > 0);
+        }
+    }
+
+    #[test]
+    fn list_capture_sources_includes_monitors() {
+        if is_supported() {
+            let sources = list_capture_sources().unwrap();
+            assert!(
+                sources
+                    .iter()
+                    .any(|source| matches!(source.source, CaptureSource::Monitor { .. }))
+            );
         }
     }
 }

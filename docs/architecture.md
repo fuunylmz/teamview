@@ -27,6 +27,7 @@ Stage 4 introduces the desktop capture abstraction without depending on an inter
 The capture layer provides:
 
 - `CaptureSource` for primary monitor, monitor id, or window id/title.
+- Capture source listing for displays and visible titled windows before starting a relay session.
 - `CaptureFrame` metadata with frame id, dimensions, capture timestamp, pixel format, and storage kind, including validated CPU BGRA buffers.
 - `LatestFrameQueue`, a bounded queue that drops older frames and keeps the newest frame.
 - `WindowsGraphicsCapture` support detection, a test-frame path for non-interactive verification, and live CPU BGRA capture via GDI for primary-monitor, indexed-monitor, and exact-title visible-window sources in the `--screen-input live` broadcaster path.

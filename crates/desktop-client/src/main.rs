@@ -32,7 +32,9 @@ use tracing::info;
 
 use crate::{
     audio::{LatestAudioPlayback, SyntheticOpusDecoder, SyntheticOpusEncoder},
-    capture::{CaptureConfig, CaptureSource, ScreenCapture, windows},
+    capture::{
+        CaptureConfig, CaptureSource, CaptureSourceInfo, CaptureSourceKind, ScreenCapture, windows,
+    },
     decode::{FrameReassemblyBuffer, VideoDecoder, h264::H264Decoder},
     encode::{VideoEncoder, h264::H264Encoder},
     playback::{FramePlayback, VideoPlayback},
@@ -85,6 +87,9 @@ struct Args {
 
     #[arg(long)]
     access_token: Option<String>,
+
+    #[arg(long)]
+    list_capture_sources: bool,
 
     #[arg(long, value_enum, default_value_t = CaptureSourceArg::PrimaryMonitor)]
     capture_source: CaptureSourceArg,
@@ -155,6 +160,11 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+    if args.list_capture_sources {
+        print_capture_sources()?;
+        return Ok(());
+    }
+
     let endpoint = build_client_endpoint("127.0.0.1:0")?;
     let local_addr = endpoint.local_addr()?;
     let capture_supported = windows::is_supported();
@@ -1177,6 +1187,41 @@ fn print_control_response(stage: &str, response: &ServerEnvelope) {
     );
 }
 
+fn print_capture_sources() -> anyhow::Result<()> {
+    let sources = windows::list_capture_sources()?;
+    println!("capture-sources count={}", sources.len());
+    for source in sources {
+        println!("{}", format_capture_source(&source));
+    }
+    Ok(())
+}
+
+fn format_capture_source(source: &CaptureSourceInfo) -> String {
+    match (&source.kind, &source.source) {
+        (CaptureSourceKind::Monitor, CaptureSource::Monitor { id }) => format!(
+            "capture-source kind=monitor id={} primary={} width={} height={} label={:?}",
+            id, source.is_primary, source.width, source.height, source.label
+        ),
+        (CaptureSourceKind::PrimaryMonitor, CaptureSource::PrimaryMonitor) => format!(
+            "capture-source kind=primary-monitor width={} height={} label={:?}",
+            source.width, source.height, source.label
+        ),
+        (CaptureSourceKind::Window, CaptureSource::Window { title, .. }) => format!(
+            "capture-source kind=window title={:?} width={} height={} label={:?}",
+            title, source.width, source.height, source.label
+        ),
+        (_, capture_source) => format!(
+            "capture-source kind={:?} source={:?} primary={} width={} height={} label={:?}",
+            source.kind,
+            capture_source,
+            source.is_primary,
+            source.width,
+            source.height,
+            source.label
+        ),
+    }
+}
+
 fn ensure_not_error(action: &str, response: &ServerEnvelope) -> anyhow::Result<()> {
     if let ServerControl::Error(error) = &response.message {
         bail!("{action} failed: {}", error.message);
@@ -1320,6 +1365,50 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_capture_sources_flag_parses_without_relay_options() {
+        let args = Args::try_parse_from(["desktop-client", "--list-capture-sources"]).unwrap();
+
+        assert!(args.list_capture_sources);
+    }
+
+    #[test]
+    fn format_capture_source_prints_monitor_selection_hint() {
+        let source = CaptureSourceInfo {
+            kind: CaptureSourceKind::Monitor,
+            source: CaptureSource::Monitor { id: "0".to_owned() },
+            label: "Monitor 0 (primary)".to_owned(),
+            width: 1920,
+            height: 1080,
+            is_primary: true,
+        };
+
+        assert_eq!(
+            format_capture_source(&source),
+            "capture-source kind=monitor id=0 primary=true width=1920 height=1080 label=\"Monitor 0 (primary)\""
+        );
+    }
+
+    #[test]
+    fn format_capture_source_prints_window_title() {
+        let source = CaptureSourceInfo {
+            kind: CaptureSourceKind::Window,
+            source: CaptureSource::Window {
+                id: "Untitled - Notepad".to_owned(),
+                title: "Untitled - Notepad".to_owned(),
+            },
+            label: "Untitled - Notepad".to_owned(),
+            width: 800,
+            height: 600,
+            is_primary: false,
+        };
+
+        assert_eq!(
+            format_capture_source(&source),
+            "capture-source kind=window title=\"Untitled - Notepad\" width=800 height=600 label=\"Untitled - Notepad\""
+        );
+    }
 
     #[test]
     fn monitor_capture_source_requires_id() {
