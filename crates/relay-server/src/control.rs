@@ -31,10 +31,12 @@ const MIN_TARGET_WIDTH: u32 = 320;
 const MIN_TARGET_HEIGHT: u32 = 180;
 const MAX_TARGET_WIDTH: u32 = 7680;
 const MAX_TARGET_HEIGHT: u32 = 4320;
+const MAX_DISPLAY_NAME_CHARS: usize = 64;
 
 #[derive(Debug, Default)]
 pub struct ControlState {
     rooms: BTreeMap<RoomId, Room>,
+    display_names: BTreeMap<UserId, String>,
     viewer_stats: BTreeMap<StreamId, BTreeMap<UserId, ViewerStatsReport>>,
     voice_states: BTreeMap<RoomId, BTreeMap<UserId, VoiceState>>,
     pending_keyframe_requests: BTreeMap<StreamId, KeyframeReason>,
@@ -56,6 +58,7 @@ impl ControlState {
     pub fn new() -> Self {
         Self {
             rooms: BTreeMap::new(),
+            display_names: BTreeMap::new(),
             viewer_stats: BTreeMap::new(),
             voice_states: BTreeMap::new(),
             pending_keyframe_requests: BTreeMap::new(),
@@ -92,11 +95,25 @@ impl ControlState {
                         ),
                     ))
                 } else {
+                    let user_id = match session.user_id {
+                        Some(user_id) => user_id,
+                        None => {
+                            let user_id = self.next_user_id;
+                            self.next_user_id += 1;
+                            user_id
+                        }
+                    };
+                    let display_name = sanitize_display_name(&hello.client_name, user_id);
                     if session.user_id.is_none() {
-                        let user_id = self.next_user_id;
-                        self.next_user_id += 1;
-                        session.establish_identity(user_id, !self.requires_access_token());
+                        session.establish_identity(
+                            user_id,
+                            !self.requires_access_token(),
+                            display_name.clone(),
+                        );
+                    } else {
+                        session.update_display_name(display_name.clone());
                     }
+                    self.display_names.insert(user_id, display_name);
                     ServerControl::HelloAccepted(HelloAccepted {
                         protocol_version: PROTOCOL_VERSION,
                         server_name: "teamview-relay".to_owned(),
@@ -138,7 +155,7 @@ impl ControlState {
                     session.grant_access();
                     ServerControl::Authenticated(teamview_protocol::control::Authenticated {
                         user_id,
-                        display_name: format!("user-{user_id}"),
+                        display_name: self.display_name_for_user(user_id),
                     })
                 }
                 None => ServerControl::Error(ControlError::new("not_ready", "send Hello first")),
@@ -397,6 +414,13 @@ impl ControlState {
             .and_then(|room_voice_states| room_voice_states.get(&user_id))
     }
 
+    pub fn display_name_for_user(&self, user_id: UserId) -> String {
+        self.display_names
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_else(|| format!("user-{user_id}"))
+    }
+
     pub fn voice_publisher_can_send(&self, stream_id: StreamId, user_id: UserId) -> bool {
         self.voice_state_for_stream(stream_id, user_id)
             .is_none_or(|voice_state| {
@@ -426,6 +450,7 @@ impl ControlState {
         }
         self.viewer_stats
             .retain(|_, stream_viewer_stats| !stream_viewer_stats.is_empty());
+        self.display_names.remove(&user_id);
     }
 
     fn leave_room(&mut self, user_id: UserId, room_id: RoomId) {
@@ -986,7 +1011,7 @@ impl ControlState {
                     ParticipantSummary {
                         room_id,
                         user_id: *participant_id,
-                        display_name: format!("user-{participant_id}"),
+                        display_name: self.display_name_for_user(*participant_id),
                         muted: voice_state.muted,
                         deafened: voice_state.deafened,
                         push_to_talk: voice_state.push_to_talk,
@@ -1094,6 +1119,38 @@ fn clamp_target_resolution(width: u32, height: u32) -> (u32, u32) {
         width.clamp(MIN_TARGET_WIDTH, MAX_TARGET_WIDTH),
         height.clamp(MIN_TARGET_HEIGHT, MAX_TARGET_HEIGHT),
     )
+}
+
+fn sanitize_display_name(raw_name: &str, user_id: UserId) -> String {
+    let mut name = String::new();
+    let mut previous_was_space = false;
+    let mut char_count = 0;
+
+    for ch in raw_name.trim().chars() {
+        if char_count >= MAX_DISPLAY_NAME_CHARS {
+            break;
+        }
+        let next = if ch.is_control() {
+            continue;
+        } else if ch.is_whitespace() {
+            ' '
+        } else {
+            ch
+        };
+        if next == ' ' && previous_was_space {
+            continue;
+        }
+        name.push(next);
+        previous_was_space = next == ' ';
+        char_count += 1;
+    }
+
+    let name = name.trim();
+    if name.is_empty() {
+        format!("user-{user_id}")
+    } else {
+        name.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -1265,6 +1322,43 @@ mod tests {
     }
 
     #[test]
+    fn authenticate_returns_hello_display_name() {
+        let mut state = ControlState::with_access_token("secret");
+        let mut session = Session::anonymous(1);
+        authenticate(&mut state, &mut session, "  Alice   Screenshare  ");
+
+        let response = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                2,
+                ClientControl::Authenticate(Authenticate {
+                    token: "secret".to_owned(),
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Authenticated(authenticated) => {
+                assert_eq!(authenticated.user_id, 1);
+                assert_eq!(authenticated.display_name, "Alice Screenshare");
+                assert_eq!(session.display_name, "Alice Screenshare");
+                assert_eq!(state.display_name_for_user(1), "Alice Screenshare");
+            }
+            other => panic!("unexpected authenticate response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_display_name_falls_back_to_user_id() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+        authenticate(&mut state, &mut session, " \t\n ");
+
+        assert_eq!(session.display_name, "user-1");
+        assert_eq!(state.display_name_for_user(1), "user-1");
+    }
+
+    #[test]
     fn duplicate_stream_id_is_rejected_across_rooms() {
         let mut state = ControlState::new();
         let mut first = Session::anonymous(1);
@@ -1424,13 +1518,16 @@ mod tests {
         join_room(&mut state, &mut viewer, room_id);
         publish_stream(&mut state, &mut publisher, room_id, 9);
         subscribe_stream(&mut state, &mut viewer, room_id, 9);
+        let publisher_id = publisher.user_id.unwrap();
+        assert_eq!(state.display_name_for_user(publisher_id), "publisher");
 
-        state.disconnect_user(publisher.user_id.unwrap());
+        state.disconnect_user(publisher_id);
 
         let room = state.room(room_id).unwrap();
-        assert!(!room.participants.contains(&publisher.user_id.unwrap()));
+        assert!(!room.participants.contains(&publisher_id));
         assert!(!room.published_streams.contains_key(&9));
         assert!(!room.subscriptions.contains_key(&9));
+        assert_eq!(state.display_name_for_user(publisher_id), "user-1");
     }
 
     #[test]
@@ -2429,7 +2526,7 @@ mod tests {
             .find(|participant| participant.user_id == viewer_id)
             .unwrap();
 
-        assert_eq!(publisher_summary.display_name, "user-1");
+        assert_eq!(publisher_summary.display_name, "publisher");
         assert!(!publisher_summary.muted);
         assert!(!publisher_summary.deafened);
         assert!(!publisher_summary.push_to_talk);
@@ -2437,7 +2534,7 @@ mod tests {
         assert_eq!(publisher_summary.published_stream_count, 1);
         assert_eq!(publisher_summary.subscribed_stream_count, 0);
 
-        assert_eq!(viewer_summary.display_name, "user-2");
+        assert_eq!(viewer_summary.display_name, "viewer");
         assert!(!viewer_summary.muted);
         assert!(viewer_summary.deafened);
         assert!(viewer_summary.push_to_talk);

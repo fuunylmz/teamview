@@ -208,7 +208,7 @@ For TeamSpeak-style voice state checks, add `--muted` to the broadcaster, `--pus
 To inspect the current room presence and voice state without subscribing to media, run:
 
 ```bash
-cargo run -p desktop-client -- --list-participants --room-name stage1
+cargo run -p desktop-client -- --list-participants --room-name stage1 --display-name Alice
 ```
 
 Expected behavior:
@@ -218,7 +218,7 @@ Expected behavior:
 - With `--audio-output speaker`, the viewer queues decoded PCM to the default Windows speaker through WinMM while keeping the same `audio-play` metrics.
 - With `--push-to-talk --ptt-active`, the broadcaster prints `voice-state` with `speaking=true` and sends voice frames as usual.
 - With `--deafened`, the viewer prints `voice-state`, `voice-deafened`, and a zero-frame voice summary instead of `audio-play`.
-- `--list-participants` prints one `participant` line per room member with `muted`, `deafened`, `push_to_talk`, `speaking`, `published_streams`, and `subscribed_streams`.
+- `--list-participants` prints one `participant` line per room member with `display_name`, `muted`, `deafened`, `push_to_talk`, `speaking`, `published_streams`, and `subscribed_streams`.
 - The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams, zero drops, current stream egress queue depth, and server route timing percentiles.
 - The final viewer summary reports `kind=voice`, matching decoded and played frame counts, and zero loss on a healthy local run.
 

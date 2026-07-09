@@ -110,6 +110,9 @@ struct Args {
     access_token: Option<String>,
 
     #[arg(long)]
+    display_name: Option<String>,
+
+    #[arg(long)]
     list_capture_sources: bool,
 
     #[arg(long)]
@@ -264,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
     let response = control
         .send(ClientControl::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
-            client_name: format!("desktop-client/{:?}", args.mode),
+            client_name: args.control_display_name(),
         }))
         .await?;
     print_control_response("hello", &response);
@@ -2400,6 +2403,12 @@ fn ensure_not_error(action: &str, response: &ServerEnvelope) -> anyhow::Result<(
 }
 
 impl Args {
+    fn control_display_name(&self) -> String {
+        self.display_name
+            .clone()
+            .unwrap_or_else(|| format!("desktop-client/{:?}", self.mode))
+    }
+
     fn synthetic_media_enabled(&self) -> bool {
         self.media_frames > 0 || self.media_run_ms > 0
     }
@@ -2646,6 +2655,16 @@ mod tests {
         let args = Args::try_parse_from(["desktop-client", "--list-participants"]).unwrap();
 
         assert!(args.list_participants);
+    }
+
+    #[test]
+    fn display_name_overrides_default_control_name() {
+        let named = Args::try_parse_from(["desktop-client", "--display-name", "Alice Screenshare"])
+            .unwrap();
+        let default = Args::try_parse_from(["desktop-client"]).unwrap();
+
+        assert_eq!(named.control_display_name(), "Alice Screenshare");
+        assert_eq!(default.control_display_name(), "desktop-client/Viewer");
     }
 
     #[test]
