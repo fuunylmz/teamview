@@ -4,9 +4,10 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     control::{
         ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason, MediaKind,
-        Pong, RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, ServerControl,
-        ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId,
-        StreamPublished, StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
+        Pong, RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, RoomList, RoomSummary,
+        ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig,
+        StreamId, StreamList, StreamPublished, StreamSubscribed, StreamSummary, StreamUnsubscribed,
+        UserId, ViewerStatsReport,
     },
     packet::MediaPacket,
 };
@@ -134,6 +135,7 @@ impl ControlState {
                     ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"))
                 }
             },
+            ClientControl::ListRooms(_) => ServerControl::RoomList(self.list_rooms()),
             ClientControl::JoinRoom(join) => match self.rooms.get_mut(&join.room_id) {
                 Some(room) => match session.user_id {
                     Some(user_id) => {
@@ -192,6 +194,7 @@ impl ControlState {
                     }
                 }
             }
+            ClientControl::ListStreams(list) => self.list_streams(session, list.room_id),
             ClientControl::SubscribeStream(subscribe) => {
                 match self.rooms.get_mut(&subscribe.room_id) {
                     Some(room) => match session.user_id {
@@ -705,6 +708,61 @@ impl ControlState {
         }
     }
 
+    fn list_rooms(&self) -> RoomList {
+        RoomList {
+            rooms: self
+                .rooms
+                .values()
+                .map(|room| RoomSummary {
+                    room_id: room.id,
+                    name: room.name.clone(),
+                    participant_count: room.participants.len() as u32,
+                    published_stream_count: room.published_streams.len() as u32,
+                })
+                .collect(),
+        }
+    }
+
+    fn list_streams(&self, session: &Session, room_id: RoomId) -> ServerControl {
+        let Some(user_id) = session.user_id else {
+            return ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"));
+        };
+        let Some(room) = self.rooms.get(&room_id) else {
+            return ServerControl::Error(ControlError::new(
+                "room_not_found",
+                "room does not exist",
+            ));
+        };
+        if !room.participants.contains(&user_id) {
+            return ServerControl::Error(ControlError::new(
+                "not_in_room",
+                "join room before listing streams",
+            ));
+        }
+        ServerControl::StreamList(StreamList {
+            room_id,
+            streams: room
+                .published_streams
+                .values()
+                .map(|stream| StreamSummary {
+                    room_id,
+                    stream_id: stream.stream_id,
+                    publisher_id: stream.publisher_id,
+                    codec: stream.codec,
+                    media_kind: stream.media_kind,
+                    subscriber_count: room
+                        .subscriptions
+                        .get(&stream.stream_id)
+                        .map(|subscribers| subscribers.len() as u32)
+                        .unwrap_or_default(),
+                    has_config: stream.config.is_some(),
+                    target_bitrate_bps: stream.target_bitrate_bps,
+                    target_frames_per_second: stream.target_frames_per_second,
+                })
+                .collect(),
+        })
+    }
+
     fn poll_stream_metrics(
         &self,
         session: &Session,
@@ -760,10 +818,10 @@ mod tests {
         PROTOCOL_VERSION,
         codec::CodecId,
         control::{
-            Authenticate, ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind,
-            Ping, PollPublisherFeedback, PollStreamConfig, PollStreamMetrics, PublishStream,
-            RequestKeyframe, SetTargetBitrate, SetTargetFramerate, StreamConfig, SubscribeStream,
-            ViewerStatsReport,
+            Authenticate, ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, ListRooms,
+            ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
+            PollStreamMetrics, PublishStream, RequestKeyframe, SetTargetBitrate,
+            SetTargetFramerate, StreamConfig, SubscribeStream, ViewerStatsReport,
         },
         packet::{MediaPacket, MediaPacketHeader, PacketFlags, PacketType},
     };
@@ -903,6 +961,106 @@ mod tests {
         match duplicate.message {
             ServerControl::Error(error) => assert_eq!(error.code, "stream_id_conflict"),
             other => panic!("unexpected duplicate stream response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_rooms_returns_room_summaries() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        create_room(&mut state, &mut publisher, "empty");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(6, ClientControl::ListRooms(ListRooms)),
+        );
+
+        match response.message {
+            ServerControl::RoomList(list) => {
+                assert_eq!(list.rooms.len(), 2);
+                assert_eq!(list.rooms[0].room_id, room_id);
+                assert_eq!(list.rooms[0].name, "stage1");
+                assert_eq!(list.rooms[0].participant_count, 2);
+                assert_eq!(list.rooms[0].published_stream_count, 1);
+                assert_eq!(list.rooms[1].name, "empty");
+                assert_eq!(list.rooms[1].participant_count, 0);
+                assert_eq!(list.rooms[1].published_stream_count, 0);
+            }
+            other => panic!("unexpected room list response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn room_participant_can_list_streams() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+        let config = sample_stream_config(room_id, 9);
+        state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(6, ClientControl::SetStreamConfig(config)),
+        );
+
+        let response = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(7, ClientControl::ListStreams(ListStreams { room_id })),
+        );
+
+        match response.message {
+            ServerControl::StreamList(list) => {
+                assert_eq!(list.room_id, room_id);
+                assert_eq!(list.streams.len(), 1);
+                let stream = &list.streams[0];
+                assert_eq!(stream.room_id, room_id);
+                assert_eq!(stream.stream_id, 9);
+                assert_eq!(stream.publisher_id, publisher.user_id.unwrap());
+                assert_eq!(stream.codec, CodecId::H264);
+                assert_eq!(stream.media_kind, MediaKind::Screen);
+                assert_eq!(stream.subscriber_count, 1);
+                assert!(stream.has_config);
+                assert_eq!(stream.target_bitrate_bps, DEFAULT_TARGET_BITRATE_BPS);
+                assert_eq!(
+                    stream.target_frames_per_second,
+                    DEFAULT_TARGET_FRAMES_PER_SECOND
+                );
+            }
+            other => panic!("unexpected stream list response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_participant_cannot_list_streams() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut outsider = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut outsider, "outsider");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut outsider,
+            ClientEnvelope::new(6, ClientControl::ListStreams(ListStreams { room_id })),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "not_in_room"),
+            other => panic!("unexpected stream list response: {other:?}"),
         }
     }
 

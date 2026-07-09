@@ -35,8 +35,10 @@ Current control messages cover:
 - ping / pong keepalive
 - optional shared-token authentication
 - create room
+- list rooms
 - join room
 - publish stream
+- list streams
 - subscribe / unsubscribe stream
 - leave room
 - keyframe request
@@ -49,6 +51,8 @@ Current control messages cover:
 JSON-line framing is intentionally a Stage 1 choice. Later stages can replace it with a compact binary serializer or length-prefixed binary envelope without changing the room/control state machine.
 
 When the relay is started with an access token, clients must send `Authenticate` after `Hello` and before room, stream, stats, or media use. Invalid tokens return `invalid_token`; unauthenticated control actions return `not_authenticated`. Media datagrams from a connection that has not authenticated are dropped. Without an access token, `Hello` grants access for local development and tests.
+
+Viewers can discover active sessions before subscribing. `ListRooms` returns room ids, names, participant counts, and published stream counts. After joining a room, `ListStreams` returns stream ids, publisher ids, codec/media kind, subscriber counts, config availability, and current target bitrate/FPS. The desktop viewer uses these messages to select a room by `--room-name` when `--room-id` is not provided.
 
 Keyframe requests are accepted from subscribed viewers and are also registered automatically when a viewer first subscribes to a stream. The relay exposes those requests to the publisher through `PublisherFeedback.keyframe_requested`; the publisher consumes the pending request when it polls feedback and should make the next encoded video frame a keyframe.
 

@@ -30,8 +30,10 @@ pub enum ClientControl {
     Ping(Ping),
     Authenticate(Authenticate),
     CreateRoom(CreateRoom),
+    ListRooms(ListRooms),
     JoinRoom(JoinRoom),
     PublishStream(PublishStream),
+    ListStreams(ListStreams),
     SubscribeStream(SubscribeStream),
     UnsubscribeStream(UnsubscribeStream),
     LeaveRoom(LeaveRoom),
@@ -51,8 +53,10 @@ pub enum ServerControl {
     Pong(Pong),
     Authenticated(Authenticated),
     RoomCreated(RoomCreated),
+    RoomList(RoomList),
     RoomJoined(RoomJoined),
     StreamPublished(StreamPublished),
+    StreamList(StreamList),
     StreamSubscribed(StreamSubscribed),
     StreamUnsubscribed(StreamUnsubscribed),
     RoomLeft(RoomLeft),
@@ -111,6 +115,22 @@ pub struct RoomCreated {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListRooms;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomSummary {
+    pub room_id: RoomId,
+    pub name: String,
+    pub participant_count: u32,
+    pub published_stream_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomList {
+    pub rooms: Vec<RoomSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRoom {
     pub room_id: RoomId,
 }
@@ -133,6 +153,30 @@ pub struct PublishStream {
 pub struct StreamPublished {
     pub room_id: RoomId,
     pub stream_id: StreamId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListStreams {
+    pub room_id: RoomId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamSummary {
+    pub room_id: RoomId,
+    pub stream_id: StreamId,
+    pub publisher_id: UserId,
+    pub codec: CodecId,
+    pub media_kind: MediaKind,
+    pub subscriber_count: u32,
+    pub has_config: bool,
+    pub target_bitrate_bps: u32,
+    pub target_frames_per_second: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamList {
+    pub room_id: RoomId,
+    pub streams: Vec<StreamSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +444,60 @@ mod tests {
         let encoded = encode_client_envelope(&envelope).unwrap();
 
         assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn discovery_controls_round_trip_as_json_lines() {
+        let list_rooms = ClientEnvelope::new(9, ClientControl::ListRooms(ListRooms));
+        let list_streams =
+            ClientEnvelope::new(10, ClientControl::ListStreams(ListStreams { room_id: 1 }));
+        let room_list = ServerEnvelope::new(
+            11,
+            ServerControl::RoomList(RoomList {
+                rooms: vec![RoomSummary {
+                    room_id: 1,
+                    name: "stage1".to_owned(),
+                    participant_count: 2,
+                    published_stream_count: 1,
+                }],
+            }),
+        );
+        let stream_list = ServerEnvelope::new(
+            12,
+            ServerControl::StreamList(StreamList {
+                room_id: 1,
+                streams: vec![StreamSummary {
+                    room_id: 1,
+                    stream_id: 9,
+                    publisher_id: 1,
+                    codec: CodecId::H264,
+                    media_kind: MediaKind::Screen,
+                    subscriber_count: 1,
+                    has_config: true,
+                    target_bitrate_bps: 4_000_000,
+                    target_frames_per_second: 30,
+                }],
+            }),
+        );
+
+        let encoded_rooms = encode_client_envelope(&list_rooms).unwrap();
+        let encoded_streams = encode_client_envelope(&list_streams).unwrap();
+        let encoded_room_list = encode_server_envelope(&room_list).unwrap();
+        let encoded_stream_list = encode_server_envelope(&stream_list).unwrap();
+
+        assert_eq!(decode_client_envelope(&encoded_rooms).unwrap(), list_rooms);
+        assert_eq!(
+            decode_client_envelope(&encoded_streams).unwrap(),
+            list_streams
+        );
+        assert_eq!(
+            decode_server_envelope(&encoded_room_list).unwrap(),
+            room_list
+        );
+        assert_eq!(
+            decode_server_envelope(&encoded_stream_list).unwrap(),
+            stream_list
+        );
     }
 
     #[test]

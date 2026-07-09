@@ -100,7 +100,7 @@ For a local desktop-client synthetic media session, start the relay, then start 
 ```bash
 cargo run -p relay-server -- --listen 127.0.0.1:4433
 cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 5 --media-frame-bytes 800 --max-datagram-payload 700 --feedback-interval-frames 2
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-id 1 --media-run-ms 1000 --media-fps 5 --max-datagram-payload 700
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-run-ms 1000 --media-fps 5 --max-datagram-payload 700
 ```
 
 Expected output includes the broadcaster publishing `StreamConfig`, setting target bitrate/framerate, the viewer polling config before media, publisher feedback polling, relay `stream-metrics`, received frames with `latency_ms`, `media-render` lines, periodic `viewer-stats` responses, and a final viewer summary similar to:
@@ -114,13 +114,13 @@ For a local synthetic voice session, use `--media-kind voice` and a 50 fps packe
 
 ```bash
 cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind voice --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --media-frame-bytes 96 --feedback-interval-frames 10
-cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-id 1 --media-kind voice --media-run-ms 1000 --media-fps 50
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-name stage1 --media-kind voice --media-run-ms 1000 --media-fps 50
 ```
 
 Expected voice output includes `audio-send`, `audio-recv`, `audio-play`, relay `stream-metrics`, and a final viewer summary similar to `media-summary role=viewer kind=voice frames=50 decoded=50 played=50 ...`.
 
 ## Current stage
 
-Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers through independent bounded viewer egress queues, optionally require a shared access token, store and serve stream config, expose stream ingress/egress metrics, aggregate viewer stats into publisher feedback, and the client/load-test paths can packetize, pace, send, receive, reassemble with stale-frame drops, parse synthetic Annex B H.264-like frames into BGRA preview frames, render them into a latest-frame playback sink, send and receive synthetic Opus-like voice frames, estimate capture-to-viewer latency from media timestamps, report viewer stats, poll publisher feedback and stream metrics, request synthetic keyframes for new subscribers, packet loss, or decoder recovery, adapt synthetic bitrate/FPS targets when viewers are degraded, and keep QUIC control connections alive while waiting for delayed media.
+Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers through independent bounded viewer egress queues, optionally require a shared access token, list rooms and streams for viewer discovery, store and serve stream config, expose stream ingress/egress metrics, aggregate viewer stats into publisher feedback, and the client/load-test paths can packetize, pace, send, receive, reassemble with stale-frame drops, parse synthetic Annex B H.264-like frames into BGRA preview frames, render them into a latest-frame playback sink, send and receive synthetic Opus-like voice frames, estimate capture-to-viewer latency from media timestamps, report viewer stats, poll publisher feedback and stream metrics, request synthetic keyframes for new subscribers, packet loss, or decoder recovery, adapt synthetic bitrate/FPS targets when viewers are degraded, and keep QUIC control connections alive while waiting for delayed media.
 
 Actual Windows Graphics Capture frame acquisition, microphone capture, real Opus, hardware encode, native decode, native window rendering, and production-grade adaptive media feedback are later stages.

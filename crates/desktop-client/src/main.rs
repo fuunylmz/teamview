@@ -17,11 +17,11 @@ use teamview_protocol::{
     PROTOCOL_VERSION,
     codec::CodecId,
     control::{
-        Authenticate, ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, MediaKind, Ping,
-        PollPublisherFeedback, PollStreamConfig, PollStreamMetrics, PublishStream,
-        PublisherFeedback, RequestKeyframe, RoomId, ServerControl, ServerEnvelope,
-        SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId, StreamMetricsSnapshot,
-        SubscribeStream, ViewerStatsReport,
+        Authenticate, ClientControl, CreateRoom, Hello, JoinRoom, KeyframeReason, ListRooms,
+        ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig, PollStreamMetrics,
+        PublishStream, PublisherFeedback, RequestKeyframe, RoomId, RoomSummary, ServerControl,
+        ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId,
+        StreamMetricsSnapshot, StreamSummary, SubscribeStream, ViewerStatsReport,
     },
     frame::{packetize_frame_for_datagram_target, packetize_frame_with_type_for_datagram_target},
     packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, PacketType},
@@ -248,9 +248,7 @@ async fn run_viewer_control_flow(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<()> {
-    let room_id = args
-        .room_id
-        .context("viewer mode requires --room-id from a broadcaster run")?;
+    let room_id = resolve_viewer_room_id(control, args).await?;
 
     let joined = control
         .send(ClientControl::JoinRoom(JoinRoom { room_id }))
@@ -258,16 +256,19 @@ async fn run_viewer_control_flow(
     print_control_response("join-room", &joined);
     ensure_not_error("join room", &joined)?;
 
+    let available_streams = list_room_streams(control, room_id).await?;
+    let stream_id = resolve_viewer_stream_id(args, &available_streams)?;
+
     let subscribed = control
         .send(ClientControl::SubscribeStream(SubscribeStream {
             room_id,
-            stream_id: args.stream_id,
+            stream_id,
         }))
         .await?;
     print_control_response("subscribe-stream", &subscribed);
     ensure_not_error("subscribe stream", &subscribed)?;
 
-    let stream_config = poll_stream_config(control, room_id, args.stream_id).await?;
+    let stream_config = poll_stream_config(control, room_id, stream_id).await?;
     println!(
         "stream-config stream_id={} codec={:?} width={} height={} fps={} timebase_hz={}",
         stream_config.stream_id,
@@ -280,12 +281,178 @@ async fn run_viewer_control_flow(
 
     println!(
         "control-flow viewer room_id={} stream_id={}",
-        room_id, args.stream_id
+        room_id, stream_id
     );
     if args.synthetic_media_enabled() {
-        run_synthetic_viewer_media(control, args).await?;
+        run_synthetic_viewer_media(control, args, room_id, stream_id).await?;
     }
     Ok(())
+}
+
+async fn resolve_viewer_room_id(
+    control: &mut crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<RoomId> {
+    if let Some(room_id) = args.room_id {
+        return Ok(room_id);
+    }
+
+    let rooms = list_rooms(control).await?;
+    if rooms.is_empty() {
+        bail!("no rooms are available; start a broadcaster first or pass --room-id");
+    }
+    let selected = select_viewer_room(&rooms, &args.room_name).with_context(|| {
+        format!(
+            "no room matched name {:?}; available rooms: {}",
+            args.room_name,
+            format_room_summaries(&rooms)
+        )
+    })?;
+    println!(
+        "room-discovery selected_room_id={} name={} participants={} streams={}",
+        selected.room_id,
+        selected.name,
+        selected.participant_count,
+        selected.published_stream_count
+    );
+    Ok(selected.room_id)
+}
+
+async fn list_rooms(
+    control: &mut crate::transport::quic::ControlClient,
+) -> anyhow::Result<Vec<RoomSummary>> {
+    let response = control.send(ClientControl::ListRooms(ListRooms)).await?;
+    print_control_response("list-rooms", &response);
+    match response.message {
+        ServerControl::RoomList(list) => Ok(list.rooms),
+        ServerControl::Error(error) => bail!("list rooms failed: {}", error.message),
+        other => bail!("unexpected list rooms response: {other:?}"),
+    }
+}
+
+fn select_viewer_room<'a>(rooms: &'a [RoomSummary], room_name: &str) -> Option<&'a RoomSummary> {
+    let mut candidates = rooms
+        .iter()
+        .filter(|room| room.name == room_name)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() && rooms.len() == 1 {
+        candidates.push(&rooms[0]);
+    }
+    candidates.into_iter().max_by_key(|room| {
+        (
+            room.published_stream_count > 0,
+            room.participant_count > 0,
+            room.room_id,
+        )
+    })
+}
+
+async fn list_room_streams(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+) -> anyhow::Result<Vec<StreamSummary>> {
+    let response = control
+        .send(ClientControl::ListStreams(ListStreams { room_id }))
+        .await?;
+    print_control_response("list-streams", &response);
+    match response.message {
+        ServerControl::StreamList(list) => Ok(list.streams),
+        ServerControl::Error(error) => bail!("list streams failed: {}", error.message),
+        other => bail!("unexpected list streams response: {other:?}"),
+    }
+}
+
+fn resolve_viewer_stream_id(args: &Args, streams: &[StreamSummary]) -> anyhow::Result<StreamId> {
+    let expected_kind = args.protocol_media_kind();
+    if let Some(stream) = streams
+        .iter()
+        .find(|stream| stream.stream_id == args.stream_id)
+    {
+        if stream.media_kind != expected_kind {
+            bail!(
+                "stream {} is {:?}, but viewer requested {:?}",
+                args.stream_id,
+                stream.media_kind,
+                expected_kind
+            );
+        }
+        println!(
+            "stream-discovery selected_stream_id={} codec={:?} media_kind={:?} subscribers={} configured={}",
+            stream.stream_id,
+            stream.codec,
+            stream.media_kind,
+            stream.subscriber_count,
+            stream.has_config
+        );
+        return Ok(stream.stream_id);
+    }
+
+    let matching_streams = streams
+        .iter()
+        .filter(|stream| stream.media_kind == expected_kind)
+        .collect::<Vec<_>>();
+    match matching_streams.as_slice() {
+        [] => bail!(
+            "stream {} was not found and no {:?} streams are available; streams: {}",
+            args.stream_id,
+            expected_kind,
+            format_stream_summaries(streams)
+        ),
+        [stream] => {
+            println!(
+                "stream-discovery selected_stream_id={} requested_stream_id={} codec={:?} media_kind={:?} subscribers={} configured={}",
+                stream.stream_id,
+                args.stream_id,
+                stream.codec,
+                stream.media_kind,
+                stream.subscriber_count,
+                stream.has_config
+            );
+            Ok(stream.stream_id)
+        }
+        _ => bail!(
+            "stream {} was not found and multiple {:?} streams are available; pass --stream-id. streams: {}",
+            args.stream_id,
+            expected_kind,
+            format_stream_summaries(streams)
+        ),
+    }
+}
+
+fn format_room_summaries(rooms: &[RoomSummary]) -> String {
+    if rooms.is_empty() {
+        return "none".to_owned();
+    }
+    rooms
+        .iter()
+        .map(|room| {
+            format!(
+                "{}:{} participants={} streams={}",
+                room.room_id, room.name, room.participant_count, room.published_stream_count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_stream_summaries(streams: &[StreamSummary]) -> String {
+    if streams.is_empty() {
+        return "none".to_owned();
+    }
+    streams
+        .iter()
+        .map(|stream| {
+            format!(
+                "{}:{:?}/{:?} subscribers={} configured={}",
+                stream.stream_id,
+                stream.media_kind,
+                stream.codec,
+                stream.subscriber_count,
+                stream.has_config
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn poll_stream_config(
@@ -634,20 +801,25 @@ async fn poll_stream_metrics(
 async fn run_synthetic_viewer_media(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
+    room_id: RoomId,
+    stream_id: StreamId,
 ) -> anyhow::Result<()> {
     match args.media_kind {
-        MediaKindArg::Screen => run_synthetic_screen_viewer_media(control, args).await,
-        MediaKindArg::Voice => run_synthetic_voice_viewer_media(control, args).await,
+        MediaKindArg::Screen => {
+            run_synthetic_screen_viewer_media(control, args, room_id, stream_id).await
+        }
+        MediaKindArg::Voice => {
+            run_synthetic_voice_viewer_media(control, args, room_id, stream_id).await
+        }
     }
 }
 
 async fn run_synthetic_screen_viewer_media(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
+    room_id: RoomId,
+    stream_id: StreamId,
 ) -> anyhow::Result<()> {
-    let room_id = args
-        .room_id
-        .context("viewer mode requires --room-id for media receive")?;
     let target_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
@@ -684,7 +856,7 @@ async fn run_synthetic_screen_viewer_media(
             stats.record_dropped_frames(outcome.dropped_frames);
         }
         if (packet_loss_detected || outcome.dropped_frames > 0) && !awaiting_recovery_keyframe {
-            request_keyframe(control, room_id, args.stream_id, KeyframeReason::PacketLoss).await?;
+            request_keyframe(control, room_id, stream_id, KeyframeReason::PacketLoss).await?;
             awaiting_recovery_keyframe = true;
         }
         stats.jitter_buffer_ms = buffer.estimated_jitter_ms(frame_interval_ms.max(1));
@@ -717,13 +889,8 @@ async fn run_synthetic_screen_viewer_media(
             } else {
                 stats.record_dropped_frame();
                 if !awaiting_recovery_keyframe {
-                    request_keyframe(
-                        control,
-                        room_id,
-                        args.stream_id,
-                        KeyframeReason::DecoderRecovery,
-                    )
-                    .await?;
+                    request_keyframe(control, room_id, stream_id, KeyframeReason::DecoderRecovery)
+                        .await?;
                     awaiting_recovery_keyframe = true;
                 }
             }
@@ -731,12 +898,12 @@ async fn run_synthetic_screen_viewer_media(
             if args.stats_interval_frames > 0
                 && reassembled_frames.is_multiple_of(args.stats_interval_frames)
             {
-                send_viewer_stats(control, room_id, args.stream_id, stats).await?;
+                send_viewer_stats(control, room_id, stream_id, stats).await?;
             }
         }
     }
     if received_packets > 0 {
-        send_viewer_stats(control, room_id, args.stream_id, stats).await?;
+        send_viewer_stats(control, room_id, stream_id, stats).await?;
     }
 
     println!(
@@ -755,10 +922,9 @@ async fn run_synthetic_screen_viewer_media(
 async fn run_synthetic_voice_viewer_media(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
+    room_id: RoomId,
+    stream_id: StreamId,
 ) -> anyhow::Result<()> {
-    let room_id = args
-        .room_id
-        .context("viewer mode requires --room-id for media receive")?;
     let target_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
@@ -820,12 +986,12 @@ async fn run_synthetic_voice_viewer_media(
             if args.stats_interval_frames > 0
                 && reassembled_frames.is_multiple_of(args.stats_interval_frames)
             {
-                send_viewer_stats(control, room_id, args.stream_id, stats).await?;
+                send_viewer_stats(control, room_id, stream_id, stats).await?;
             }
         }
     }
     if received_packets > 0 {
-        send_viewer_stats(control, room_id, args.stream_id, stats).await?;
+        send_viewer_stats(control, room_id, stream_id, stats).await?;
     }
 
     println!(
