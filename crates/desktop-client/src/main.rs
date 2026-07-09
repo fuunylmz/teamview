@@ -52,6 +52,7 @@ enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CaptureSourceArg {
     PrimaryMonitor,
+    Monitor,
     Window,
 }
 
@@ -87,6 +88,9 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = CaptureSourceArg::PrimaryMonitor)]
     capture_source: CaptureSourceArg,
+
+    #[arg(long)]
+    monitor_id: Option<String>,
 
     #[arg(long)]
     window_title: Option<String>,
@@ -1268,6 +1272,17 @@ impl Args {
     fn capture_source(&self) -> anyhow::Result<CaptureSource> {
         match self.capture_source {
             CaptureSourceArg::PrimaryMonitor => Ok(CaptureSource::PrimaryMonitor),
+            CaptureSourceArg::Monitor => {
+                let id = self
+                    .monitor_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--monitor-id is required when --capture-source monitor")
+                    })?;
+                Ok(CaptureSource::Monitor { id: id.to_owned() })
+            }
             CaptureSourceArg::Window => {
                 let title = self
                     .window_title
@@ -1305,6 +1320,39 @@ impl Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_capture_source_requires_id() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--capture-source",
+            "monitor",
+            "--screen-input",
+            "live",
+        ])
+        .unwrap();
+
+        let error = args.capture_source().unwrap_err();
+
+        assert!(error.to_string().contains("--monitor-id"));
+    }
+
+    #[test]
+    fn monitor_capture_source_uses_monitor_id() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--capture-source",
+            "monitor",
+            "--monitor-id",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.capture_source().unwrap(),
+            CaptureSource::Monitor { id: "0".to_owned() }
+        );
+    }
 
     #[test]
     fn window_capture_source_requires_title() {

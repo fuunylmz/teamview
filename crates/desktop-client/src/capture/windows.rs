@@ -5,13 +5,14 @@ use std::{ffi::c_void, mem, ptr};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
-    Foundation::{HANDLE, HWND, RECT},
+    Foundation::{HANDLE, HWND, LPARAM, RECT},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
-        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDeviceCaps, GetWindowDC, HDC, HORZRES,
-        ReleaseDC, SRCCOPY, SelectObject, VERTRES,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC, GetDeviceCaps,
+        GetMonitorInfoW, GetWindowDC, HDC, HMONITOR, HORZRES, MONITORINFO, ReleaseDC, SRCCOPY,
+        SelectObject, VERTRES,
     },
-    UI::WindowsAndMessaging::{FindWindowW, GetWindowRect, IsWindowVisible},
+    UI::WindowsAndMessaging::{FindWindowW, GetWindowRect, IsWindowVisible, MONITORINFOF_PRIMARY},
 };
 
 #[cfg(target_os = "windows")]
@@ -20,11 +21,25 @@ const WINDOW_SOURCE_LABEL: &str = "window capture source";
 #[cfg(target_os = "windows")]
 const PRIMARY_MONITOR_SOURCE_LABEL: &str = "primary monitor";
 
+#[cfg(target_os = "windows")]
+const MONITOR_SOURCE_LABEL: &str = "monitor capture source";
+
 #[cfg(not(target_os = "windows"))]
 const PRIMARY_MONITOR_SOURCE_LABEL: &str = "primary monitor";
 
 #[cfg(not(target_os = "windows"))]
 const WINDOW_SOURCE_LABEL: &str = "window capture source";
+
+#[cfg(not(target_os = "windows"))]
+const MONITOR_SOURCE_LABEL: &str = "monitor capture source";
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy)]
+struct MonitorBounds {
+    index: usize,
+    rect: RECT,
+    is_primary: bool,
+}
 
 #[derive(Debug)]
 pub struct WindowsGraphicsCapture {
@@ -118,9 +133,7 @@ fn capture_source_size_impl(source: &CaptureSource) -> anyhow::Result<(u32, u32)
             let hwnd = find_window_by_title(title)?;
             window_capture_size(hwnd)
         }
-        CaptureSource::Monitor { id } => {
-            anyhow::bail!("monitor capture by id is not implemented yet: {id}")
-        }
+        CaptureSource::Monitor { id } => monitor_bounds_by_id(id)?.size(),
     }
 }
 
@@ -134,9 +147,7 @@ impl WindowsGraphicsCapture {
         match &self.source {
             CaptureSource::PrimaryMonitor => self.capture_primary_monitor(),
             CaptureSource::Window { title, .. } => self.capture_window(title.clone()),
-            CaptureSource::Monitor { id } => {
-                anyhow::bail!("monitor capture by id is not implemented yet: {id}")
-            }
+            CaptureSource::Monitor { id } => self.capture_monitor(id.clone()),
         }
     }
 
@@ -193,6 +204,36 @@ impl WindowsGraphicsCapture {
     fn capture_window(&mut self, _title: String) -> anyhow::Result<CaptureFrame> {
         anyhow::bail!("Windows Graphics Capture is only available on Windows")
     }
+
+    #[cfg(target_os = "windows")]
+    fn capture_monitor(&mut self, id: String) -> anyhow::Result<CaptureFrame> {
+        let monitor = monitor_bounds_by_id(&id)?;
+        let (width, height) = monitor.size()?;
+        with_screen_dc(|screen_dc| unsafe {
+            let bytes = capture_bgra_from_source_region(
+                screen_dc,
+                monitor.rect.left,
+                monitor.rect.top,
+                width,
+                height,
+                MONITOR_SOURCE_LABEL,
+            )?;
+            let frame = CaptureFrame::cpu_bgra(
+                self.next_frame_id,
+                width,
+                height,
+                unix_time_micros(),
+                bytes,
+            )?;
+            self.next_frame_id = self.next_frame_id.saturating_add(1);
+            Ok(frame)
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn capture_monitor(&mut self, _id: String) -> anyhow::Result<CaptureFrame> {
+        anyhow::bail!("Windows Graphics Capture is only available on Windows")
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -205,6 +246,105 @@ fn validate_capture_dimensions(
         anyhow::bail!("{source_label} has invalid capture size {width}x{height}");
     }
     Ok((width as u32, height as u32))
+}
+
+#[cfg(target_os = "windows")]
+impl MonitorBounds {
+    fn size(&self) -> anyhow::Result<(u32, u32)> {
+        validate_capture_dimensions(
+            self.rect.right.saturating_sub(self.rect.left),
+            self.rect.bottom.saturating_sub(self.rect.top),
+            MONITOR_SOURCE_LABEL,
+        )
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn monitor_bounds_by_id(id: &str) -> anyhow::Result<MonitorBounds> {
+    let monitors = enumerate_monitors()?;
+    let id = id.trim();
+    if id.eq_ignore_ascii_case("primary") {
+        return monitors
+            .into_iter()
+            .find(|monitor| monitor.is_primary)
+            .ok_or_else(|| anyhow::anyhow!("no primary monitor reported by Windows"));
+    }
+
+    let index = id
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("monitor id must be a zero-based display index or primary"))?;
+    monitors
+        .into_iter()
+        .find(|monitor| monitor.index == index)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "monitor index {} not found; available monitor indexes: {}",
+                index,
+                available_monitor_indexes()
+            )
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn available_monitor_indexes() -> String {
+    match enumerate_monitors() {
+        Ok(monitors) if !monitors.is_empty() => monitors
+            .iter()
+            .map(|monitor| {
+                if monitor.is_primary {
+                    format!("{} (primary)", monitor.index)
+                } else {
+                    monitor.index.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "none".to_owned(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_monitors() -> anyhow::Result<Vec<MonitorBounds>> {
+    unsafe extern "system" fn enum_monitor(
+        hmonitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> i32 {
+        let monitors = unsafe { &mut *(lparam as *mut Vec<MonitorBounds>) };
+        let mut info = MONITORINFO {
+            cbSize: mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: unsafe { mem::zeroed() },
+            rcWork: unsafe { mem::zeroed() },
+            dwFlags: 0,
+        };
+        if unsafe { GetMonitorInfoW(hmonitor, &mut info) } == 0 {
+            return 1;
+        }
+        monitors.push(MonitorBounds {
+            index: monitors.len(),
+            rect: info.rcMonitor,
+            is_primary: (info.dwFlags & MONITORINFOF_PRIMARY) != 0,
+        });
+        1
+    }
+
+    let mut monitors = Vec::new();
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            ptr::null_mut(),
+            ptr::null(),
+            Some(enum_monitor),
+            (&mut monitors as *mut Vec<MonitorBounds>) as LPARAM,
+        )
+    };
+    if ok == 0 {
+        anyhow::bail!("failed to enumerate display monitors");
+    }
+    if monitors.is_empty() {
+        anyhow::bail!("Windows did not report any display monitors");
+    }
+    Ok(monitors)
 }
 
 #[cfg(target_os = "windows")]
@@ -277,13 +417,34 @@ unsafe fn capture_bgra_from_source_dc(
     height: u32,
     source_label: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    unsafe { capture_bgra_from_source_region(source_dc, 0, 0, width, height, source_label) }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn capture_bgra_from_source_region(
+    source_dc: HDC,
+    source_x: i32,
+    source_y: i32,
+    width: u32,
+    height: u32,
+    source_label: &str,
+) -> anyhow::Result<Vec<u8>> {
     let memory_dc = unsafe { CreateCompatibleDC(source_dc) };
     if memory_dc.is_null() {
         anyhow::bail!("failed to create compatible capture device context");
     }
 
-    let result =
-        unsafe { capture_bgra_with_memory_dc(source_dc, memory_dc, width, height, source_label) };
+    let result = unsafe {
+        capture_bgra_with_memory_dc(
+            source_dc,
+            memory_dc,
+            source_x,
+            source_y,
+            width,
+            height,
+            source_label,
+        )
+    };
     unsafe {
         DeleteDC(memory_dc);
     }
@@ -294,6 +455,8 @@ unsafe fn capture_bgra_from_source_dc(
 unsafe fn capture_bgra_with_memory_dc(
     source_dc: HDC,
     memory_dc: HDC,
+    source_x: i32,
+    source_y: i32,
     width: u32,
     height: u32,
     source_label: &str,
@@ -340,8 +503,8 @@ unsafe fn capture_bgra_with_memory_dc(
             width as i32,
             height as i32,
             source_dc,
-            0,
-            0,
+            source_x,
+            source_y,
             SRCCOPY,
         )
     } == 0
@@ -422,6 +585,16 @@ mod tests {
                 capture_source_size(&CaptureSource::PrimaryMonitor).unwrap(),
                 primary_monitor_size().unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn capture_source_size_accepts_monitor_index() {
+        if is_supported() {
+            let (width, height) =
+                capture_source_size(&CaptureSource::Monitor { id: "0".to_owned() }).unwrap();
+            assert!(width > 0);
+            assert!(height > 0);
         }
     }
 }
