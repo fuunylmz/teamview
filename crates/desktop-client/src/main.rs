@@ -1009,10 +1009,11 @@ async fn run_synthetic_screen_viewer_media(
                 bail!("timed out waiting for media packet");
             }
         };
+        let packet_receive_time_micros = unix_time_micros();
         let lost_packets_before = stats.lost_packets;
         stats.record_packet(&packet);
         received_packets += 1;
-        let outcome = buffer.push_with_stats(packet)?;
+        let outcome = buffer.push_with_stats_at(packet, packet_receive_time_micros)?;
         let packet_loss_detected = stats.lost_packets > lost_packets_before;
         if outcome.dropped_frames > 0 {
             stats.record_dropped_frames(outcome.dropped_frames);
@@ -1023,13 +1024,18 @@ async fn run_synthetic_screen_viewer_media(
         }
         stats.jitter_buffer_ms = buffer.estimated_jitter_ms(frame_interval_ms.max(1));
         if let Some(frame) = outcome.frame {
-            stats.record_estimated_latency(frame.sender_capture_time_micros, unix_time_micros());
+            stats.record_reassembly_millis(outcome.reassembly_ms);
+            stats.record_estimated_latency(
+                frame.sender_capture_time_micros,
+                packet_receive_time_micros,
+            );
             println!(
-                "media-recv frame_id={} bytes={} keyframe={} latency_ms={}",
+                "media-recv frame_id={} bytes={} keyframe={} latency_ms={} reassembly_ms={}",
                 frame.frame_id,
                 frame.bytes.len(),
                 frame.is_keyframe,
-                stats.estimated_latency_ms
+                stats.estimated_latency_ms,
+                outcome.reassembly_ms
             );
             let decode_start = Instant::now();
             if let Some(decoded) = decoder.decode(&frame.bytes)? {
@@ -1078,7 +1084,7 @@ async fn run_synthetic_screen_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={} decode_ms_p50={} decode_ms_p95={} render_ms_p50={} render_ms_p95={} render_fps={}",
+        "media-summary role=viewer frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} render_ms_p50={} render_ms_p95={} render_fps={}",
         reassembled_frames,
         decoded_frames,
         playback.rendered_frames(),
@@ -1086,6 +1092,8 @@ async fn run_synthetic_screen_viewer_media(
         stats.lost_packets,
         stats.dropped_frames,
         stats.estimated_latency_ms,
+        stats.to_viewer_report(room_id, stream_id).reassembly_ms_p50,
+        stats.to_viewer_report(room_id, stream_id).reassembly_ms_p95,
         stats.to_viewer_report(room_id, stream_id).decode_ms_p50,
         stats.to_viewer_report(room_id, stream_id).decode_ms_p95,
         stats.to_viewer_report(room_id, stream_id).render_ms_p50,
@@ -1127,20 +1135,26 @@ async fn run_synthetic_voice_viewer_media(
                 bail!("timed out waiting for audio packet");
             }
         };
+        let packet_receive_time_micros = unix_time_micros();
         stats.record_packet(&packet);
         received_packets += 1;
-        let outcome = buffer.push_with_stats(packet)?;
+        let outcome = buffer.push_with_stats_at(packet, packet_receive_time_micros)?;
         if outcome.dropped_frames > 0 {
             stats.record_dropped_frames(outcome.dropped_frames);
         }
         stats.jitter_buffer_ms = buffer.estimated_jitter_ms(frame_interval_ms.max(1));
         if let Some(frame) = outcome.frame {
-            stats.record_estimated_latency(frame.sender_capture_time_micros, unix_time_micros());
+            stats.record_reassembly_millis(outcome.reassembly_ms);
+            stats.record_estimated_latency(
+                frame.sender_capture_time_micros,
+                packet_receive_time_micros,
+            );
             println!(
-                "audio-recv frame_id={} bytes={} latency_ms={}",
+                "audio-recv frame_id={} bytes={} latency_ms={} reassembly_ms={}",
                 frame.frame_id,
                 frame.bytes.len(),
-                stats.estimated_latency_ms
+                stats.estimated_latency_ms,
+                outcome.reassembly_ms
             );
             let decode_start = Instant::now();
             if let Some(decoded) = decoder.decode(&frame.bytes)? {
@@ -1180,7 +1194,7 @@ async fn run_synthetic_voice_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer kind=voice frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={} decode_ms_p50={} decode_ms_p95={} play_ms_p50={} play_ms_p95={} play_fps={}",
+        "media-summary role=viewer kind=voice frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} play_ms_p50={} play_ms_p95={} play_fps={}",
         reassembled_frames,
         decoded_frames,
         playback.played_frames(),
@@ -1188,6 +1202,8 @@ async fn run_synthetic_voice_viewer_media(
         stats.lost_packets,
         stats.dropped_frames,
         stats.estimated_latency_ms,
+        stats.to_viewer_report(room_id, stream_id).reassembly_ms_p50,
+        stats.to_viewer_report(room_id, stream_id).reassembly_ms_p95,
         stats.to_viewer_report(room_id, stream_id).decode_ms_p50,
         stats.to_viewer_report(room_id, stream_id).decode_ms_p95,
         stats.to_viewer_report(room_id, stream_id).render_ms_p50,

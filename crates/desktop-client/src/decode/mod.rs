@@ -1,6 +1,6 @@
 pub mod h264;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 
 use bytes::Bytes;
 use teamview_protocol::{
@@ -54,6 +54,14 @@ impl FrameReassemblyBuffer {
     }
 
     pub fn push_with_stats(&mut self, packet: MediaPacket) -> anyhow::Result<ReassemblyOutcome> {
+        self.push_with_stats_at(packet, 0)
+    }
+
+    pub fn push_with_stats_at(
+        &mut self,
+        packet: MediaPacket,
+        packet_receive_time_micros: u64,
+    ) -> anyhow::Result<ReassemblyOutcome> {
         let frame_id = packet.header.frame_id;
         let fragment_count = packet.header.fragment_count as usize;
         let fragment_index = packet.header.fragment_index;
@@ -66,7 +74,13 @@ impl FrameReassemblyBuffer {
             self.pending.remove(&oldest_frame_id);
             dropped_frames += 1;
         }
-        let pending = self.pending.entry(frame_id).or_default();
+        let pending = match self.pending.entry(frame_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(PendingFrame {
+                first_packet_receive_time_micros: packet_receive_time_micros,
+                packets: Vec::new(),
+            }),
+        };
         if pending
             .packets
             .iter()
@@ -79,14 +93,21 @@ impl FrameReassemblyBuffer {
             return Ok(ReassemblyOutcome {
                 frame: None,
                 dropped_frames,
+                reassembly_ms: 0,
             });
         }
 
-        let packets = self.pending.remove(&frame_id).unwrap().packets;
+        let pending = self.pending.remove(&frame_id).unwrap();
+        let reassembly_ms = micros_delta_to_millis(
+            pending.first_packet_receive_time_micros,
+            packet_receive_time_micros,
+        );
+        let packets = pending.packets;
         let frame = reassemble_frame(packets).map_err(anyhow::Error::from)?;
         Ok(ReassemblyOutcome {
             frame: Some(frame),
             dropped_frames,
+            reassembly_ms,
         })
     }
 
@@ -117,6 +138,7 @@ impl FrameReassemblyBuffer {
 
 #[derive(Debug, Default, Clone)]
 struct PendingFrame {
+    first_packet_receive_time_micros: u64,
     packets: Vec<MediaPacket>,
 }
 
@@ -124,6 +146,17 @@ struct PendingFrame {
 pub struct ReassemblyOutcome {
     pub frame: Option<EncodedFrame>,
     pub dropped_frames: u64,
+    pub reassembly_ms: u16,
+}
+
+fn micros_delta_to_millis(start_micros: u64, end_micros: u64) -> u16 {
+    if start_micros == 0 || end_micros < start_micros {
+        return 0;
+    }
+    end_micros
+        .saturating_sub(start_micros)
+        .saturating_div(1_000)
+        .min(u16::MAX as u64) as u16
 }
 
 fn frame_is_older_than_window(
@@ -206,6 +239,7 @@ mod tests {
             ReassemblyOutcome {
                 frame: None,
                 dropped_frames: 0,
+                reassembly_ms: 0,
             }
         );
 
@@ -216,8 +250,31 @@ mod tests {
             ReassemblyOutcome {
                 frame: None,
                 dropped_frames: 1,
+                reassembly_ms: 0,
             }
         );
+    }
+
+    #[test]
+    fn reassembly_buffer_reports_first_to_last_fragment_time() {
+        let frame = sample_frame();
+        let packets = packetize_frame(&frame, 1, 8).unwrap();
+        let expected_reassembly_ms = (packets.len() as u16 - 1) * 4;
+        let mut buffer = FrameReassemblyBuffer::new();
+        let mut outcome = ReassemblyOutcome {
+            frame: None,
+            dropped_frames: 0,
+            reassembly_ms: 0,
+        };
+
+        for (index, packet) in packets.into_iter().enumerate() {
+            outcome = buffer
+                .push_with_stats_at(packet, 1_000_000 + index as u64 * 4_000)
+                .unwrap();
+        }
+
+        assert_eq!(outcome.frame, Some(frame));
+        assert_eq!(outcome.reassembly_ms, expected_reassembly_ms);
     }
 
     #[test]

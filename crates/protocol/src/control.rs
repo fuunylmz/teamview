@@ -278,6 +278,8 @@ pub struct ViewerStatsReport {
     pub dropped_frames: u64,
     pub jitter_buffer_ms: u16,
     pub estimated_latency_ms: u16,
+    pub reassembly_ms_p50: u16,
+    pub reassembly_ms_p95: u16,
     pub decode_ms_p50: u16,
     pub decode_ms_p95: u16,
     pub render_ms_p50: u16,
@@ -445,6 +447,34 @@ mod tests {
                 room_id: 1,
                 stream_id: 9,
                 reason: KeyframeReason::DecoderRecovery,
+            }),
+        );
+
+        let encoded = encode_client_envelope(&envelope).unwrap();
+
+        assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn viewer_stats_round_trips_from_client() {
+        let envelope = ClientEnvelope::new(
+            9,
+            ClientControl::ViewerStats(ViewerStatsReport {
+                room_id: 1,
+                stream_id: 9,
+                received_packets: 20,
+                lost_packets: 1,
+                decoded_frames: 8,
+                dropped_frames: 2,
+                jitter_buffer_ms: 33,
+                estimated_latency_ms: 88,
+                reassembly_ms_p50: 4,
+                reassembly_ms_p95: 9,
+                decode_ms_p50: 6,
+                decode_ms_p95: 12,
+                render_ms_p50: 3,
+                render_ms_p95: 7,
+                render_fps: 30,
             }),
         );
 

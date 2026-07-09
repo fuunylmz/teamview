@@ -81,6 +81,7 @@ pub struct ClientMediaStats {
     pub jitter_buffer_ms: u16,
     pub estimated_latency_ms: u16,
     last_sequence_number: Option<u32>,
+    reassembly_samples_ms: LatencySamples,
     decode_samples_ms: LatencySamples,
     render_samples_ms: LatencySamples,
     first_render_time_micros: u64,
@@ -104,6 +105,10 @@ impl ClientMediaStats {
 
     pub fn record_decoded_frame(&mut self) {
         self.decoded_frames = self.decoded_frames.saturating_add(1);
+    }
+
+    pub fn record_reassembly_millis(&mut self, reassembly_ms: u16) {
+        self.reassembly_samples_ms.push(reassembly_ms);
     }
 
     pub fn record_decode_duration(&mut self, duration: Duration) {
@@ -152,6 +157,8 @@ impl ClientMediaStats {
             dropped_frames: self.dropped_frames,
             jitter_buffer_ms: self.jitter_buffer_ms,
             estimated_latency_ms: self.estimated_latency_ms,
+            reassembly_ms_p50: self.reassembly_samples_ms.percentile(50),
+            reassembly_ms_p95: self.reassembly_samples_ms.percentile(95),
             decode_ms_p50: self.decode_samples_ms.percentile(50),
             decode_ms_p95: self.decode_samples_ms.percentile(95),
             render_ms_p50: self.render_samples_ms.percentile(50),
@@ -245,6 +252,8 @@ mod tests {
         let mut stats = ClientMediaStats::default();
         stats.record_packet(&packet_with_sequence(1));
         stats.record_decoded_frame();
+        stats.record_reassembly_millis(2);
+        stats.record_reassembly_millis(6);
         stats.record_decode_duration(Duration::from_millis(4));
         stats.record_decode_duration(Duration::from_millis(8));
         stats.record_render_duration(Duration::from_millis(3), 1_000_000);
@@ -259,6 +268,8 @@ mod tests {
         assert_eq!(report.stream_id, 9);
         assert_eq!(report.received_packets, 1);
         assert_eq!(report.decoded_frames, 1);
+        assert_eq!(report.reassembly_ms_p50, 6);
+        assert_eq!(report.reassembly_ms_p95, 6);
         assert_eq!(report.decode_ms_p50, 8);
         assert_eq!(report.decode_ms_p95, 8);
         assert_eq!(report.render_ms_p50, 5);
