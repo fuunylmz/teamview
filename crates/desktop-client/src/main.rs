@@ -44,6 +44,8 @@ use crate::{
 
 const MIN_SYNTHETIC_PAYLOAD_BYTES: usize = 64;
 const CONTROL_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_TIME_SYNC_SAMPLES: u8 = 5;
+const DEFAULT_TIME_SYNC_SPACING_MS: u64 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -153,6 +155,12 @@ struct Args {
 
     #[arg(long, default_value_t = 30)]
     feedback_interval_frames: u32,
+
+    #[arg(long, default_value_t = DEFAULT_TIME_SYNC_SAMPLES)]
+    time_sync_samples: u8,
+
+    #[arg(long, default_value_t = DEFAULT_TIME_SYNC_SPACING_MS)]
+    time_sync_spacing_ms: u64,
 }
 
 #[tokio::main]
@@ -200,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     print_control_response("hello", &response);
     ensure_not_error("hello", &response)?;
-    let clock_sync = sync_control_clock(&mut control).await?;
+    let clock_sync = sync_control_clock(&mut control, &args).await?;
     if let Some(access_token) = &args.access_token {
         authenticate_control(&mut control, access_token).await?;
     }
@@ -215,38 +223,64 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ClockSyncEstimate {
+    rtt_micros: u64,
     rtt_ms: u16,
     clock_offset_micros: i64,
 }
 
 async fn sync_control_clock(
     control: &mut crate::transport::quic::ControlClient,
+    args: &Args,
 ) -> anyhow::Result<ClockSyncEstimate> {
-    let client_send_time_micros = unix_time_micros();
-    let response = control
-        .send(ClientControl::TimeSync(TimeSyncRequest {
-            client_send_time_micros,
-        }))
-        .await?;
-    let client_receive_time_micros = unix_time_micros();
-    print_control_response("time-sync", &response);
-    match response.message {
-        ServerControl::TimeSync(sync) => {
-            let estimate = estimate_clock_sync(&sync, client_receive_time_micros);
-            println!(
-                "time-sync client_send_time_micros={} client_receive_time_micros={} server_receive_time_micros={} server_send_time_micros={} rtt_ms={} clock_offset_micros={}",
-                sync.client_send_time_micros,
-                client_receive_time_micros,
-                sync.server_receive_time_micros,
-                sync.server_send_time_micros,
-                estimate.rtt_ms,
-                estimate.clock_offset_micros
-            );
-            Ok(estimate)
+    let sample_count = args.time_sync_samples.max(1);
+    let sample_spacing = Duration::from_millis(args.time_sync_spacing_ms);
+    let mut samples = Vec::with_capacity(sample_count as usize);
+
+    for sample_index in 1..=sample_count {
+        let client_send_time_micros = unix_time_micros();
+        let response = control
+            .send(ClientControl::TimeSync(TimeSyncRequest {
+                client_send_time_micros,
+            }))
+            .await?;
+        let client_receive_time_micros = unix_time_micros();
+        print_control_response("time-sync", &response);
+        match response.message {
+            ServerControl::TimeSync(sync) => {
+                let estimate = estimate_clock_sync(&sync, client_receive_time_micros);
+                println!(
+                    "time-sync-sample sample={} samples={} client_send_time_micros={} client_receive_time_micros={} server_receive_time_micros={} server_send_time_micros={} rtt_micros={} rtt_ms={} clock_offset_micros={}",
+                    sample_index,
+                    sample_count,
+                    sync.client_send_time_micros,
+                    client_receive_time_micros,
+                    sync.server_receive_time_micros,
+                    sync.server_send_time_micros,
+                    estimate.rtt_micros,
+                    estimate.rtt_ms,
+                    estimate.clock_offset_micros
+                );
+                samples.push((sample_index, estimate));
+            }
+            ServerControl::Error(error) => bail!("time sync failed: {}", error.message),
+            other => bail!("unexpected time sync response: {other:?}"),
         }
-        ServerControl::Error(error) => bail!("time sync failed: {}", error.message),
-        other => bail!("unexpected time sync response: {other:?}"),
+        if sample_index < sample_count && sample_spacing > Duration::ZERO {
+            tokio::time::sleep(sample_spacing).await;
+        }
     }
+
+    let (selected_sample, estimate) =
+        select_best_clock_sync_estimate(&samples).context("time sync produced no samples")?;
+    println!(
+        "time-sync selected_sample={} samples={} rtt_micros={} rtt_ms={} clock_offset_micros={}",
+        selected_sample,
+        sample_count,
+        estimate.rtt_micros,
+        estimate.rtt_ms,
+        estimate.clock_offset_micros
+    );
+    Ok(estimate)
 }
 
 fn estimate_clock_sync(
@@ -268,9 +302,19 @@ fn estimate_clock_sync(
         (server_midpoint - client_midpoint).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
 
     ClockSyncEstimate {
+        rtt_micros,
         rtt_ms: micros_to_millis(rtt_micros),
         clock_offset_micros,
     }
+}
+
+fn select_best_clock_sync_estimate(
+    samples: &[(u8, ClockSyncEstimate)],
+) -> Option<(u8, ClockSyncEstimate)> {
+    samples
+        .iter()
+        .copied()
+        .min_by_key(|(_, estimate)| estimate.rtt_micros)
 }
 
 async fn authenticate_control(
@@ -1635,6 +1679,7 @@ mod tests {
         assert_eq!(
             estimate,
             ClockSyncEstimate {
+                rtt_micros: 1_200,
                 rtt_ms: 1,
                 clock_offset_micros: 200,
             }
@@ -1652,6 +1697,42 @@ mod tests {
         let estimate = estimate_clock_sync(&sync, u64::MAX);
 
         assert_eq!(estimate.rtt_ms, u16::MAX);
+        assert_eq!(estimate.rtt_micros, u64::MAX);
+    }
+
+    #[test]
+    fn clock_sync_selection_prefers_lowest_rtt_sample() {
+        let samples = [
+            (
+                1,
+                ClockSyncEstimate {
+                    rtt_micros: 2_000,
+                    rtt_ms: 2,
+                    clock_offset_micros: 50,
+                },
+            ),
+            (
+                2,
+                ClockSyncEstimate {
+                    rtt_micros: 900,
+                    rtt_ms: 0,
+                    clock_offset_micros: 75,
+                },
+            ),
+            (
+                3,
+                ClockSyncEstimate {
+                    rtt_micros: 1_400,
+                    rtt_ms: 1,
+                    clock_offset_micros: 60,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            select_best_clock_sync_estimate(&samples),
+            Some((2, samples[1].1))
+        );
     }
 
     #[test]
