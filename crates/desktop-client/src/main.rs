@@ -371,7 +371,7 @@ async fn run_synthetic_viewer_media(
     let frame_interval = args.media_frame_interval()?;
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
     let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
-    let mut decoder = H264Decoder;
+    let mut decoder = H264Decoder::default();
     let mut playback = NullPlayback;
     let mut stats = ClientMediaStats::default();
     let mut reassembled_frames = 0_u32;

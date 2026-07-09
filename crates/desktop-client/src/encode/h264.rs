@@ -5,6 +5,15 @@ use crate::capture::CaptureFrame;
 
 use super::VideoEncoder;
 
+const ANNEX_B_START_CODE: &[u8; 4] = &[0x00, 0x00, 0x00, 0x01];
+const SYNTHETIC_SPS_MAGIC: &[u8; 4] = b"TVS1";
+const SYNTHETIC_PPS_MAGIC: &[u8; 4] = b"TVP1";
+const SYNTHETIC_FRAME_MAGIC: &[u8; 4] = b"TVF1";
+const NAL_SPS: u8 = 0x67;
+const NAL_PPS: u8 = 0x68;
+const NAL_IDR_SLICE: u8 = 0x65;
+const NAL_NON_IDR_SLICE: u8 = 0x41;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct H264EncoderConfig {
     pub width: u32,
@@ -42,15 +51,21 @@ impl VideoEncoder for H264Encoder {
         self.keyframe_requested = false;
 
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1f]);
         if is_keyframe {
-            bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x65]);
+            append_nal(
+                &mut bytes,
+                NAL_SPS,
+                &synthetic_sps_payload(frame.width, frame.height, self.config.frames_per_second),
+            );
+            append_nal(&mut bytes, NAL_PPS, SYNTHETIC_PPS_MAGIC);
+            append_nal(&mut bytes, NAL_IDR_SLICE, &synthetic_frame_payload(&frame));
         } else {
-            bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x41]);
+            append_nal(
+                &mut bytes,
+                NAL_NON_IDR_SLICE,
+                &synthetic_frame_payload(&frame),
+            );
         }
-        bytes.extend_from_slice(&frame.frame_id.to_le_bytes());
-        bytes.extend_from_slice(&frame.width.to_le_bytes());
-        bytes.extend_from_slice(&frame.height.to_le_bytes());
         while bytes.len() < self.config.synthetic_payload_bytes {
             bytes.push(
                 frame
@@ -59,7 +74,6 @@ impl VideoEncoder for H264Encoder {
                     .to_le_bytes()[0],
             );
         }
-        bytes.truncate(self.config.synthetic_payload_bytes);
 
         Ok(Some(EncodedFrame {
             room_stream_id: stream_id,
@@ -79,6 +93,30 @@ impl VideoEncoder for H264Encoder {
     fn update_bitrate(&mut self, bitrate_bps: u32) {
         self.config.bitrate_bps = bitrate_bps;
     }
+}
+
+fn append_nal(bytes: &mut Vec<u8>, nal_header: u8, payload: &[u8]) {
+    bytes.extend_from_slice(ANNEX_B_START_CODE);
+    bytes.push(nal_header);
+    bytes.extend_from_slice(payload);
+}
+
+fn synthetic_sps_payload(width: u32, height: u32, frames_per_second: u16) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(14);
+    payload.extend_from_slice(SYNTHETIC_SPS_MAGIC);
+    payload.extend_from_slice(&width.to_le_bytes());
+    payload.extend_from_slice(&height.to_le_bytes());
+    payload.extend_from_slice(&frames_per_second.to_le_bytes());
+    payload
+}
+
+fn synthetic_frame_payload(frame: &CaptureFrame) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(16);
+    payload.extend_from_slice(SYNTHETIC_FRAME_MAGIC);
+    payload.extend_from_slice(&(frame.frame_id as u32).to_le_bytes());
+    payload.extend_from_slice(&frame.width.to_le_bytes());
+    payload.extend_from_slice(&frame.height.to_le_bytes());
+    payload
 }
 
 #[cfg(test)]
@@ -112,6 +150,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(encoded.bytes.len(), 2048);
+    }
+
+    #[test]
+    fn synthetic_encoder_keeps_required_metadata_when_payload_size_is_tiny() {
+        let mut encoder = H264Encoder::default();
+        encoder.config.synthetic_payload_bytes = 8;
+
+        let encoded = encoder
+            .encode(CaptureFrame::metadata_only(1, 1280, 720, 123_456), 9)
+            .unwrap()
+            .unwrap();
+
+        assert!(encoded.bytes.len() > 8);
+        assert!(
+            encoded
+                .bytes
+                .windows(ANNEX_B_START_CODE.len())
+                .any(|window| window == ANNEX_B_START_CODE)
+        );
     }
 
     #[test]

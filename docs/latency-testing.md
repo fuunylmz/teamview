@@ -105,7 +105,7 @@ quic-sample-forward frames=2 fragments=14 reassembled=4 delivered=28 dropped=0
 
 ## Desktop synthetic session checks
 
-The desktop client can run a paced synthetic media session over the relay. The broadcaster uses a frame interval derived from `--media-fps`, keeps sequence numbers continuous across fragments, and lingers briefly after finite sends so in-flight datagrams can drain. The viewer reassembles frames, mock-decodes them, tracks packet loss from sequence gaps, and periodically sends `ViewerStats` over the control stream.
+The desktop client can run a paced synthetic media session over the relay. The broadcaster uses a frame interval derived from `--media-fps`, keeps sequence numbers continuous across fragments, and lingers briefly after finite sends so in-flight datagrams can drain. The viewer reassembles frames, parses synthetic Annex B H.264-like NAL units, tracks packet loss from sequence gaps, and periodically sends `ViewerStats` over the control stream.
 
 Run in separate terminals:
 
