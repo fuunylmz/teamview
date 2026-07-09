@@ -491,11 +491,6 @@ async fn run_viewer_control_flow(
     args: &Args,
     clock_sync: ClockSyncEstimate,
 ) -> anyhow::Result<()> {
-    if args.media_kind == MediaKindArg::Both {
-        bail!(
-            "viewer --media-kind both is not supported yet; run separate screen and voice viewers or select one media kind"
-        );
-    }
     let room_id = resolve_viewer_room_id(control, args).await?;
 
     let joined = control
@@ -505,16 +500,16 @@ async fn run_viewer_control_flow(
     ensure_not_error("join room", &joined)?;
 
     let available_streams = list_room_streams(control, room_id).await?;
+    if args.media_kind == MediaKindArg::Both {
+        run_dual_stream_viewer_control_flow(control, args, room_id, &available_streams, clock_sync)
+            .await?;
+        leave_room(control, room_id).await?;
+        return Ok(());
+    }
+
     let stream_id = resolve_viewer_stream_id(args, &available_streams)?;
 
-    let subscribed = control
-        .send(ClientControl::SubscribeStream(SubscribeStream {
-            room_id,
-            stream_id,
-        }))
-        .await?;
-    print_control_response("subscribe-stream", &subscribed);
-    ensure_not_error("subscribe stream", &subscribed)?;
+    subscribe_stream(control, room_id, stream_id).await?;
 
     let stream_config = poll_stream_config(control, room_id, stream_id).await?;
     println!(
@@ -536,6 +531,60 @@ async fn run_viewer_control_flow(
     }
     unsubscribe_stream(control, room_id, stream_id).await?;
     leave_room(control, room_id).await?;
+    Ok(())
+}
+
+async fn run_dual_stream_viewer_control_flow(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+    available_streams: &[StreamSummary],
+    clock_sync: ClockSyncEstimate,
+) -> anyhow::Result<()> {
+    let (screen_stream_id, voice_stream_id) =
+        resolve_dual_viewer_stream_ids(args, available_streams)?;
+
+    subscribe_stream(control, room_id, screen_stream_id).await?;
+    subscribe_stream(control, room_id, voice_stream_id).await?;
+
+    let screen_config = poll_stream_config(control, room_id, screen_stream_id).await?;
+    let voice_config = poll_stream_config(control, room_id, voice_stream_id).await?;
+    println!(
+        "stream-config stream_id={} codec={:?} width={} height={} fps={} timebase_hz={}",
+        screen_config.stream_id,
+        screen_config.codec,
+        screen_config.width,
+        screen_config.height,
+        screen_config.frames_per_second,
+        screen_config.timebase_hz
+    );
+    println!(
+        "stream-config stream_id={} codec={:?} width={} height={} fps={} timebase_hz={}",
+        voice_config.stream_id,
+        voice_config.codec,
+        voice_config.width,
+        voice_config.height,
+        voice_config.frames_per_second,
+        voice_config.timebase_hz
+    );
+
+    println!(
+        "control-flow viewer room_id={} screen_stream_id={} voice_stream_id={}",
+        room_id, screen_stream_id, voice_stream_id
+    );
+    if args.synthetic_media_enabled() {
+        run_synthetic_dual_viewer_media(
+            control,
+            args,
+            room_id,
+            screen_stream_id,
+            voice_stream_id,
+            clock_sync,
+        )
+        .await?;
+    }
+    unsubscribe_stream(control, room_id, screen_stream_id).await?;
+    unsubscribe_stream(control, room_id, voice_stream_id).await?;
     Ok(())
 }
 
@@ -667,6 +716,76 @@ fn resolve_viewer_stream_id(args: &Args, streams: &[StreamSummary]) -> anyhow::R
             format_stream_summaries(streams)
         ),
     }
+}
+
+fn resolve_dual_viewer_stream_ids(
+    args: &Args,
+    streams: &[StreamSummary],
+) -> anyhow::Result<(StreamId, StreamId)> {
+    let screen_stream_id = resolve_stream_id_for_kind(args.stream_id, MediaKind::Screen, streams)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "screen stream {} was not found; streams: {}",
+                args.stream_id,
+                format_stream_summaries(streams)
+            )
+        })?;
+    let requested_voice_stream_id = args.voice_stream_id()?;
+    let voice_stream_id =
+        resolve_stream_id_for_kind(requested_voice_stream_id, MediaKind::Voice, streams)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "voice stream {} was not found; streams: {}",
+                    requested_voice_stream_id,
+                    format_stream_summaries(streams)
+                )
+            })?;
+    Ok((screen_stream_id, voice_stream_id))
+}
+
+fn resolve_stream_id_for_kind(
+    requested_stream_id: StreamId,
+    expected_kind: MediaKind,
+    streams: &[StreamSummary],
+) -> anyhow::Result<Option<StreamId>> {
+    let Some(stream) = streams
+        .iter()
+        .find(|stream| stream.stream_id == requested_stream_id)
+    else {
+        return Ok(None);
+    };
+    if stream.media_kind != expected_kind {
+        bail!(
+            "stream {} is {:?}, but viewer requested {:?}",
+            requested_stream_id,
+            stream.media_kind,
+            expected_kind
+        );
+    }
+    println!(
+        "stream-discovery selected_stream_id={} codec={:?} media_kind={:?} subscribers={} configured={}",
+        stream.stream_id,
+        stream.codec,
+        stream.media_kind,
+        stream.subscriber_count,
+        stream.has_config
+    );
+    Ok(Some(stream.stream_id))
+}
+
+async fn subscribe_stream(
+    control: &crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
+    let subscribed = control
+        .send(ClientControl::SubscribeStream(SubscribeStream {
+            room_id,
+            stream_id,
+        }))
+        .await?;
+    print_control_response("subscribe-stream", &subscribed);
+    ensure_not_error("subscribe stream", &subscribed)
 }
 
 fn format_room_summaries(rooms: &[RoomSummary]) -> String {
@@ -1363,6 +1482,320 @@ async fn run_synthetic_viewer_media(
     }
 }
 
+async fn run_synthetic_dual_viewer_media(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+    screen_stream_id: StreamId,
+    voice_stream_id: StreamId,
+    clock_sync: ClockSyncEstimate,
+) -> anyhow::Result<()> {
+    let target_frames = args.synthetic_media_frames()?;
+    let frame_interval = args.media_frame_interval()?;
+    let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
+
+    let mut screen_buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
+    let mut screen_decoder = H264Decoder::default();
+    let mut screen_playback = args.video_playback()?;
+    let mut screen_stats = ClientMediaStats::default();
+    let mut screen_reassembled_frames = 0_u32;
+    let mut screen_decoded_frames = 0_u32;
+    let mut screen_received_packets = 0_u64;
+    let mut awaiting_recovery_keyframe = false;
+
+    let mut voice_buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
+    let mut voice_decoder = SyntheticOpusDecoder;
+    let mut voice_playback = args.audio_playback()?;
+    let mut voice_stats = ClientMediaStats::default();
+    let mut voice_reassembled_frames = 0_u32;
+    let mut voice_decoded_frames = 0_u32;
+    let mut voice_received_packets = 0_u64;
+
+    while screen_reassembled_frames < target_frames || voice_reassembled_frames < target_frames {
+        let packet = match recv_media_packet_with_keepalive(
+            control,
+            Duration::from_millis(args.media_idle_timeout_ms),
+        )
+        .await?
+        {
+            Some(packet) => packet,
+            None => {
+                if args.media_frames == 0
+                    && (screen_received_packets > 0 || voice_received_packets > 0)
+                {
+                    break;
+                }
+                bail!("timed out waiting for dual-stream media packet");
+            }
+        };
+        let packet_receive_time_micros = unix_time_micros();
+        let packet_stream_id = packet.header.room_stream_id;
+
+        if packet_stream_id == screen_stream_id && screen_reassembled_frames < target_frames {
+            let lost_packets_before = screen_stats.lost_packets;
+            screen_stats.record_packet(&packet);
+            screen_received_packets += 1;
+            let outcome = screen_buffer.push_with_stats_at(packet, packet_receive_time_micros)?;
+            let packet_loss_detected = screen_stats.lost_packets > lost_packets_before;
+            if outcome.dropped_frames > 0 {
+                screen_stats.record_dropped_frames(outcome.dropped_frames);
+            }
+            if (packet_loss_detected || outcome.dropped_frames > 0) && !awaiting_recovery_keyframe {
+                request_keyframe(
+                    control,
+                    room_id,
+                    screen_stream_id,
+                    KeyframeReason::PacketLoss,
+                )
+                .await?;
+                awaiting_recovery_keyframe = true;
+            }
+            screen_stats.jitter_buffer_ms =
+                screen_buffer.estimated_jitter_ms(frame_interval_ms.max(1));
+            if let Some(frame) = outcome.frame {
+                screen_stats.record_reassembly_millis(outcome.reassembly_ms);
+                screen_stats.record_estimated_latency(
+                    frame.sender_capture_time_micros,
+                    packet_receive_time_micros,
+                );
+                screen_stats.record_calibrated_latency(
+                    frame.sender_capture_time_micros,
+                    frame.sender_clock_offset_micros,
+                    packet_receive_time_micros,
+                    clock_sync.clock_offset_micros,
+                );
+                screen_stats.record_sender_timestamps(
+                    frame.sender_capture_time_micros,
+                    frame.sender_encode_done_time_micros,
+                    frame.sender_send_time_micros,
+                );
+                screen_stats.record_server_queue_latency(
+                    frame.server_receive_time_micros,
+                    frame.server_send_time_micros,
+                );
+                println!(
+                    "media-recv frame_id={} stream_id={} bytes={} keyframe={} latency_ms={} calibrated_latency_ms={} sender_encode_ms={} sender_send_ms={} server_queue_ms={} reassembly_ms={}",
+                    frame.frame_id,
+                    screen_stream_id,
+                    frame.bytes.len(),
+                    frame.is_keyframe,
+                    screen_stats.estimated_latency_ms,
+                    screen_stats.calibrated_latency_ms,
+                    screen_stats.sender_encode_ms,
+                    screen_stats.sender_send_ms,
+                    screen_stats.server_queue_ms,
+                    outcome.reassembly_ms
+                );
+                let decode_start = Instant::now();
+                if let Some(decoded) = screen_decoder.decode(&frame.bytes)? {
+                    let decode_duration = decode_start.elapsed();
+                    screen_stats.record_decode_duration(decode_duration);
+                    let render_start = Instant::now();
+                    screen_playback.render(decoded)?;
+                    let render_duration = render_start.elapsed();
+                    if let Some(rendered) = screen_playback.latest_frame() {
+                        screen_stats
+                            .record_render_duration(render_duration, rendered.render_time_micros);
+                        println!(
+                            "media-render frame_id={} stream_id={} width={} height={} pixel_bytes={} render_time_micros={} decode_ms={} render_ms={} render_fps={}",
+                            rendered.frame_id,
+                            screen_stream_id,
+                            rendered.width,
+                            rendered.height,
+                            rendered.pixel_bytes,
+                            rendered.render_time_micros,
+                            millis_for_log(decode_duration),
+                            millis_for_log(render_duration),
+                            screen_stats.render_fps()
+                        );
+                    }
+                    screen_stats.record_decoded_frame();
+                    screen_decoded_frames += 1;
+                    if frame.is_keyframe {
+                        awaiting_recovery_keyframe = false;
+                    }
+                } else {
+                    screen_stats.record_dropped_frame();
+                    if !awaiting_recovery_keyframe {
+                        request_keyframe(
+                            control,
+                            room_id,
+                            screen_stream_id,
+                            KeyframeReason::DecoderRecovery,
+                        )
+                        .await?;
+                        awaiting_recovery_keyframe = true;
+                    }
+                }
+                screen_reassembled_frames += 1;
+                if args.stats_interval_frames > 0
+                    && screen_reassembled_frames.is_multiple_of(args.stats_interval_frames)
+                {
+                    send_viewer_stats(control, room_id, screen_stream_id, screen_stats).await?;
+                }
+            }
+        } else if packet_stream_id == voice_stream_id && voice_reassembled_frames < target_frames {
+            voice_stats.record_packet(&packet);
+            voice_received_packets += 1;
+            let outcome = voice_buffer.push_with_stats_at(packet, packet_receive_time_micros)?;
+            if outcome.dropped_frames > 0 {
+                voice_stats.record_dropped_frames(outcome.dropped_frames);
+            }
+            voice_stats.jitter_buffer_ms =
+                voice_buffer.estimated_jitter_ms(frame_interval_ms.max(1));
+            if let Some(frame) = outcome.frame {
+                voice_stats.record_reassembly_millis(outcome.reassembly_ms);
+                voice_stats.record_estimated_latency(
+                    frame.sender_capture_time_micros,
+                    packet_receive_time_micros,
+                );
+                voice_stats.record_calibrated_latency(
+                    frame.sender_capture_time_micros,
+                    frame.sender_clock_offset_micros,
+                    packet_receive_time_micros,
+                    clock_sync.clock_offset_micros,
+                );
+                voice_stats.record_sender_timestamps(
+                    frame.sender_capture_time_micros,
+                    frame.sender_encode_done_time_micros,
+                    frame.sender_send_time_micros,
+                );
+                voice_stats.record_server_queue_latency(
+                    frame.server_receive_time_micros,
+                    frame.server_send_time_micros,
+                );
+                println!(
+                    "audio-recv frame_id={} stream_id={} bytes={} latency_ms={} calibrated_latency_ms={} sender_encode_ms={} sender_send_ms={} server_queue_ms={} reassembly_ms={}",
+                    frame.frame_id,
+                    voice_stream_id,
+                    frame.bytes.len(),
+                    voice_stats.estimated_latency_ms,
+                    voice_stats.calibrated_latency_ms,
+                    voice_stats.sender_encode_ms,
+                    voice_stats.sender_send_ms,
+                    voice_stats.server_queue_ms,
+                    outcome.reassembly_ms
+                );
+                let decode_start = Instant::now();
+                if let Some(decoded) = voice_decoder.decode(&frame.bytes)? {
+                    let decode_duration = decode_start.elapsed();
+                    voice_stats.record_decode_duration(decode_duration);
+                    let play_start = Instant::now();
+                    voice_playback.play(decoded)?;
+                    let play_duration = play_start.elapsed();
+                    voice_stats.record_render_duration(play_duration, unix_time_micros());
+                    if let Some(played) = voice_playback.latest() {
+                        println!(
+                            "audio-play frame_id={} stream_id={} sample_rate_hz={} channels={} samples={} decode_ms={} play_ms={} play_fps={}",
+                            played.frame_id,
+                            voice_stream_id,
+                            played.sample_rate_hz,
+                            played.channel_count,
+                            played.sample_count,
+                            millis_for_log(decode_duration),
+                            millis_for_log(play_duration),
+                            voice_stats.render_fps()
+                        );
+                    }
+                    voice_stats.record_decoded_frame();
+                    voice_decoded_frames += 1;
+                } else {
+                    voice_stats.record_dropped_frame();
+                }
+                voice_reassembled_frames += 1;
+                if args.stats_interval_frames > 0
+                    && voice_reassembled_frames.is_multiple_of(args.stats_interval_frames)
+                {
+                    send_viewer_stats(control, room_id, voice_stream_id, voice_stats).await?;
+                }
+            }
+        }
+    }
+
+    if screen_received_packets > 0 {
+        send_viewer_stats(control, room_id, screen_stream_id, screen_stats).await?;
+    }
+    if voice_received_packets > 0 {
+        send_viewer_stats(control, room_id, voice_stream_id, voice_stats).await?;
+    }
+
+    println!(
+        "media-summary role=viewer kind=screen stream_id={} frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={} calibrated_latency_ms={} sender_encode_ms_p50={} sender_encode_ms_p95={} sender_send_ms_p50={} sender_send_ms_p95={} server_queue_ms_p50={} server_queue_ms_p95={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} render_ms_p50={} render_ms_p95={} render_fps={}",
+        screen_stream_id,
+        screen_reassembled_frames,
+        screen_decoded_frames,
+        screen_playback.rendered_frames(),
+        screen_received_packets,
+        screen_stats.lost_packets,
+        screen_stats.dropped_frames,
+        screen_stats.estimated_latency_ms,
+        screen_stats.calibrated_latency_ms,
+        screen_stats.sender_encode_ms_p50(),
+        screen_stats.sender_encode_ms_p95(),
+        screen_stats.sender_send_ms_p50(),
+        screen_stats.sender_send_ms_p95(),
+        screen_stats.server_queue_ms_p50(),
+        screen_stats.server_queue_ms_p95(),
+        screen_stats
+            .to_viewer_report(room_id, screen_stream_id)
+            .reassembly_ms_p50,
+        screen_stats
+            .to_viewer_report(room_id, screen_stream_id)
+            .reassembly_ms_p95,
+        screen_stats
+            .to_viewer_report(room_id, screen_stream_id)
+            .decode_ms_p50,
+        screen_stats
+            .to_viewer_report(room_id, screen_stream_id)
+            .decode_ms_p95,
+        screen_stats
+            .to_viewer_report(room_id, screen_stream_id)
+            .render_ms_p50,
+        screen_stats
+            .to_viewer_report(room_id, screen_stream_id)
+            .render_ms_p95,
+        screen_stats.render_fps()
+    );
+    println!(
+        "media-summary role=viewer kind=voice stream_id={} frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={} calibrated_latency_ms={} sender_encode_ms_p50={} sender_encode_ms_p95={} sender_send_ms_p50={} sender_send_ms_p95={} server_queue_ms_p50={} server_queue_ms_p95={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} play_ms_p50={} play_ms_p95={} play_fps={}",
+        voice_stream_id,
+        voice_reassembled_frames,
+        voice_decoded_frames,
+        voice_playback.played_frames(),
+        voice_received_packets,
+        voice_stats.lost_packets,
+        voice_stats.dropped_frames,
+        voice_stats.estimated_latency_ms,
+        voice_stats.calibrated_latency_ms,
+        voice_stats.sender_encode_ms_p50(),
+        voice_stats.sender_encode_ms_p95(),
+        voice_stats.sender_send_ms_p50(),
+        voice_stats.sender_send_ms_p95(),
+        voice_stats.server_queue_ms_p50(),
+        voice_stats.server_queue_ms_p95(),
+        voice_stats
+            .to_viewer_report(room_id, voice_stream_id)
+            .reassembly_ms_p50,
+        voice_stats
+            .to_viewer_report(room_id, voice_stream_id)
+            .reassembly_ms_p95,
+        voice_stats
+            .to_viewer_report(room_id, voice_stream_id)
+            .decode_ms_p50,
+        voice_stats
+            .to_viewer_report(room_id, voice_stream_id)
+            .decode_ms_p95,
+        voice_stats
+            .to_viewer_report(room_id, voice_stream_id)
+            .render_ms_p50,
+        voice_stats
+            .to_viewer_report(room_id, voice_stream_id)
+            .render_ms_p95,
+        voice_stats.render_fps()
+    );
+    Ok(())
+}
+
 async fn run_synthetic_screen_viewer_media(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
@@ -1988,6 +2421,24 @@ impl Args {
 mod tests {
     use super::*;
 
+    fn stream_summary(stream_id: StreamId, media_kind: MediaKind) -> StreamSummary {
+        StreamSummary {
+            room_id: 1,
+            stream_id,
+            publisher_id: 10,
+            codec: match media_kind {
+                MediaKind::Screen => CodecId::H264,
+                MediaKind::Voice => CodecId::Opus,
+                MediaKind::Probe => CodecId::H264,
+            },
+            media_kind,
+            subscriber_count: 0,
+            has_config: true,
+            target_bitrate_bps: 800_000,
+            target_frames_per_second: 30,
+        }
+    }
+
     #[test]
     fn list_capture_sources_flag_parses_without_relay_options() {
         let args = Args::try_parse_from(["desktop-client", "--list-capture-sources"]).unwrap();
@@ -2099,6 +2550,58 @@ mod tests {
 
         assert!(args.stream_config(1).is_err());
         assert!(args.protocol_media_kind().is_err());
+    }
+
+    #[test]
+    fn dual_viewer_resolves_screen_and_voice_streams() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--mode",
+            "viewer",
+            "--media-kind",
+            "both",
+            "--stream-id",
+            "1",
+            "--voice-stream-id",
+            "2",
+        ])
+        .unwrap();
+        let streams = [
+            stream_summary(1, MediaKind::Screen),
+            stream_summary(2, MediaKind::Voice),
+        ];
+
+        let resolved = resolve_dual_viewer_stream_ids(&args, &streams).unwrap();
+
+        assert_eq!(resolved, (1, 2));
+    }
+
+    #[test]
+    fn dual_viewer_rejects_wrong_voice_stream_kind() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--mode",
+            "viewer",
+            "--media-kind",
+            "both",
+            "--stream-id",
+            "1",
+            "--voice-stream-id",
+            "2",
+        ])
+        .unwrap();
+        let streams = [
+            stream_summary(1, MediaKind::Screen),
+            stream_summary(2, MediaKind::Screen),
+        ];
+
+        let error = resolve_dual_viewer_stream_ids(&args, &streams).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("stream 2 is Screen, but viewer requested Voice")
+        );
     }
 
     #[test]
