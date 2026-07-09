@@ -58,6 +58,8 @@ impl SyntheticOpusEncoder {
             frame_id,
             media_timestamp: frame_id.saturating_mul(sample_count as u32) as u64,
             sender_capture_time_micros: capture_time_micros,
+            server_receive_time_micros: 0,
+            server_send_time_micros: 0,
             codec: CodecId::Opus,
             is_keyframe: false,
             bytes: Bytes::from(bytes),

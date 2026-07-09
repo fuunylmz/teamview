@@ -84,6 +84,8 @@ The packet header is defined in `crates/protocol/src/packet.rs` and includes:
 - fragment index/count
 - media timestamp
 - sender capture timestamp
+- relay receive timestamp
+- relay send timestamp
 - codec id
 - future layer id
 - payload length
@@ -100,11 +102,13 @@ Stage 3 adds reusable encoded-frame helpers in `crates/protocol/src/frame.rs`.
 - `frame_id`
 - `media_timestamp`
 - `sender_capture_time_micros`
+- `server_receive_time_micros`
+- `server_send_time_micros`
 - `codec`
 - `is_keyframe`
 - opaque encoded bytes
 
-The desktop synthetic broadcaster writes `sender_capture_time_micros` as Unix epoch microseconds. Viewers compare it with their local receive time to populate `ViewerStats.estimated_latency_ms`; production cross-machine latency will need clock offset estimation before this value can be treated as calibrated glass-to-glass latency.
+The desktop synthetic broadcaster writes `sender_capture_time_micros` as Unix epoch microseconds. The relay stamps forwarded datagrams with `server_receive_time_micros` when it accepts an ingress datagram and `server_send_time_micros` immediately before it calls QUIC `send_datagram` for a viewer. Viewers compare sender capture time with local receive time to populate `ViewerStats.estimated_latency_ms` and compare relay receive/send timestamps to log server queue delay; production cross-machine latency will need clock offset estimation before capture-to-viewer values can be treated as calibrated glass-to-glass latency.
 
 `packetize_frame` splits a video frame into `MediaPacket` fragments. `packetize_frame_with_type` uses the same fragmentation rules for other media packet types such as audio:
 
@@ -114,4 +118,4 @@ The desktop synthetic broadcaster writes `sender_capture_time_micros` as Unix ep
 - `KEYFRAME` is set on fragments belonging to a keyframe.
 - `END_OF_FRAME` is set only on the last fragment.
 
-`reassemble_frame` sorts fragments by index, verifies frame metadata consistency, and reconstructs the original encoded bytes. Incomplete frames are rejected instead of being passed to a decoder.
+`reassemble_frame` sorts fragments by index, verifies frame metadata consistency, reconstructs the original encoded bytes, and carries the relay timestamp span from the earliest receive timestamp to the latest send timestamp across fragments. Incomplete frames are rejected instead of being passed to a decoder.

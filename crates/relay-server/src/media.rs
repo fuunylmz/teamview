@@ -7,7 +7,6 @@ use std::{
 };
 
 use anyhow::Context;
-use bytes::Bytes;
 use quinn::Connection;
 use teamview_protocol::{
     control::{MediaKind, UserId},
@@ -94,6 +93,7 @@ impl MediaRelay {
         state: &ControlState,
         publisher_id: UserId,
         packet: &MediaPacket,
+        server_receive_time_micros: u64,
     ) -> MediaForwardSummary {
         let stream_id = packet.header.room_stream_id;
         let Some(published) = state.published_stream(stream_id) else {
@@ -114,7 +114,7 @@ impl MediaRelay {
             };
         }
 
-        let Ok(encoded) = packet.encode() else {
+        let Ok(_) = packet.encode() else {
             return MediaForwardSummary {
                 stream_id,
                 queued: 0,
@@ -150,7 +150,7 @@ impl MediaRelay {
             }
             let datagram = EgressDatagram {
                 stream_id,
-                bytes: encoded.clone(),
+                packet: packet_for_egress(packet, server_receive_time_micros),
                 media_duration_ms,
             };
             match egress.sender.try_send(datagram) {
@@ -283,8 +283,17 @@ async fn send_viewer_egress(
     while let Some(datagram) = receiver.recv().await {
         let stream_id = datagram.stream_id;
         let media_duration_ms = datagram.media_duration_ms;
-        if let Err(error) = connection.send_datagram(datagram.bytes) {
-            warn!(user_id, %error, "failed to send queued media datagram");
+        let mut packet = datagram.packet;
+        packet.header.server_send_time_micros = unix_time_micros();
+        match packet.encode() {
+            Ok(bytes) => {
+                if let Err(error) = connection.send_datagram(bytes) {
+                    warn!(user_id, %error, "failed to send queued media datagram");
+                }
+            }
+            Err(error) => {
+                warn!(user_id, %error, "failed to encode queued media datagram");
+            }
         }
         release_queued_media(&queued_media_ms, media_duration_ms);
         release_stream_depth(&stream_depths, stream_id, media_duration_ms);
@@ -294,7 +303,7 @@ async fn send_viewer_egress(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EgressDatagram {
     stream_id: u32,
-    bytes: Bytes,
+    packet: MediaPacket,
     media_duration_ms: u16,
 }
 
@@ -312,6 +321,13 @@ fn release_queued_media(queued_media_ms: &AtomicU32, media_duration_ms: u16) {
     let _ = queued_media_ms.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(media_duration_ms))
     });
+}
+
+fn packet_for_egress(packet: &MediaPacket, server_receive_time_micros: u64) -> MediaPacket {
+    let mut packet = packet.clone();
+    packet.header.server_receive_time_micros = server_receive_time_micros;
+    packet.header.server_send_time_micros = 0;
+    packet
 }
 
 fn reserve_stream_depth(
@@ -405,7 +421,7 @@ pub async fn serve_media_datagrams(
         };
         let mut state = state.lock().await;
         let media = media.lock().await;
-        let summary = media.forward_media_packet(&state, user_id, &packet);
+        let summary = media.forward_media_packet(&state, user_id, &packet, received_at_micros);
         let server_route_ms = micros_delta_to_millis(received_at_micros, unix_time_micros());
         state.record_media_forward_summary(
             &packet,
@@ -452,7 +468,7 @@ mod tests {
         assert_eq!(room_id, 1);
 
         let relay = MediaRelay::new();
-        let summary = relay.forward_media_packet(&state, viewer.user_id.unwrap(), &packet);
+        let summary = relay.forward_media_packet(&state, viewer.user_id.unwrap(), &packet, 0);
 
         assert_eq!(summary.queued, 0);
         assert_eq!(summary.dropped, 1);
@@ -468,7 +484,7 @@ mod tests {
         packet.header.packet_type = PacketType::Audio;
 
         let relay = MediaRelay::new();
-        let summary = relay.forward_media_packet(&state, publisher.user_id.unwrap(), &packet);
+        let summary = relay.forward_media_packet(&state, publisher.user_id.unwrap(), &packet, 0);
 
         assert_eq!(summary.queued, 0);
         assert_eq!(summary.dropped, 1);
@@ -488,23 +504,24 @@ mod tests {
         let mut slow_rx = relay.register_paused_for_test(slow_viewer.user_id.unwrap());
 
         let first = synthetic_packet_with_sequence(9, 1);
-        let first_summary = relay.forward_media_packet(&state, publisher.user_id.unwrap(), &first);
+        let first_summary =
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &first, 123_000);
         assert_eq!(first_summary.queued, 2);
         assert_eq!(first_summary.dropped, 0);
 
         let fast_first = fast_rx.try_recv().unwrap();
-        assert_eq!(MediaPacket::decode(&fast_first.bytes).unwrap(), first);
+        assert_eq!(fast_first.packet, packet_for_egress(&first, 123_000));
 
         let second = synthetic_packet_with_sequence(9, 2);
         let second_summary =
-            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &second);
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &second, 124_000);
         assert_eq!(second_summary.queued, 1);
         assert_eq!(second_summary.dropped, 1);
 
         let fast_second = fast_rx.try_recv().unwrap();
-        assert_eq!(MediaPacket::decode(&fast_second.bytes).unwrap(), second);
+        assert_eq!(fast_second.packet, packet_for_egress(&second, 124_000));
         let slow_first = slow_rx.try_recv().unwrap();
-        assert_eq!(MediaPacket::decode(&slow_first.bytes).unwrap(), first);
+        assert_eq!(slow_first.packet, packet_for_egress(&first, 123_000));
         assert!(slow_rx.try_recv().is_err());
     }
 
@@ -519,7 +536,8 @@ mod tests {
         let mut viewer_rx = relay.register_paused_for_test(viewer.user_id.unwrap());
 
         let first = synthetic_packet_with_sequence(9, 1);
-        let first_summary = relay.forward_media_packet(&state, publisher.user_id.unwrap(), &first);
+        let first_summary =
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &first, 123_000);
         assert_eq!(first_summary.queued, 1);
         assert_eq!(first_summary.dropped, 0);
         assert_eq!(
@@ -532,7 +550,7 @@ mod tests {
 
         let second = synthetic_packet_with_sequence(9, 2);
         let second_summary =
-            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &second);
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &second, 124_000);
         assert_eq!(second_summary.queued, 0);
         assert_eq!(second_summary.dropped, 1);
         assert_eq!(
@@ -544,7 +562,7 @@ mod tests {
         );
 
         let queued_first = viewer_rx.try_recv().unwrap();
-        assert_eq!(MediaPacket::decode(&queued_first.bytes).unwrap(), first);
+        assert_eq!(queued_first.packet, packet_for_egress(&first, 123_000));
         assert!(viewer_rx.try_recv().is_err());
     }
 

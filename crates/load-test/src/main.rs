@@ -354,6 +354,8 @@ fn sample_h264_frame(frame_id: u32) -> EncodedFrame {
         frame_id,
         media_timestamp: frame_id as u64 * 3_000,
         sender_capture_time_micros: frame_id as u64 * 33_333,
+        server_receive_time_micros: 0,
+        server_send_time_micros: 0,
         codec: CodecId::H264,
         is_keyframe: frame_id == 1,
         bytes: Bytes::from(bytes),

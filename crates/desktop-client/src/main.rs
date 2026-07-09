@@ -1033,12 +1033,17 @@ async fn run_synthetic_screen_viewer_media(
                 frame.sender_capture_time_micros,
                 packet_receive_time_micros,
             );
+            stats.record_server_queue_latency(
+                frame.server_receive_time_micros,
+                frame.server_send_time_micros,
+            );
             println!(
-                "media-recv frame_id={} bytes={} keyframe={} latency_ms={} reassembly_ms={}",
+                "media-recv frame_id={} bytes={} keyframe={} latency_ms={} server_queue_ms={} reassembly_ms={}",
                 frame.frame_id,
                 frame.bytes.len(),
                 frame.is_keyframe,
                 stats.estimated_latency_ms,
+                stats.server_queue_ms,
                 outcome.reassembly_ms
             );
             let decode_start = Instant::now();
@@ -1088,7 +1093,7 @@ async fn run_synthetic_screen_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} render_ms_p50={} render_ms_p95={} render_fps={}",
+        "media-summary role=viewer frames={} decoded={} rendered={} packets={} lost={} dropped={} latency_ms={} server_queue_ms_p50={} server_queue_ms_p95={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} render_ms_p50={} render_ms_p95={} render_fps={}",
         reassembled_frames,
         decoded_frames,
         playback.rendered_frames(),
@@ -1096,6 +1101,8 @@ async fn run_synthetic_screen_viewer_media(
         stats.lost_packets,
         stats.dropped_frames,
         stats.estimated_latency_ms,
+        stats.server_queue_ms_p50(),
+        stats.server_queue_ms_p95(),
         stats.to_viewer_report(room_id, stream_id).reassembly_ms_p50,
         stats.to_viewer_report(room_id, stream_id).reassembly_ms_p95,
         stats.to_viewer_report(room_id, stream_id).decode_ms_p50,
@@ -1153,11 +1160,16 @@ async fn run_synthetic_voice_viewer_media(
                 frame.sender_capture_time_micros,
                 packet_receive_time_micros,
             );
+            stats.record_server_queue_latency(
+                frame.server_receive_time_micros,
+                frame.server_send_time_micros,
+            );
             println!(
-                "audio-recv frame_id={} bytes={} latency_ms={} reassembly_ms={}",
+                "audio-recv frame_id={} bytes={} latency_ms={} server_queue_ms={} reassembly_ms={}",
                 frame.frame_id,
                 frame.bytes.len(),
                 stats.estimated_latency_ms,
+                stats.server_queue_ms,
                 outcome.reassembly_ms
             );
             let decode_start = Instant::now();
@@ -1198,7 +1210,7 @@ async fn run_synthetic_voice_viewer_media(
     }
 
     println!(
-        "media-summary role=viewer kind=voice frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} play_ms_p50={} play_ms_p95={} play_fps={}",
+        "media-summary role=viewer kind=voice frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={} server_queue_ms_p50={} server_queue_ms_p95={} reassembly_ms_p50={} reassembly_ms_p95={} decode_ms_p50={} decode_ms_p95={} play_ms_p50={} play_ms_p95={} play_fps={}",
         reassembled_frames,
         decoded_frames,
         playback.played_frames(),
@@ -1206,6 +1218,8 @@ async fn run_synthetic_voice_viewer_media(
         stats.lost_packets,
         stats.dropped_frames,
         stats.estimated_latency_ms,
+        stats.server_queue_ms_p50(),
+        stats.server_queue_ms_p95(),
         stats.to_viewer_report(room_id, stream_id).reassembly_ms_p50,
         stats.to_viewer_report(room_id, stream_id).reassembly_ms_p95,
         stats.to_viewer_report(room_id, stream_id).decode_ms_p50,

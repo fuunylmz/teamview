@@ -196,7 +196,7 @@ impl ControlRuntime {
         };
         let mut state = self.state.lock().await;
         let media = self.media.lock().await;
-        let summary = media.forward_media_packet(&state, user_id, &packet);
+        let summary = media.forward_media_packet(&state, user_id, &packet, received_at_micros);
         let server_route_ms = micros_delta_to_millis(received_at_micros, unix_time_micros());
         state.record_media_forward_summary(
             &packet,
@@ -645,7 +645,21 @@ mod tests {
             .expect("viewer receives forwarded datagram")
             .expect("datagram read succeeds");
 
-        assert_eq!(MediaPacket::decode(&forwarded).unwrap(), packet);
+        let forwarded = MediaPacket::decode(&forwarded).unwrap();
+        assert_eq!(forwarded.payload, packet.payload);
+        assert_eq!(
+            forwarded.header.room_stream_id,
+            packet.header.room_stream_id
+        );
+        assert_eq!(
+            forwarded.header.sequence_number,
+            packet.header.sequence_number
+        );
+        assert_eq!(forwarded.header.frame_id, packet.header.frame_id);
+        assert!(forwarded.header.server_receive_time_micros > 0);
+        assert!(
+            forwarded.header.server_send_time_micros >= forwarded.header.server_receive_time_micros
+        );
 
         let metrics = send_control_request(
             &publisher,

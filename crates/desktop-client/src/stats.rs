@@ -80,8 +80,10 @@ pub struct ClientMediaStats {
     pub dropped_frames: u64,
     pub jitter_buffer_ms: u16,
     pub estimated_latency_ms: u16,
+    pub server_queue_ms: u16,
     last_sequence_number: Option<u32>,
     reassembly_samples_ms: LatencySamples,
+    server_queue_samples_ms: LatencySamples,
     decode_samples_ms: LatencySamples,
     render_samples_ms: LatencySamples,
     first_render_time_micros: u64,
@@ -145,6 +147,30 @@ impl ClientMediaStats {
             .saturating_div(1_000)
             .min(u16::MAX as u64) as u16;
         self.estimated_latency_ms = latency_ms;
+    }
+
+    pub fn record_server_queue_latency(
+        &mut self,
+        server_receive_time_micros: u64,
+        server_send_time_micros: u64,
+    ) {
+        if server_receive_time_micros == 0 || server_send_time_micros < server_receive_time_micros {
+            return;
+        }
+        let latency_ms = server_send_time_micros
+            .saturating_sub(server_receive_time_micros)
+            .saturating_div(1_000)
+            .min(u16::MAX as u64) as u16;
+        self.server_queue_ms = latency_ms;
+        self.server_queue_samples_ms.push(latency_ms);
+    }
+
+    pub fn server_queue_ms_p50(self) -> u16 {
+        self.server_queue_samples_ms.percentile(50)
+    }
+
+    pub fn server_queue_ms_p95(self) -> u16 {
+        self.server_queue_samples_ms.percentile(95)
     }
 
     pub fn to_viewer_report(self, room_id: RoomId, stream_id: StreamId) -> ViewerStatsReport {
@@ -261,6 +287,7 @@ mod tests {
         stats.record_dropped_frame();
         stats.jitter_buffer_ms = 42;
         stats.estimated_latency_ms = 88;
+        stats.record_server_queue_latency(1_000_000, 1_005_000);
 
         let report = stats.to_viewer_report(7, 9);
 
@@ -278,6 +305,9 @@ mod tests {
         assert_eq!(report.dropped_frames, 1);
         assert_eq!(report.jitter_buffer_ms, 42);
         assert_eq!(report.estimated_latency_ms, 88);
+        assert_eq!(stats.server_queue_ms, 5);
+        assert_eq!(stats.server_queue_ms_p50(), 5);
+        assert_eq!(stats.server_queue_ms_p95(), 5);
     }
 
     #[test]
@@ -300,6 +330,21 @@ mod tests {
         stats.record_estimated_latency(2_000_000, 1_123_456);
 
         assert_eq!(stats.estimated_latency_ms, 42);
+    }
+
+    #[test]
+    fn media_stats_ignores_missing_or_reversed_server_queue_timestamps() {
+        let mut stats = ClientMediaStats {
+            server_queue_ms: 9,
+            ..Default::default()
+        };
+
+        stats.record_server_queue_latency(0, 1_123_456);
+        stats.record_server_queue_latency(2_000_000, 1_123_456);
+
+        assert_eq!(stats.server_queue_ms, 9);
+        assert_eq!(stats.server_queue_ms_p50(), 0);
+        assert_eq!(stats.server_queue_ms_p95(), 0);
     }
 
     #[test]
