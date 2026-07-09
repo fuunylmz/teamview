@@ -94,6 +94,7 @@ Expected behavior:
 
 - A publisher creates a room, publishes a screen stream, and sends fragmented synthetic frames as QUIC datagrams.
 - Each viewer joins, subscribes, receives every forwarded fragment, and reassembles each frame byte-for-byte.
+- The relay accepts publisher media into independent bounded viewer egress queues and drops only for viewers whose queue is full.
 - Relay forwarding rejects media from non-publishers and packet types/codecs that do not match the published stream.
 
 Example output:

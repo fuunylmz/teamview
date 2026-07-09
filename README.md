@@ -90,6 +90,6 @@ quic-sample-forward frames=2 fragments=14 reassembled=4 delivered=28 dropped=0
 
 ## Current stage
 
-Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers, and the client/load-test paths can packetize, send, receive, reassemble, and mock-decode synthetic H.264-like frames.
+Stage 4 plus synthetic QUIC media forwarding: the desktop client has a Windows capture foundation with support detection, capture source metadata, frame metadata, and a latest-frame queue that keeps only the newest frame to avoid latency buildup. The relay can also forward validated synthetic media datagrams from a publisher to subscribed viewers through independent bounded viewer egress queues, and the client/load-test paths can packetize, send, receive, reassemble, and mock-decode synthetic H.264-like frames.
 
-Actual Windows Graphics Capture frame acquisition, hardware encode, native decode, real rendering, and production egress queueing are later stages.
+Actual Windows Graphics Capture frame acquisition, hardware encode, native decode, real rendering, and adaptive media feedback are later stages.

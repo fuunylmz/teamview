@@ -166,7 +166,7 @@ impl ControlRuntime {
             session_id,
             user_id,
             stream_id = summary.stream_id,
-            delivered = summary.delivered,
+            queued = summary.queued,
             dropped = summary.dropped,
             "forwarded media datagram"
         );
