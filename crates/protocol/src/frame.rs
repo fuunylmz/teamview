@@ -35,6 +35,15 @@ pub fn packetize_frame(
     first_sequence_number: u32,
     max_payload: usize,
 ) -> Result<Vec<MediaPacket>, FramePacketizeError> {
+    packetize_frame_with_type(frame, PacketType::Video, first_sequence_number, max_payload)
+}
+
+pub fn packetize_frame_with_type(
+    frame: &EncodedFrame,
+    packet_type: PacketType,
+    first_sequence_number: u32,
+    max_payload: usize,
+) -> Result<Vec<MediaPacket>, FramePacketizeError> {
     if max_payload == 0 {
         return Err(FramePacketizeError::ZeroMaxPayload);
     }
@@ -65,7 +74,7 @@ pub fn packetize_frame(
         }
 
         let mut header = MediaPacketHeader::new(
-            PacketType::Video,
+            packet_type,
             frame.codec,
             frame.room_stream_id,
             first_sequence_number.wrapping_add(fragment_index as u32),
@@ -94,8 +103,26 @@ pub fn packetize_frame_for_datagram_target(
     if max_datagram_payload <= MEDIA_PACKET_HEADER_LEN {
         return Err(FramePacketizeError::DatagramTooSmall);
     }
-    packetize_frame(
+    packetize_frame_with_type_for_datagram_target(
         frame,
+        PacketType::Video,
+        first_sequence_number,
+        max_datagram_payload,
+    )
+}
+
+pub fn packetize_frame_with_type_for_datagram_target(
+    frame: &EncodedFrame,
+    packet_type: PacketType,
+    first_sequence_number: u32,
+    max_datagram_payload: usize,
+) -> Result<Vec<MediaPacket>, FramePacketizeError> {
+    if max_datagram_payload <= MEDIA_PACKET_HEADER_LEN {
+        return Err(FramePacketizeError::DatagramTooSmall);
+    }
+    packetize_frame_with_type(
+        frame,
+        packet_type,
         first_sequence_number,
         max_datagram_payload - MEDIA_PACKET_HEADER_LEN,
     )
@@ -132,7 +159,7 @@ pub fn reassemble_frame(
 
     packets.sort_by_key(|packet| packet.header.fragment_index);
     let first = packets[0].header.clone();
-    if first.packet_type != PacketType::Video {
+    if !matches!(first.packet_type, PacketType::Video | PacketType::Audio) {
         return Err(FrameReassemblyError::FragmentMetadataMismatch);
     }
     if packets.len() != first.fragment_count as usize {
@@ -214,6 +241,25 @@ mod tests {
         for packet in packets {
             assert!(packet.encode().unwrap().len() <= MEDIA_PACKET_HEADER_LEN + 10);
         }
+    }
+
+    #[test]
+    fn packetizes_audio_frame_with_audio_packet_type() {
+        let frame = EncodedFrame {
+            room_stream_id: 9,
+            frame_id: 7,
+            media_timestamp: 960,
+            sender_capture_time_micros: 1_234_567,
+            codec: CodecId::Opus,
+            is_keyframe: false,
+            bytes: Bytes::from_static(b"synthetic-opus"),
+        };
+
+        let packets = packetize_frame_with_type(&frame, PacketType::Audio, 1, 8).unwrap();
+
+        assert_eq!(packets[0].header.packet_type, PacketType::Audio);
+        let reassembled = reassemble_frame(packets).unwrap();
+        assert_eq!(reassembled, frame);
     }
 
     #[test]

@@ -131,8 +131,26 @@ Expected behavior:
 - When most viewers are degraded, relay feedback lowers the synthetic target bitrate, and the broadcaster shrinks subsequent synthetic frame payloads.
 - The final viewer summary reports zero loss and drops on a healthy local run.
 
+## Desktop synthetic voice checks
+
+The same desktop client path can publish a synthetic Opus-like voice stream with `--media-kind voice`. The relay validates it as `MediaKind::Voice`, forwards it as audio datagrams, and the viewer reassembles, decodes, and plays frames into a latest-audio playback sink.
+
+Run in separate terminals after starting the relay:
+
+```bash
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-kind voice --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 50 --media-frame-bytes 96 --feedback-interval-frames 10
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-id 1 --media-kind voice --media-run-ms 1000 --media-fps 50
+```
+
+Expected behavior:
+
+- The broadcaster publishes an Opus voice stream config and prints `audio-send` lines.
+- The viewer prints `audio-recv` and `audio-play` lines for each decoded frame.
+- The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams with zero drops.
+- The final viewer summary reports `kind=voice`, matching decoded and played frame counts, and zero loss on a healthy local run.
+
 ## Measurement plan
 
-Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, synthetic QUIC forwarding behavior, and synthetic capture-to-viewer latency. Later milestones add real capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
+Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, synthetic QUIC forwarding behavior, synthetic voice forwarding behavior, and synthetic capture-to-viewer latency. Later milestones add real capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
 
 High-speed camera validation should be used to calibrate in-app estimates once live rendering exists.

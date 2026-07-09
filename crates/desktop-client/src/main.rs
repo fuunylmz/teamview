@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod app;
+mod audio;
 mod capture;
 mod decode;
 mod encode;
@@ -22,13 +23,14 @@ use teamview_protocol::{
         SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId, StreamMetricsSnapshot,
         SubscribeStream, ViewerStatsReport,
     },
-    frame::packetize_frame_for_datagram_target,
-    packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket},
+    frame::{packetize_frame_for_datagram_target, packetize_frame_with_type_for_datagram_target},
+    packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, PacketType},
 };
 use tokio::time::MissedTickBehavior;
 use tracing::info;
 
 use crate::{
+    audio::{LatestAudioPlayback, SyntheticOpusDecoder, SyntheticOpusEncoder},
     capture::{CaptureConfig, CaptureSource, ScreenCapture, windows},
     decode::{FrameReassemblyBuffer, VideoDecoder, h264::H264Decoder},
     encode::{VideoEncoder, h264::H264Encoder},
@@ -49,6 +51,12 @@ enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CaptureSourceArg {
     PrimaryMonitor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MediaKindArg {
+    Screen,
+    Voice,
 }
 
 #[derive(Debug, Parser)]
@@ -74,6 +82,9 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     stream_id: StreamId,
+
+    #[arg(long, value_enum, default_value_t = MediaKindArg::Screen)]
+    media_kind: MediaKindArg,
 
     #[arg(long, default_value_t = 0)]
     media_frames: u32,
@@ -180,8 +191,8 @@ async fn run_broadcaster_control_flow(
         .send(ClientControl::PublishStream(PublishStream {
             room_id,
             stream_id: args.stream_id,
-            codec: CodecId::H264,
-            media_kind: MediaKind::Screen,
+            codec: args.codec(),
+            media_kind: args.protocol_media_kind(),
         }))
         .await?;
     print_control_response("publish-stream", &published);
@@ -277,6 +288,19 @@ async fn run_synthetic_broadcaster_media(
     args: &Args,
     room_id: RoomId,
 ) -> anyhow::Result<()> {
+    match args.media_kind {
+        MediaKindArg::Screen => {
+            run_synthetic_screen_broadcaster_media(control, args, room_id).await
+        }
+        MediaKindArg::Voice => run_synthetic_voice_broadcaster_media(control, args, room_id).await,
+    }
+}
+
+async fn run_synthetic_screen_broadcaster_media(
+    control: &mut crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+) -> anyhow::Result<()> {
     if args.media_start_delay_ms > 0 {
         sleep_with_keepalive(control, Duration::from_millis(args.media_start_delay_ms)).await?;
     }
@@ -366,6 +390,77 @@ async fn run_synthetic_broadcaster_media(
     Ok(())
 }
 
+async fn run_synthetic_voice_broadcaster_media(
+    control: &mut crate::transport::quic::ControlClient,
+    args: &Args,
+    room_id: RoomId,
+) -> anyhow::Result<()> {
+    if args.media_start_delay_ms > 0 {
+        sleep_with_keepalive(control, Duration::from_millis(args.media_start_delay_ms)).await?;
+    }
+    let media_frames = args.synthetic_media_frames()?;
+    let frame_interval = args.media_frame_interval()?;
+    let mut encoder = SyntheticOpusEncoder::default();
+    encoder.config.synthetic_payload_bytes = args.media_frame_bytes;
+    encoder.config.bitrate_bps = args.synthetic_bitrate_bps();
+    encoder.set_frames_per_second(args.media_fps.max(1));
+
+    let mut ticker = tokio::time::interval(frame_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut active_fps = args.media_fps;
+    let mut sent_packets = 0_u64;
+    let mut next_sequence_number = 1_u32;
+    for frame_id in 1..=media_frames {
+        ticker.tick().await;
+        let frame = encoder.encode(frame_id, unix_time_micros(), args.stream_id)?;
+        let packets = packetize_frame_with_type_for_datagram_target(
+            &frame,
+            PacketType::Audio,
+            next_sequence_number,
+            args.max_datagram_payload,
+        )?;
+        next_sequence_number = next_sequence_number.wrapping_add(packets.len() as u32);
+        for packet in &packets {
+            control.send_media_packet(packet)?;
+            sent_packets += 1;
+        }
+        println!(
+            "audio-send frame_id={} fragments={} bytes={} target_bytes={}",
+            frame.frame_id,
+            packets.len(),
+            frame.bytes.len(),
+            encoder.config.synthetic_payload_bytes
+        );
+        if args.feedback_interval_frames > 0
+            && frame_id.is_multiple_of(args.feedback_interval_frames)
+        {
+            let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
+            apply_audio_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
+        }
+    }
+    let feedback = poll_publisher_feedback(control, room_id, args.stream_id).await?;
+    apply_audio_publisher_feedback(&feedback, &mut encoder, &mut active_fps, &mut ticker);
+    let stream_metrics = poll_stream_metrics(control, room_id, args.stream_id).await?;
+    println!(
+        "stream-metrics stream_id={} ingress_packets={} ingress_bytes={} egress_queued={} egress_dropped={} subscribers={} last_ingress_time_micros={}",
+        stream_metrics.stream_id,
+        stream_metrics.ingress_packets,
+        stream_metrics.ingress_bytes,
+        stream_metrics.egress_queued_packets,
+        stream_metrics.egress_dropped_packets,
+        stream_metrics.subscriber_count,
+        stream_metrics.last_ingress_time_micros
+    );
+    println!(
+        "media-summary role=broadcaster kind=voice frames={} packets={} fps={} run_ms={}",
+        media_frames, sent_packets, args.media_fps, args.media_run_ms
+    );
+    if args.media_end_linger_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
+    }
+    Ok(())
+}
+
 async fn set_publisher_target_media(
     control: &mut crate::transport::quic::ControlClient,
     room_id: RoomId,
@@ -419,6 +514,36 @@ fn apply_publisher_feedback(
     if adapted {
         println!(
             "publisher-adapt stream_id={} bitrate_bps={} fps={} frame_bytes={}",
+            feedback.stream_id,
+            encoder.config.bitrate_bps,
+            *active_fps,
+            encoder.config.synthetic_payload_bytes
+        );
+    }
+}
+
+fn apply_audio_publisher_feedback(
+    feedback: &PublisherFeedback,
+    encoder: &mut SyntheticOpusEncoder,
+    active_fps: &mut u16,
+    ticker: &mut tokio::time::Interval,
+) {
+    let mut adapted = false;
+    let target_bitrate = feedback.aggregate_available_bitrate_bps;
+    if target_bitrate > 0 && target_bitrate != encoder.config.bitrate_bps {
+        encoder.update_bitrate(target_bitrate);
+        adapted = true;
+    }
+    if feedback.target_frames_per_second > 0 && feedback.target_frames_per_second != *active_fps {
+        *active_fps = feedback.target_frames_per_second;
+        encoder.set_frames_per_second(*active_fps);
+        *ticker = tokio::time::interval(Duration::from_micros(media_interval_micros(*active_fps)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        adapted = true;
+    }
+    if adapted {
+        println!(
+            "publisher-adapt stream_id={} bitrate_bps={} fps={} audio_bytes={}",
             feedback.stream_id,
             encoder.config.bitrate_bps,
             *active_fps,
@@ -483,6 +608,16 @@ async fn poll_stream_metrics(
 }
 
 async fn run_synthetic_viewer_media(
+    control: &mut crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<()> {
+    match args.media_kind {
+        MediaKindArg::Screen => run_synthetic_screen_viewer_media(control, args).await,
+        MediaKindArg::Voice => run_synthetic_voice_viewer_media(control, args).await,
+    }
+}
+
+async fn run_synthetic_screen_viewer_media(
     control: &mut crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<()> {
@@ -585,6 +720,95 @@ async fn run_synthetic_viewer_media(
         reassembled_frames,
         decoded_frames,
         playback.rendered_frames(),
+        received_packets,
+        stats.lost_packets,
+        stats.dropped_frames,
+        stats.estimated_latency_ms
+    );
+    Ok(())
+}
+
+async fn run_synthetic_voice_viewer_media(
+    control: &mut crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let room_id = args
+        .room_id
+        .context("viewer mode requires --room-id for media receive")?;
+    let target_frames = args.synthetic_media_frames()?;
+    let frame_interval = args.media_frame_interval()?;
+    let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
+    let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
+    let mut decoder = SyntheticOpusDecoder;
+    let mut playback = LatestAudioPlayback::default();
+    let mut stats = ClientMediaStats::default();
+    let mut reassembled_frames = 0_u32;
+    let mut decoded_frames = 0_u32;
+    let mut received_packets = 0_u64;
+
+    while reassembled_frames < target_frames {
+        let packet = match recv_media_packet_with_keepalive(
+            control,
+            Duration::from_millis(args.media_idle_timeout_ms),
+        )
+        .await?
+        {
+            Some(packet) => packet,
+            None => {
+                if args.media_frames == 0 && received_packets > 0 {
+                    break;
+                }
+                bail!("timed out waiting for audio packet");
+            }
+        };
+        stats.record_packet(&packet);
+        received_packets += 1;
+        let outcome = buffer.push_with_stats(packet)?;
+        if outcome.dropped_frames > 0 {
+            stats.record_dropped_frames(outcome.dropped_frames);
+        }
+        stats.jitter_buffer_ms = buffer.estimated_jitter_ms(frame_interval_ms.max(1));
+        if let Some(frame) = outcome.frame {
+            stats.record_estimated_latency(frame.sender_capture_time_micros, unix_time_micros());
+            println!(
+                "audio-recv frame_id={} bytes={} latency_ms={}",
+                frame.frame_id,
+                frame.bytes.len(),
+                stats.estimated_latency_ms
+            );
+            if let Some(decoded) = decoder.decode(&frame.bytes)? {
+                playback.play(decoded)?;
+                if let Some(played) = playback.latest() {
+                    println!(
+                        "audio-play frame_id={} sample_rate_hz={} channels={} samples={}",
+                        played.frame_id,
+                        played.sample_rate_hz,
+                        played.channel_count,
+                        played.sample_count
+                    );
+                }
+                stats.record_decoded_frame();
+                decoded_frames += 1;
+            } else {
+                stats.record_dropped_frame();
+            }
+            reassembled_frames += 1;
+            if args.stats_interval_frames > 0
+                && reassembled_frames.is_multiple_of(args.stats_interval_frames)
+            {
+                send_viewer_stats(control, room_id, args.stream_id, stats).await?;
+            }
+        }
+    }
+    if received_packets > 0 {
+        send_viewer_stats(control, room_id, args.stream_id, stats).await?;
+    }
+
+    println!(
+        "media-summary role=viewer kind=voice frames={} decoded={} played={} packets={} lost={} dropped={} latency_ms={}",
+        reassembled_frames,
+        decoded_frames,
+        playback.played_frames(),
         received_packets,
         stats.lost_packets,
         stats.dropped_frames,
@@ -720,15 +944,40 @@ impl Args {
         bitrate.min(u32::MAX as u128) as u32
     }
 
+    fn protocol_media_kind(&self) -> MediaKind {
+        match self.media_kind {
+            MediaKindArg::Screen => MediaKind::Screen,
+            MediaKindArg::Voice => MediaKind::Voice,
+        }
+    }
+
+    fn codec(&self) -> CodecId {
+        match self.media_kind {
+            MediaKindArg::Screen => CodecId::H264,
+            MediaKindArg::Voice => CodecId::Opus,
+        }
+    }
+
     fn synthetic_stream_config(&self, room_id: RoomId) -> StreamConfig {
-        StreamConfig {
-            room_id,
-            stream_id: self.stream_id,
-            codec: CodecId::H264,
-            width: H264Encoder::default().config.width,
-            height: H264Encoder::default().config.height,
-            frames_per_second: self.media_fps.max(1),
-            timebase_hz: 90_000,
+        match self.media_kind {
+            MediaKindArg::Screen => StreamConfig {
+                room_id,
+                stream_id: self.stream_id,
+                codec: CodecId::H264,
+                width: H264Encoder::default().config.width,
+                height: H264Encoder::default().config.height,
+                frames_per_second: self.media_fps.max(1),
+                timebase_hz: 90_000,
+            },
+            MediaKindArg::Voice => StreamConfig {
+                room_id,
+                stream_id: self.stream_id,
+                codec: CodecId::Opus,
+                width: 0,
+                height: 0,
+                frames_per_second: self.media_fps.max(1),
+                timebase_hz: 48_000,
+            },
         }
     }
 }

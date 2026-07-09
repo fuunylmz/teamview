@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use teamview_protocol::{
     PROTOCOL_VERSION,
     control::{
-        ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason, Pong,
-        RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, ServerControl, ServerEnvelope,
-        SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId, StreamPublished,
-        StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
+        ClientControl, ClientEnvelope, ControlError, HelloAccepted, KeyframeReason, MediaKind,
+        Pong, RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, ServerControl,
+        ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig, StreamId,
+        StreamPublished, StreamSubscribed, StreamUnsubscribed, UserId, ViewerStatsReport,
     },
     packet::MediaPacket,
 };
@@ -177,8 +177,12 @@ impl ControlState {
                                 .subscriptions
                                 .get(&subscribe.stream_id)
                                 .is_some_and(|subscribers| subscribers.contains(&user_id));
+                            let requests_keyframe_on_subscribe = room
+                                .published_streams
+                                .get(&subscribe.stream_id)
+                                .is_some_and(|stream| stream.media_kind == MediaKind::Screen);
                             if room.subscribe(subscribe.stream_id, user_id) {
-                                if !already_subscribed {
+                                if !already_subscribed && requests_keyframe_on_subscribe {
                                     self.register_keyframe_request(
                                         subscribe.stream_id,
                                         KeyframeReason::NewSubscriber,
@@ -1201,6 +1205,39 @@ mod tests {
     }
 
     #[test]
+    fn voice_subscriber_does_not_request_keyframe() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_voice_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        let response = state.handle_client_envelope(
+            &mut publisher,
+            ClientEnvelope::new(
+                6,
+                ClientControl::PollPublisherFeedback(PollPublisherFeedback {
+                    room_id,
+                    stream_id: 9,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::PublisherFeedback(feedback) => {
+                assert_eq!(feedback.total_viewer_count, 1);
+                assert!(!feedback.keyframe_requested);
+            }
+            other => panic!("unexpected voice feedback response: {other:?}"),
+        }
+    }
+
+    #[test]
     fn subscribed_viewer_can_request_decoder_recovery_keyframe() {
         let mut state = ControlState::new();
         let mut publisher = Session::anonymous(1);
@@ -1538,6 +1575,30 @@ mod tests {
                     stream_id,
                     codec: CodecId::H264,
                     media_kind: MediaKind::Screen,
+                }),
+            ),
+        );
+        assert!(matches!(
+            response.message,
+            ServerControl::StreamPublished(_)
+        ));
+    }
+
+    fn publish_voice_stream(
+        state: &mut ControlState,
+        session: &mut Session,
+        room_id: RoomId,
+        stream_id: StreamId,
+    ) {
+        let response = state.handle_client_envelope(
+            session,
+            ClientEnvelope::new(
+                4,
+                ClientControl::PublishStream(PublishStream {
+                    room_id,
+                    stream_id,
+                    codec: CodecId::Opus,
+                    media_kind: MediaKind::Voice,
                 }),
             ),
         );

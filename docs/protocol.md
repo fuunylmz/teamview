@@ -58,7 +58,7 @@ Room participants can poll `StreamMetrics` for a published stream. The relay rep
 
 Media packets travel over QUIC datagrams. Each datagram carries one packet with a versioned binary header and an opaque encoded payload.
 
-Encoded frames may be fragmented into multiple datagrams for MTU safety. Fragmentation is only a transport concern; the relay never decodes or transforms video content.
+Encoded frames may be fragmented into multiple datagrams for MTU safety. Fragmentation is only a transport concern; the relay never decodes or transforms media content.
 
 The packet header is defined in `crates/protocol/src/packet.rs` and includes:
 
@@ -94,7 +94,7 @@ Stage 3 adds reusable encoded-frame helpers in `crates/protocol/src/frame.rs`.
 
 The desktop synthetic broadcaster writes `sender_capture_time_micros` as Unix epoch microseconds. Viewers compare it with their local receive time to populate `ViewerStats.estimated_latency_ms`; production cross-machine latency will need clock offset estimation before this value can be treated as calibrated glass-to-glass latency.
 
-`packetize_frame` splits a frame into `MediaPacket` fragments:
+`packetize_frame` splits a video frame into `MediaPacket` fragments. `packetize_frame_with_type` uses the same fragmentation rules for other media packet types such as audio:
 
 - `sequence_number` increments for every fragment.
 - `frame_id` stays the same for all fragments in the frame.

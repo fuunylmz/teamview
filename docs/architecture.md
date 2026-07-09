@@ -33,4 +33,4 @@ The queue defaults to capacity 1. This is intentional: if capture outruns encode
 
 ## First milestones
 
-The first milestones use synthetic media datagrams and pre-encoded sample frames before real capture. This proves the server routing model, per-viewer isolation, packetization, decoder-to-playback handoff, and low-latency queue policy before hardware capture, hardware encoding, and native window rendering are added.
+The first milestones use synthetic media datagrams, pre-encoded sample frames, and synthetic Opus-like voice frames before real capture. This proves the server routing model, per-viewer isolation, packetization, decoder-to-playback handoff, audio playback handoff, and low-latency queue policy before hardware capture, microphone capture, hardware encoding, real Opus, and native window rendering are added.
