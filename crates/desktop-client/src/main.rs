@@ -68,6 +68,7 @@ const DEFAULT_TIME_SYNC_SPACING_MS: u64 = 20;
 const DEFAULT_CHANNEL_NAME: &str = "stage1";
 const DEFAULT_SCREEN_FPS: u16 = 30;
 const DEFAULT_VOICE_FPS: u16 = 50;
+const DEFAULT_VOICE_FRAME_BYTES: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -251,6 +252,9 @@ struct Args {
 
     #[arg(long, default_value_t = 512)]
     media_frame_bytes: usize,
+
+    #[arg(long, default_value_t = DEFAULT_VOICE_FRAME_BYTES)]
+    voice_frame_bytes: usize,
 
     #[arg(long, default_value_t = DEFAULT_DATAGRAM_PAYLOAD_TARGET)]
     max_datagram_payload: usize,
@@ -1544,7 +1548,7 @@ async fn run_synthetic_voice_broadcaster_media(
     let media_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
     let mut encoder = SyntheticOpusEncoder::default();
-    encoder.config.synthetic_payload_bytes = args.media_frame_bytes;
+    encoder.config.synthetic_payload_bytes = args.active_media_frame_bytes();
     encoder.config.bitrate_bps = args.synthetic_bitrate_bps();
     encoder.set_frames_per_second(args.active_media_fps().max(1));
     let mut microphone_capture = match args.voice_input {
@@ -2937,10 +2941,17 @@ impl Args {
     }
 
     fn synthetic_bitrate_bps(&self) -> u32 {
-        let bitrate = (self.media_frame_bytes as u128)
+        let bitrate = (self.active_media_frame_bytes() as u128)
             .saturating_mul(self.active_media_fps().max(1) as u128)
             .saturating_mul(8);
         bitrate.min(u32::MAX as u128) as u32
+    }
+
+    fn active_media_frame_bytes(&self) -> usize {
+        match self.media_kind {
+            MediaKindArg::Voice => self.voice_frame_bytes,
+            MediaKindArg::Screen | MediaKindArg::Both => self.media_frame_bytes,
+        }
     }
 
     fn video_encoder_backend(&self) -> H264VideoEncoderBackend {
@@ -3327,6 +3338,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.active_media_fps(), DEFAULT_SCREEN_FPS);
+        assert_eq!(args.active_media_frame_bytes(), 512);
         assert_eq!(args.synthetic_media_frames().unwrap(), 30);
         assert_eq!(
             args.media_frame_interval().unwrap(),
@@ -3350,6 +3362,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.active_media_fps(), DEFAULT_VOICE_FPS);
+        assert_eq!(args.active_media_frame_bytes(), DEFAULT_VOICE_FRAME_BYTES);
         assert_eq!(args.synthetic_media_frames().unwrap(), 50);
         assert_eq!(
             args.media_frame_interval().unwrap(),
@@ -3360,6 +3373,10 @@ mod tests {
             DEFAULT_VOICE_FPS
         );
         assert_eq!(args.audio_capture_config().frame_duration_ms, 20);
+        assert_eq!(
+            args.synthetic_bitrate_bps(),
+            (DEFAULT_VOICE_FRAME_BYTES * DEFAULT_VOICE_FPS as usize * 8) as u32
+        );
     }
 
     #[test]
@@ -3382,6 +3399,23 @@ mod tests {
             Duration::from_millis(25)
         );
         assert_eq!(args.audio_capture_config().frame_duration_ms, 25);
+    }
+
+    #[test]
+    fn voice_frame_bytes_override_audio_payload() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "voice",
+            "--voice-fps",
+            "40",
+            "--voice-frame-bytes",
+            "120",
+        ])
+        .unwrap();
+
+        assert_eq!(args.active_media_frame_bytes(), 120);
+        assert_eq!(args.synthetic_bitrate_bps(), 38_400);
     }
 
     #[test]
@@ -3487,9 +3521,39 @@ mod tests {
         assert_eq!(voice_args.codec().unwrap(), CodecId::Opus);
         assert_eq!(voice_args.active_media_fps(), DEFAULT_VOICE_FPS);
         assert_eq!(
+            voice_args.active_media_frame_bytes(),
+            DEFAULT_VOICE_FRAME_BYTES
+        );
+        assert_eq!(
             voice_args.stream_config(1).unwrap().frames_per_second,
             DEFAULT_VOICE_FPS
         );
+    }
+
+    #[test]
+    fn dual_stream_args_keep_screen_and_voice_payloads_independent() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "both",
+            "--media-frame-bytes",
+            "800",
+            "--voice-frame-bytes",
+            "96",
+            "--stream-id",
+            "1",
+            "--voice-stream-id",
+            "2",
+        ])
+        .unwrap();
+
+        let screen_args = args.for_media_kind(MediaKindArg::Screen, args.stream_id);
+        let voice_args = args.for_media_kind(MediaKindArg::Voice, args.voice_stream_id().unwrap());
+
+        assert_eq!(screen_args.active_media_frame_bytes(), 800);
+        assert_eq!(voice_args.active_media_frame_bytes(), 96);
+        assert_eq!(screen_args.synthetic_bitrate_bps(), 192_000);
+        assert_eq!(voice_args.synthetic_bitrate_bps(), 38_400);
     }
 
     #[test]
