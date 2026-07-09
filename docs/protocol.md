@@ -33,6 +33,7 @@ Current control messages cover:
 
 - hello / hello accepted
 - ping / pong keepalive
+- time sync for relay clock offset estimation
 - optional shared-token authentication
 - create room
 - list rooms
@@ -50,7 +51,9 @@ Current control messages cover:
 
 JSON-line framing is intentionally a Stage 1 choice. Later stages can replace it with a compact binary serializer or length-prefixed binary envelope without changing the room/control state machine.
 
-When the relay is started with an access token, clients must send `Authenticate` after `Hello` and before room, stream, stats, or media use. Invalid tokens return `invalid_token`; unauthenticated control actions return `not_authenticated`. Media datagrams from a connection that has not authenticated are dropped. Without an access token, `Hello` grants access for local development and tests.
+When the relay is started with an access token, clients must send `Authenticate` after `Hello` and before room, stream, stats, or media use. Invalid tokens return `invalid_token`; unauthenticated control actions return `not_authenticated`. `TimeSync` is allowed after `Hello` without stream or room state so clients can estimate clock offset before media starts. Media datagrams from a connection that has not authenticated are dropped. Without an access token, `Hello` grants access for local development and tests.
+
+`TimeSync` echoes the client's send timestamp and returns relay receive/send Unix microsecond timestamps. The desktop client uses the client send/receive midpoint and relay receive/send midpoint to log a one-shot RTT and `clock_offset_micros` estimate. Later stages should take multiple samples and use the lowest-RTT sample or a filtered estimator before treating capture-to-viewer values as calibrated.
 
 Viewers can discover active sessions before subscribing. `ListRooms` returns room ids, names, participant counts, and published stream counts. After joining a room, `ListStreams` returns stream ids, publisher ids, codec/media kind, subscriber counts, config availability, and current target bitrate/FPS. The desktop viewer uses these messages to select a room by `--room-name` when `--room-id` is not provided.
 
@@ -112,7 +115,7 @@ Stage 3 adds reusable encoded-frame helpers in `crates/protocol/src/frame.rs`.
 - `is_keyframe`
 - opaque encoded bytes
 
-The desktop synthetic broadcaster writes `sender_capture_time_micros` as Unix epoch microseconds, stamps `sender_encode_done_time_micros` after encoding, and stamps `sender_send_time_micros` immediately before each QUIC datagram send. The relay stamps forwarded datagrams with `server_receive_time_micros` when it accepts an ingress datagram and `server_send_time_micros` immediately before it calls QUIC `send_datagram` for a viewer. Viewers compare sender capture/encode/send timestamps to log publisher-side media timing, compare relay receive/send timestamps to log server queue delay, and compare sender capture time with local receive time to populate `ViewerStats.estimated_latency_ms`; production cross-machine latency will need clock offset estimation before capture-to-viewer values can be treated as calibrated glass-to-glass latency.
+The desktop synthetic broadcaster writes `sender_capture_time_micros` as Unix epoch microseconds, stamps `sender_encode_done_time_micros` after encoding, and stamps `sender_send_time_micros` immediately before each QUIC datagram send. The relay stamps forwarded datagrams with `server_receive_time_micros` when it accepts an ingress datagram and `server_send_time_micros` immediately before it calls QUIC `send_datagram` for a viewer. Viewers compare sender capture/encode/send timestamps to log publisher-side media timing, compare relay receive/send timestamps to log server queue delay, and compare sender capture time with local receive time to populate `ViewerStats.estimated_latency_ms`; production cross-machine latency should apply clock offset calibration before capture-to-viewer values are treated as calibrated glass-to-glass latency.
 
 `packetize_frame` splits a video frame into `MediaPacket` fragments. `packetize_frame_with_type` uses the same fragmentation rules for other media packet types such as audio:
 

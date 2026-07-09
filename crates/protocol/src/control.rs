@@ -28,6 +28,7 @@ impl<T> ControlEnvelope<T> {
 pub enum ClientControl {
     Hello(Hello),
     Ping(Ping),
+    TimeSync(TimeSyncRequest),
     Authenticate(Authenticate),
     CreateRoom(CreateRoom),
     ListRooms(ListRooms),
@@ -51,6 +52,7 @@ pub enum ClientControl {
 pub enum ServerControl {
     HelloAccepted(HelloAccepted),
     Pong(Pong),
+    TimeSync(TimeSyncResponse),
     Authenticated(Authenticated),
     RoomCreated(RoomCreated),
     RoomList(RoomList),
@@ -90,6 +92,18 @@ pub struct Ping {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pong {
     pub nonce: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSyncRequest {
+    pub client_send_time_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeSyncResponse {
+    pub client_send_time_micros: u64,
+    pub server_receive_time_micros: u64,
+    pub server_send_time_micros: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,6 +453,30 @@ mod tests {
         let encoded = encode_client_envelope(&envelope).unwrap();
 
         assert_eq!(decode_client_envelope(&encoded).unwrap(), envelope);
+    }
+
+    #[test]
+    fn time_sync_round_trips_as_json_lines() {
+        let request = ClientEnvelope::new(
+            8,
+            ClientControl::TimeSync(TimeSyncRequest {
+                client_send_time_micros: 1_000_000,
+            }),
+        );
+        let response = ServerEnvelope::new(
+            8,
+            ServerControl::TimeSync(TimeSyncResponse {
+                client_send_time_micros: 1_000_000,
+                server_receive_time_micros: 1_000_500,
+                server_send_time_micros: 1_000_700,
+            }),
+        );
+
+        let encoded_request = encode_client_envelope(&request).unwrap();
+        let encoded_response = encode_server_envelope(&response).unwrap();
+
+        assert_eq!(decode_client_envelope(&encoded_request).unwrap(), request);
+        assert_eq!(decode_server_envelope(&encoded_response).unwrap(), response);
     }
 
     #[test]

@@ -7,14 +7,14 @@ use teamview_protocol::{
         Pong, RequestKeyframe, RoomCreated, RoomId, RoomJoined, RoomLeft, RoomList, RoomSummary,
         ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig,
         StreamId, StreamList, StreamPublished, StreamSubscribed, StreamSummary, StreamUnsubscribed,
-        UserId, ViewerStatsReport,
+        TimeSyncResponse, UserId, ViewerStatsReport,
     },
     packet::MediaPacket,
 };
 
 use crate::{
     media::MediaForwardSummary,
-    metrics::StreamForwardingMetrics,
+    metrics::{StreamForwardingMetrics, unix_time_micros},
     room::{PublishedStream, Room},
     session::Session,
 };
@@ -96,6 +96,19 @@ impl ControlState {
             }
             ClientControl::Ping(ping) => match session.user_id {
                 Some(_) => ServerControl::Pong(Pong { nonce: ping.nonce }),
+                None => {
+                    ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"))
+                }
+            },
+            ClientControl::TimeSync(time_sync) => match session.user_id {
+                Some(_) => {
+                    let server_receive_time_micros = unix_time_micros();
+                    ServerControl::TimeSync(TimeSyncResponse {
+                        client_send_time_micros: time_sync.client_send_time_micros,
+                        server_receive_time_micros,
+                        server_send_time_micros: unix_time_micros(),
+                    })
+                }
                 None => {
                     ServerControl::Error(ControlError::new("unauthenticated", "send Hello first"))
                 }
@@ -302,7 +315,10 @@ impl ControlState {
     ) -> Option<ServerControl> {
         if matches!(
             message,
-            ClientControl::Hello(_) | ClientControl::Ping(_) | ClientControl::Authenticate(_)
+            ClientControl::Hello(_)
+                | ClientControl::Ping(_)
+                | ClientControl::TimeSync(_)
+                | ClientControl::Authenticate(_)
         ) {
             return None;
         }
@@ -857,7 +873,7 @@ mod tests {
             Authenticate, ClientEnvelope, CreateRoom, Hello, JoinRoom, KeyframeReason, LeaveRoom,
             ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
             PollStreamMetrics, PublishStream, RequestKeyframe, SetTargetBitrate,
-            SetTargetFramerate, StreamConfig, SubscribeStream, ViewerStatsReport,
+            SetTargetFramerate, StreamConfig, SubscribeStream, TimeSyncRequest, ViewerStatsReport,
         },
         packet::{MediaPacket, MediaPacketHeader, PacketFlags, PacketType},
     };
@@ -914,6 +930,53 @@ mod tests {
         );
 
         assert_eq!(response.message, ServerControl::Pong(Pong { nonce: 99 }));
+    }
+
+    #[test]
+    fn time_sync_requires_hello() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+
+        let response = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                1,
+                ClientControl::TimeSync(TimeSyncRequest {
+                    client_send_time_micros: 123,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::Error(error) => assert_eq!(error.code, "unauthenticated"),
+            other => panic!("unexpected time sync response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn time_sync_echoes_client_time_after_hello() {
+        let mut state = ControlState::new();
+        let mut session = Session::anonymous(1);
+        authenticate(&mut state, &mut session, "client");
+
+        let response = state.handle_client_envelope(
+            &mut session,
+            ClientEnvelope::new(
+                2,
+                ClientControl::TimeSync(TimeSyncRequest {
+                    client_send_time_micros: 1_234_567,
+                }),
+            ),
+        );
+
+        match response.message {
+            ServerControl::TimeSync(sync) => {
+                assert_eq!(sync.client_send_time_micros, 1_234_567);
+                assert!(sync.server_receive_time_micros > 0);
+                assert!(sync.server_send_time_micros >= sync.server_receive_time_micros);
+            }
+            other => panic!("unexpected time sync response: {other:?}"),
+        }
     }
 
     #[test]

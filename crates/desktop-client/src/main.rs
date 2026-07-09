@@ -21,8 +21,8 @@ use teamview_protocol::{
         ListRooms, ListStreams, MediaKind, Ping, PollPublisherFeedback, PollStreamConfig,
         PollStreamMetrics, PublishStream, PublisherFeedback, RequestKeyframe, RoomId, RoomSummary,
         ServerControl, ServerEnvelope, SetTargetBitrate, SetTargetFramerate, StreamConfig,
-        StreamId, StreamMetricsSnapshot, StreamSummary, SubscribeStream, UnsubscribeStream,
-        ViewerStatsReport,
+        StreamId, StreamMetricsSnapshot, StreamSummary, SubscribeStream, TimeSyncRequest,
+        TimeSyncResponse, UnsubscribeStream, ViewerStatsReport,
     },
     frame::{packetize_frame_for_datagram_target, packetize_frame_with_type_for_datagram_target},
     packet::{DEFAULT_DATAGRAM_PAYLOAD_TARGET, MediaPacket, PacketType},
@@ -200,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     print_control_response("hello", &response);
     ensure_not_error("hello", &response)?;
+    sync_control_clock(&mut control).await?;
     if let Some(access_token) = &args.access_token {
         authenticate_control(&mut control, access_token).await?;
     }
@@ -210,6 +211,66 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClockSyncEstimate {
+    rtt_ms: u16,
+    clock_offset_micros: i64,
+}
+
+async fn sync_control_clock(
+    control: &mut crate::transport::quic::ControlClient,
+) -> anyhow::Result<ClockSyncEstimate> {
+    let client_send_time_micros = unix_time_micros();
+    let response = control
+        .send(ClientControl::TimeSync(TimeSyncRequest {
+            client_send_time_micros,
+        }))
+        .await?;
+    let client_receive_time_micros = unix_time_micros();
+    print_control_response("time-sync", &response);
+    match response.message {
+        ServerControl::TimeSync(sync) => {
+            let estimate = estimate_clock_sync(&sync, client_receive_time_micros);
+            println!(
+                "time-sync client_send_time_micros={} client_receive_time_micros={} server_receive_time_micros={} server_send_time_micros={} rtt_ms={} clock_offset_micros={}",
+                sync.client_send_time_micros,
+                client_receive_time_micros,
+                sync.server_receive_time_micros,
+                sync.server_send_time_micros,
+                estimate.rtt_ms,
+                estimate.clock_offset_micros
+            );
+            Ok(estimate)
+        }
+        ServerControl::Error(error) => bail!("time sync failed: {}", error.message),
+        other => bail!("unexpected time sync response: {other:?}"),
+    }
+}
+
+fn estimate_clock_sync(
+    sync: &TimeSyncResponse,
+    client_receive_time_micros: u64,
+) -> ClockSyncEstimate {
+    let client_elapsed_micros =
+        client_receive_time_micros.saturating_sub(sync.client_send_time_micros);
+    let server_processing_micros = sync
+        .server_send_time_micros
+        .saturating_sub(sync.server_receive_time_micros);
+    let rtt_micros = client_elapsed_micros.saturating_sub(server_processing_micros);
+
+    let client_midpoint =
+        sync.client_send_time_micros as i128 + (client_elapsed_micros / 2) as i128;
+    let server_midpoint =
+        sync.server_receive_time_micros as i128 + (server_processing_micros / 2) as i128;
+    let clock_offset_micros =
+        (server_midpoint - client_midpoint).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+
+    ClockSyncEstimate {
+        rtt_ms: micros_to_millis(rtt_micros),
+        clock_offset_micros,
+    }
 }
 
 async fn authenticate_control(
@@ -923,6 +984,10 @@ fn millis_for_log(duration: Duration) -> u16 {
     duration.as_millis().min(u16::MAX as u128) as u16
 }
 
+fn micros_to_millis(micros: u64) -> u16 {
+    micros.saturating_div(1_000).min(u16::MAX as u64) as u16
+}
+
 fn unix_time_micros() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1527,6 +1592,38 @@ mod tests {
         let args = Args::try_parse_from(["desktop-client", "--list-capture-sources"]).unwrap();
 
         assert!(args.list_capture_sources);
+    }
+
+    #[test]
+    fn clock_sync_estimate_uses_midpoints_and_excludes_server_processing() {
+        let sync = TimeSyncResponse {
+            client_send_time_micros: 1_000,
+            server_receive_time_micros: 1_800,
+            server_send_time_micros: 2_000,
+        };
+
+        let estimate = estimate_clock_sync(&sync, 2_400);
+
+        assert_eq!(
+            estimate,
+            ClockSyncEstimate {
+                rtt_ms: 1,
+                clock_offset_micros: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn clock_sync_estimate_saturates_rtt_millis() {
+        let sync = TimeSyncResponse {
+            client_send_time_micros: 0,
+            server_receive_time_micros: 0,
+            server_send_time_micros: 0,
+        };
+
+        let estimate = estimate_clock_sync(&sync, u64::MAX);
+
+        assert_eq!(estimate.rtt_ms, u16::MAX);
     }
 
     #[test]
