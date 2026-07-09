@@ -5,13 +5,26 @@ use std::{ffi::c_void, mem, ptr};
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::{
-    Foundation::{HANDLE, HWND},
+    Foundation::{HANDLE, HWND, RECT},
     Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
-        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDeviceCaps, HDC, HORZRES, ReleaseDC,
-        SRCCOPY, SelectObject, VERTRES,
+        DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDeviceCaps, GetWindowDC, HDC, HORZRES,
+        ReleaseDC, SRCCOPY, SelectObject, VERTRES,
     },
+    UI::WindowsAndMessaging::{FindWindowW, GetWindowRect, IsWindowVisible},
 };
+
+#[cfg(target_os = "windows")]
+const WINDOW_SOURCE_LABEL: &str = "window capture source";
+
+#[cfg(target_os = "windows")]
+const PRIMARY_MONITOR_SOURCE_LABEL: &str = "primary monitor";
+
+#[cfg(not(target_os = "windows"))]
+const PRIMARY_MONITOR_SOURCE_LABEL: &str = "primary monitor";
+
+#[cfg(not(target_os = "windows"))]
+const WINDOW_SOURCE_LABEL: &str = "window capture source";
 
 #[derive(Debug)]
 pub struct WindowsGraphicsCapture {
@@ -78,12 +91,17 @@ pub fn primary_monitor_size() -> anyhow::Result<(u32, u32)> {
     primary_monitor_size_impl()
 }
 
+pub fn capture_source_size(source: &CaptureSource) -> anyhow::Result<(u32, u32)> {
+    ensure_supported()?;
+    capture_source_size_impl(source)
+}
+
 #[cfg(target_os = "windows")]
 fn primary_monitor_size_impl() -> anyhow::Result<(u32, u32)> {
     with_screen_dc(|screen_dc| unsafe {
         let width = GetDeviceCaps(screen_dc, HORZRES as i32);
         let height = GetDeviceCaps(screen_dc, VERTRES as i32);
-        validate_capture_dimensions(width, height)
+        validate_capture_dimensions(width, height, PRIMARY_MONITOR_SOURCE_LABEL)
     })
 }
 
@@ -92,14 +110,32 @@ fn primary_monitor_size_impl() -> anyhow::Result<(u32, u32)> {
     anyhow::bail!("Windows Graphics Capture is only available on Windows")
 }
 
+#[cfg(target_os = "windows")]
+fn capture_source_size_impl(source: &CaptureSource) -> anyhow::Result<(u32, u32)> {
+    match source {
+        CaptureSource::PrimaryMonitor => primary_monitor_size_impl(),
+        CaptureSource::Window { title, .. } => {
+            let hwnd = find_window_by_title(title)?;
+            window_capture_size(hwnd)
+        }
+        CaptureSource::Monitor { id } => {
+            anyhow::bail!("monitor capture by id is not implemented yet: {id}")
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn capture_source_size_impl(_source: &CaptureSource) -> anyhow::Result<(u32, u32)> {
+    anyhow::bail!("Windows Graphics Capture is only available on Windows")
+}
+
 impl WindowsGraphicsCapture {
     fn capture_now(&mut self) -> anyhow::Result<CaptureFrame> {
         match &self.source {
             CaptureSource::PrimaryMonitor => self.capture_primary_monitor(),
-            CaptureSource::Monitor { .. } | CaptureSource::Window { .. } => {
-                anyhow::bail!(
-                    "only primary monitor capture is implemented in this client milestone"
-                )
+            CaptureSource::Window { title, .. } => self.capture_window(title.clone()),
+            CaptureSource::Monitor { id } => {
+                anyhow::bail!("monitor capture by id is not implemented yet: {id}")
             }
         }
     }
@@ -110,9 +146,14 @@ impl WindowsGraphicsCapture {
             let (width, height) = {
                 let width = GetDeviceCaps(screen_dc, HORZRES as i32);
                 let height = GetDeviceCaps(screen_dc, VERTRES as i32);
-                validate_capture_dimensions(width, height)?
+                validate_capture_dimensions(width, height, PRIMARY_MONITOR_SOURCE_LABEL)?
             };
-            let bytes = capture_bgra_from_screen_dc(screen_dc, width, height)?;
+            let bytes = capture_bgra_from_source_dc(
+                screen_dc,
+                width,
+                height,
+                PRIMARY_MONITOR_SOURCE_LABEL,
+            )?;
             let frame = CaptureFrame::cpu_bgra(
                 self.next_frame_id,
                 width,
@@ -129,14 +170,74 @@ impl WindowsGraphicsCapture {
     fn capture_primary_monitor(&mut self) -> anyhow::Result<CaptureFrame> {
         anyhow::bail!("Windows Graphics Capture is only available on Windows")
     }
+
+    #[cfg(target_os = "windows")]
+    fn capture_window(&mut self, title: String) -> anyhow::Result<CaptureFrame> {
+        let hwnd = find_window_by_title(&title)?;
+        let (width, height) = window_capture_size(hwnd)?;
+        with_window_dc(hwnd, |window_dc| unsafe {
+            let bytes = capture_bgra_from_source_dc(window_dc, width, height, WINDOW_SOURCE_LABEL)?;
+            let frame = CaptureFrame::cpu_bgra(
+                self.next_frame_id,
+                width,
+                height,
+                unix_time_micros(),
+                bytes,
+            )?;
+            self.next_frame_id = self.next_frame_id.saturating_add(1);
+            Ok(frame)
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn capture_window(&mut self, _title: String) -> anyhow::Result<CaptureFrame> {
+        anyhow::bail!("Windows Graphics Capture is only available on Windows")
+    }
 }
 
 #[cfg(target_os = "windows")]
-fn validate_capture_dimensions(width: i32, height: i32) -> anyhow::Result<(u32, u32)> {
+fn validate_capture_dimensions(
+    width: i32,
+    height: i32,
+    source_label: &str,
+) -> anyhow::Result<(u32, u32)> {
     if width <= 0 || height <= 0 {
-        anyhow::bail!("primary monitor has invalid capture size {width}x{height}");
+        anyhow::bail!("{source_label} has invalid capture size {width}x{height}");
     }
     Ok((width as u32, height as u32))
+}
+
+#[cfg(target_os = "windows")]
+fn find_window_by_title(title: &str) -> anyhow::Result<HWND> {
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("window capture title cannot be empty");
+    }
+    let wide_title = wide_null(title);
+    let hwnd = unsafe { FindWindowW(ptr::null(), wide_title.as_ptr()) };
+    if hwnd.is_null() {
+        anyhow::bail!("could not find a visible window with exact title {title:?}");
+    }
+    if unsafe { IsWindowVisible(hwnd) } == 0 {
+        anyhow::bail!("window with title {title:?} is not visible");
+    }
+    Ok(hwnd)
+}
+
+#[cfg(target_os = "windows")]
+fn window_capture_size(hwnd: HWND) -> anyhow::Result<(u32, u32)> {
+    let mut rect = unsafe { mem::zeroed::<RECT>() };
+    if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+        anyhow::bail!("failed to query window capture bounds");
+    }
+    let width = rect.right.saturating_sub(rect.left);
+    let height = rect.bottom.saturating_sub(rect.top);
+    validate_capture_dimensions(width, height, WINDOW_SOURCE_LABEL)
+}
+
+#[cfg(target_os = "windows")]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(target_os = "windows")]
@@ -154,17 +255,35 @@ fn with_screen_dc<T>(capture: impl FnOnce(HDC) -> anyhow::Result<T>) -> anyhow::
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn capture_bgra_from_screen_dc(
-    screen_dc: HDC,
+fn with_window_dc<T>(
+    hwnd: HWND,
+    capture: impl FnOnce(HDC) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    unsafe {
+        let window_dc = GetWindowDC(hwnd);
+        if window_dc.is_null() {
+            anyhow::bail!("failed to acquire window capture device context");
+        }
+        let result = capture(window_dc);
+        ReleaseDC(hwnd, window_dc);
+        result
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn capture_bgra_from_source_dc(
+    source_dc: HDC,
     width: u32,
     height: u32,
+    source_label: &str,
 ) -> anyhow::Result<Vec<u8>> {
-    let memory_dc = unsafe { CreateCompatibleDC(screen_dc) };
+    let memory_dc = unsafe { CreateCompatibleDC(source_dc) };
     if memory_dc.is_null() {
         anyhow::bail!("failed to create compatible capture device context");
     }
 
-    let result = unsafe { capture_bgra_with_memory_dc(screen_dc, memory_dc, width, height) };
+    let result =
+        unsafe { capture_bgra_with_memory_dc(source_dc, memory_dc, width, height, source_label) };
     unsafe {
         DeleteDC(memory_dc);
     }
@@ -173,10 +292,11 @@ unsafe fn capture_bgra_from_screen_dc(
 
 #[cfg(target_os = "windows")]
 unsafe fn capture_bgra_with_memory_dc(
-    screen_dc: HDC,
+    source_dc: HDC,
     memory_dc: HDC,
     width: u32,
     height: u32,
+    source_label: &str,
 ) -> anyhow::Result<Vec<u8>> {
     let buffer_len = CaptureFrame::bgra_byte_len(width, height)?;
     let mut bitmap_info = unsafe { mem::zeroed::<BITMAPINFO>() };
@@ -219,14 +339,14 @@ unsafe fn capture_bgra_with_memory_dc(
             0,
             width as i32,
             height as i32,
-            screen_dc,
+            source_dc,
             0,
             0,
             SRCCOPY,
         )
     } == 0
     {
-        Err(anyhow::anyhow!("failed to copy primary monitor pixels"))
+        Err(anyhow::anyhow!("failed to copy {source_label} pixels"))
     } else {
         let mut bytes = vec![0; buffer_len];
         unsafe {
@@ -292,6 +412,16 @@ mod tests {
             let (width, height) = primary_monitor_size().unwrap();
             assert!(width > 0);
             assert!(height > 0);
+        }
+    }
+
+    #[test]
+    fn capture_source_size_uses_primary_monitor_path() {
+        if is_supported() {
+            assert_eq!(
+                capture_source_size(&CaptureSource::PrimaryMonitor).unwrap(),
+                primary_monitor_size().unwrap()
+            );
         }
     }
 }

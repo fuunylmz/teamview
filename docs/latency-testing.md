@@ -63,7 +63,7 @@ sample-forward frames=3 fragments=18 reassembled=3 delivered=36 dropped=0
 
 Stage 4 validates capture-side latency policy without requiring interactive screen selection.
 
-The key invariant is that the capture queue keeps only the newest frame by default. If three frames arrive before encode/network consumes them, the first two are dropped and only the latest frame is returned. On Windows, the live primary-monitor path can also acquire CPU BGRA pixels for the current desktop; the temporary screen encoder carries a downsampled BGRA preview today, and hardware encoding uses the same frame storage in a later stage.
+The key invariant is that the capture queue keeps only the newest frame by default. If three frames arrive before encode/network consumes them, the first two are dropped and only the latest frame is returned. On Windows, the live primary-monitor and exact-title visible-window paths can also acquire CPU BGRA pixels; the temporary screen encoder carries a downsampled BGRA preview today, and hardware encoding uses the same frame storage in a later stage.
 
 Covered by unit tests:
 
@@ -72,6 +72,9 @@ Covered by unit tests:
 - `capture_returns_latest_queued_frame`
 - `support_detection_matches_target_os`
 - `primary_monitor_size_is_available_on_windows`
+- `capture_source_size_uses_primary_monitor_path`
+- `window_capture_source_requires_title`
+- `window_capture_source_uses_title_as_id_and_label`
 
 Smoke test:
 
@@ -90,9 +93,17 @@ cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --scree
 
 Expected output includes `screen_input=Live` and the captured `capture_width` / `capture_height`. The live frame currently feeds the synthetic H.264-like encoder with a downsampled BGRA preview so transport, stream config, timestamps, viewer rendering, and relay metrics can be validated before hardware H.264 is added.
 
+Live window capture uses an exact visible window title:
+
+```bash
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --screen-input live --capture-source window --window-title "Untitled - Notepad" --media-frames 1 --media-fps 1
+```
+
+The expected output is the same shape as primary-monitor capture, with `capture_width` and `capture_height` matching the selected window bounds.
+
 ## Synthetic QUIC forwarding checks
 
-The current relay/client smoke path validates QUIC datagram media forwarding with synthetic H.264-like frames before hardware encoding, native decoding, or window rendering exists.
+The current relay/client smoke path validates QUIC datagram media forwarding with synthetic H.264-like frames before hardware encoding and production native decoding land.
 
 Run:
 

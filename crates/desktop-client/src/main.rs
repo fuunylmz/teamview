@@ -52,6 +52,7 @@ enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CaptureSourceArg {
     PrimaryMonitor,
+    Window,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -86,6 +87,9 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = CaptureSourceArg::PrimaryMonitor)]
     capture_source: CaptureSourceArg,
+
+    #[arg(long)]
+    window_title: Option<String>,
 
     #[arg(long, default_value_t = true)]
     cursor_visible: bool,
@@ -562,13 +566,8 @@ async fn run_synthetic_screen_broadcaster_media(
     let media_frames = args.synthetic_media_frames()?;
     let frame_interval = args.media_frame_interval()?;
 
-    let mut capture = windows::WindowsGraphicsCapture::new(
-        CaptureSource::PrimaryMonitor,
-        CaptureConfig {
-            queue_capacity: 1,
-            cursor_visible: args.cursor_visible,
-        },
-    )?;
+    let mut capture =
+        windows::WindowsGraphicsCapture::new(args.capture_source()?, args.capture_config())?;
     let mut encoder = H264Encoder::default();
     encoder.config.synthetic_payload_bytes = args.media_frame_bytes;
     encoder.config.bitrate_bps = args.synthetic_bitrate_bps();
@@ -1261,8 +1260,35 @@ impl Args {
                 let config = H264Encoder::default().config;
                 Ok((config.width, config.height))
             }
-            ScreenInputArg::Live => windows::primary_monitor_size()
-                .context("failed to query primary monitor size for live screen stream"),
+            ScreenInputArg::Live => windows::capture_source_size(&self.capture_source()?)
+                .context("failed to query live capture source size"),
+        }
+    }
+
+    fn capture_source(&self) -> anyhow::Result<CaptureSource> {
+        match self.capture_source {
+            CaptureSourceArg::PrimaryMonitor => Ok(CaptureSource::PrimaryMonitor),
+            CaptureSourceArg::Window => {
+                let title = self
+                    .window_title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--window-title is required when --capture-source window")
+                    })?;
+                Ok(CaptureSource::Window {
+                    id: title.to_owned(),
+                    title: title.to_owned(),
+                })
+            }
+        }
+    }
+
+    fn capture_config(&self) -> CaptureConfig {
+        CaptureConfig {
+            queue_capacity: 1,
+            cursor_visible: self.cursor_visible,
         }
     }
 
@@ -1273,5 +1299,46 @@ impl Args {
                 FramePlayback::window("TeamView Viewer").context("failed to create render window")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_capture_source_requires_title() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--capture-source",
+            "window",
+            "--screen-input",
+            "live",
+        ])
+        .unwrap();
+
+        let error = args.capture_source().unwrap_err();
+
+        assert!(error.to_string().contains("--window-title"));
+    }
+
+    #[test]
+    fn window_capture_source_uses_title_as_id_and_label() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--capture-source",
+            "window",
+            "--window-title",
+            "Calculator",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.capture_source().unwrap(),
+            CaptureSource::Window {
+                id: "Calculator".to_owned(),
+                title: "Calculator".to_owned()
+            }
+        );
     }
 }
