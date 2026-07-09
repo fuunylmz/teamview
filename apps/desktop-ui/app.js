@@ -162,7 +162,9 @@ function cloneState(state) {
 
 async function loadInitialState() {
   if (window.teamviewState) return window.teamviewState;
-  const stateUrl = new URLSearchParams(window.location.search).get("state");
+  const stateUrl =
+    new URLSearchParams(window.location.search).get("state") ??
+    (window.location.protocol.startsWith("http") ? "state.json" : null);
   if (!stateUrl) return null;
 
   try {

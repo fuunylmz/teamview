@@ -123,13 +123,13 @@ Expected output includes `room ...`, `stream ...`, and `participant ... muted=..
 
 `--channel-name` and `--channel-id` are the preferred CLI names for channel media sessions. The older `--room-name` and `--room-id` flags remain supported as protocol-compatible aliases.
 
-The first frontend workspace is a static channel console at `apps/desktop-ui/index.html`. It models the desktop channel UI for screen sharing, voice controls, participant state, and channel switching while the native Rust media path remains the source of truth for relay/client behavior. The desktop client can export the same channel UI state shape as JSON so the frontend can load relay discovery data instead of only using its built-in fallback demo state.
+The first frontend workspace is a static channel console at `apps/desktop-ui/index.html`. It models the desktop channel UI for screen sharing, voice controls, participant state, and channel switching while the native Rust media path remains the source of truth for relay/client behavior. The desktop client can serve that UI locally and expose live relay discovery at `/state.json`.
 
 ```bash
-cargo run -p desktop-client -- --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --export-ui-state apps/desktop-ui/state.json
+cargo run -p desktop-client -- --relay 127.0.0.1:4433 --channel-name stage1 --media-kind both --serve-ui --ui-listen 127.0.0.1:7788
 ```
 
-When serving `apps/desktop-ui` over a local static server, open `/?state=state.json` to load that exported channel snapshot. `--print-ui-state` prints the same JSON to stdout for bridge/debug tooling.
+Open `http://127.0.0.1:7788/` to load the channel console. For bridge/debug tooling, `--export-ui-state apps/desktop-ui/state.json` writes the same channel snapshot to disk and `--print-ui-state` prints it to stdout.
 
 To exercise live primary-monitor acquisition through the desktop broadcaster, start a relay and run one live screen frame:
 

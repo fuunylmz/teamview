@@ -14,6 +14,8 @@ mod transport;
 
 use std::{
     fs,
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -74,6 +76,9 @@ const DEFAULT_CHANNEL_NAME: &str = "stage1";
 const DEFAULT_SCREEN_FPS: u16 = 30;
 const DEFAULT_VOICE_FPS: u16 = 50;
 const DEFAULT_VOICE_FRAME_BYTES: usize = 96;
+const UI_INDEX_HTML: &str = include_str!("../../../apps/desktop-ui/index.html");
+const UI_APP_JS: &str = include_str!("../../../apps/desktop-ui/app.js");
+const UI_STYLES_CSS: &str = include_str!("../../../apps/desktop-ui/styles.css");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -182,6 +187,12 @@ struct Args {
 
     #[arg(long)]
     export_ui_state: Option<PathBuf>,
+
+    #[arg(long)]
+    serve_ui: bool,
+
+    #[arg(long, default_value = "127.0.0.1:7788")]
+    ui_listen: String,
 
     #[arg(long, value_enum, default_value_t = CaptureSourceArg::PrimaryMonitor)]
     capture_source: CaptureSourceArg,
@@ -383,6 +394,10 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.print_ui_state || args.export_ui_state.is_some() {
         run_ui_state_export_flow(&control, &args).await?;
+        return Ok(());
+    }
+    if args.serve_ui {
+        run_ui_server_flow(&control, &args).await?;
         return Ok(());
     }
     if args.list_rooms {
@@ -695,6 +710,40 @@ async fn run_ui_state_export_flow(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<()> {
+    let (json, app) = build_ui_state_json(control, args).await?;
+
+    if let Some(path) = &args.export_ui_state {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create UI state directory {}", parent.display())
+            })?;
+        }
+        fs::write(path, &json)
+            .with_context(|| format!("failed to write UI state to {}", path.display()))?;
+        println!(
+            "ui-state-export path={} channels={} selected_channel_id={}",
+            path.display(),
+            app.channels.len(),
+            app.selected_channel_id
+                .map(|channel_id| channel_id.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        );
+    }
+
+    if args.print_ui_state {
+        println!("{json}");
+    }
+
+    Ok(())
+}
+
+async fn build_ui_state_json(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<(String, ClientApp)> {
     let rooms = list_rooms(control).await?;
     let selected_channel_id = select_ui_state_channel_id(args, &rooms)?;
     let mut streams = Vec::new();
@@ -729,33 +778,168 @@ async fn run_ui_state_export_flow(
         local_screen_share: &local_screen_share,
     });
     let json = serde_json::to_string_pretty(&app)?;
+    Ok((json, app))
+}
 
-    if let Some(path) = &args.export_ui_state {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create UI state directory {}", parent.display())
-            })?;
+async fn run_ui_server_flow(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(&args.ui_listen)
+        .with_context(|| format!("failed to bind UI server on {}", args.ui_listen))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read UI server listen address")?;
+    println!(
+        "ui-server listening on http://{}/ serving channel state from relay={}",
+        local_addr, args.relay
+    );
+
+    let control = control.clone();
+    let args = args.clone();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || serve_ui_http(listener, runtime, control, args))
+        .await
+        .context("UI server task failed")?
+}
+
+fn serve_ui_http(
+    listener: TcpListener,
+    runtime: tokio::runtime::Handle,
+    control: crate::transport::quic::ControlClient,
+    args: Args,
+) -> anyhow::Result<()> {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                if let Err(error) =
+                    handle_ui_http_connection(&mut stream, &runtime, &control, &args)
+                {
+                    eprintln!("ui-server request failed: {error:#}");
+                }
+            }
+            Err(error) => return Err(error).context("UI server accept failed"),
         }
-        fs::write(path, &json)
-            .with_context(|| format!("failed to write UI state to {}", path.display()))?;
-        println!(
-            "ui-state-export path={} channels={} selected_channel_id={}",
-            path.display(),
-            app.channels.len(),
-            app.selected_channel_id
-                .map(|channel_id| channel_id.to_string())
-                .unwrap_or_else(|| "none".to_owned())
-        );
     }
-
-    if args.print_ui_state {
-        println!("{json}");
-    }
-
     Ok(())
+}
+
+fn handle_ui_http_connection(
+    stream: &mut TcpStream,
+    runtime: &tokio::runtime::Handle,
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+) -> anyhow::Result<()> {
+    let mut request = [0_u8; 8192];
+    let read = stream
+        .read(&mut request)
+        .context("failed to read UI HTTP request")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = ui_request_path(&request).unwrap_or("/");
+
+    match ui_route_for_path(path) {
+        UiRoute::Index => write_http_response(
+            stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            UI_INDEX_HTML.as_bytes(),
+            false,
+        ),
+        UiRoute::Script => write_http_response(
+            stream,
+            "200 OK",
+            "application/javascript; charset=utf-8",
+            UI_APP_JS.as_bytes(),
+            false,
+        ),
+        UiRoute::Style => write_http_response(
+            stream,
+            "200 OK",
+            "text/css; charset=utf-8",
+            UI_STYLES_CSS.as_bytes(),
+            false,
+        ),
+        UiRoute::State => match runtime.block_on(build_ui_state_json(control, args)) {
+            Ok((json, _)) => write_http_response(
+                stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                json.as_bytes(),
+                true,
+            ),
+            Err(error) => {
+                let body = serde_json::json!({
+                    "error": error.to_string(),
+                })
+                .to_string();
+                write_http_response(
+                    stream,
+                    "500 Internal Server Error",
+                    "application/json; charset=utf-8",
+                    body.as_bytes(),
+                    true,
+                )
+            }
+        },
+        UiRoute::NotFound => write_http_response(
+            stream,
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            b"not found",
+            true,
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiRoute {
+    Index,
+    Script,
+    Style,
+    State,
+    NotFound,
+}
+
+fn ui_request_path(request: &str) -> Option<&str> {
+    let mut parts = request.lines().next()?.split_whitespace();
+    match parts.next()? {
+        "GET" | "HEAD" => {}
+        _ => return None,
+    }
+    Some(parts.next()?.split('?').next().unwrap_or("/"))
+}
+
+fn ui_route_for_path(path: &str) -> UiRoute {
+    match path {
+        "/" | "/index.html" => UiRoute::Index,
+        "/app.js" => UiRoute::Script,
+        "/styles.css" => UiRoute::Style,
+        "/state.json" => UiRoute::State,
+        _ => UiRoute::NotFound,
+    }
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    no_store: bool,
+) -> anyhow::Result<()> {
+    let cache_control = if no_store {
+        "no-store"
+    } else {
+        "public, max-age=1"
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: {cache_control}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .context("failed to write UI HTTP headers")?;
+    stream
+        .write_all(body)
+        .context("failed to write UI HTTP body")
 }
 
 fn select_ui_state_channel_id(
@@ -3456,6 +3640,38 @@ mod tests {
             args.export_ui_state,
             Some(PathBuf::from("apps/desktop-ui/state.json"))
         );
+    }
+
+    #[test]
+    fn serve_ui_flag_parses_with_listen_addr() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--serve-ui",
+            "--ui-listen",
+            "127.0.0.1:7799",
+        ])
+        .unwrap();
+
+        assert!(args.serve_ui);
+        assert_eq!(args.ui_listen, "127.0.0.1:7799");
+    }
+
+    #[test]
+    fn ui_http_routes_static_assets_and_state() {
+        assert_eq!(
+            ui_request_path("GET /?state=state.json HTTP/1.1\r\n"),
+            Some("/")
+        );
+        assert_eq!(
+            ui_request_path("GET /state.json HTTP/1.1\r\n"),
+            Some("/state.json")
+        );
+        assert_eq!(ui_route_for_path("/"), UiRoute::Index);
+        assert_eq!(ui_route_for_path("/index.html"), UiRoute::Index);
+        assert_eq!(ui_route_for_path("/app.js"), UiRoute::Script);
+        assert_eq!(ui_route_for_path("/styles.css"), UiRoute::Style);
+        assert_eq!(ui_route_for_path("/state.json"), UiRoute::State);
+        assert_eq!(ui_route_for_path("/missing"), UiRoute::NotFound);
     }
 
     #[test]
