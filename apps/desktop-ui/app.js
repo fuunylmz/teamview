@@ -202,6 +202,11 @@ function normalizeClientAppState(snapshot) {
   return normalized;
 }
 
+function applySnapshot(snapshot) {
+  clientApp = normalizeClientAppState(snapshot ?? fallbackClientApp);
+  localUserId = clientApp.localUserId ?? FALLBACK_LOCAL_USER_ID;
+}
+
 function normalizeChannel(channel) {
   const participants = Array.isArray(channel.participants)
     ? channel.participants.map(normalizeParticipant)
@@ -425,10 +430,12 @@ function renderScreenMetrics(channel) {
 
 function renderControls(channel) {
   const voice = clientApp.localVoice;
+  const canShare = clientApp.role === "broadcaster";
   elements.shareButton.classList.toggle("active", clientApp.localScreenShare.sharing);
   elements.muteButton.classList.toggle("danger", voice.muted);
   elements.deafenButton.classList.toggle("danger", voice.deafened);
   elements.pttButton.classList.toggle("active", voice.pushToTalk);
+  elements.shareButton.disabled = !canShare;
   elements.pttButton.disabled = voice.muted || voice.deafened;
   elements.shareButton.setAttribute("aria-pressed", String(clientApp.localScreenShare.sharing));
   elements.muteButton.setAttribute("aria-pressed", String(voice.muted));
@@ -448,6 +455,35 @@ function renderControls(channel) {
     : "Opus / 0 fps";
   elements.voiceLatencyMetric.textContent = voiceStream ? `${voiceStream.latencyMs} ms` : "0 ms";
   elements.voiceDropMetric.textContent = voiceStream ? `${voiceStream.droppedFrames} drops` : "0 drops";
+}
+
+function canUseClientApi() {
+  return window.location.protocol.startsWith("http");
+}
+
+async function refreshStateFromServer() {
+  const response = await fetch("state.json", { cache: "no-store" });
+  if (!response.ok) throw new Error(`state refresh failed: ${response.status}`);
+  applySnapshot(await response.json());
+}
+
+async function updateVoiceState(nextVoice) {
+  clientApp.localVoice = { ...clientApp.localVoice, ...nextVoice };
+  render();
+  if (!canUseClientApi()) return;
+
+  try {
+    const response = await fetch("api/voice-state", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(clientApp.localVoice),
+    });
+    if (!response.ok) throw new Error(`voice update failed: ${response.status}`);
+    applySnapshot(await response.json());
+    render();
+  } catch {
+    render();
+  }
 }
 
 function setButtonLabel(button, label) {
@@ -654,31 +690,35 @@ function drawVoice(channel) {
 }
 
 elements.shareButton.addEventListener("click", () => {
+  if (clientApp.role !== "broadcaster") return;
   clientApp.localScreenShare.sharing = !clientApp.localScreenShare.sharing;
   render();
 });
 
-elements.muteButton.addEventListener("click", () => {
-  clientApp.localVoice.muted = !clientApp.localVoice.muted;
-  if (!clientApp.localVoice.muted) clientApp.localVoice.deafened = false;
-  if (clientApp.localVoice.muted) clientApp.localVoice.pttActive = false;
-  render();
+elements.muteButton.addEventListener("click", async () => {
+  const nextVoice = { ...clientApp.localVoice, muted: !clientApp.localVoice.muted };
+  if (!nextVoice.muted) nextVoice.deafened = false;
+  if (nextVoice.muted) nextVoice.pttActive = false;
+  await updateVoiceState(nextVoice);
 });
 
-elements.deafenButton.addEventListener("click", () => {
-  clientApp.localVoice.deafened = !clientApp.localVoice.deafened;
-  if (clientApp.localVoice.deafened) {
-    clientApp.localVoice.muted = true;
-    clientApp.localVoice.pttActive = false;
+elements.deafenButton.addEventListener("click", async () => {
+  const nextVoice = { ...clientApp.localVoice, deafened: !clientApp.localVoice.deafened };
+  if (nextVoice.deafened) {
+    nextVoice.muted = true;
+    nextVoice.pttActive = false;
   }
-  render();
+  await updateVoiceState(nextVoice);
 });
 
-elements.pttButton.addEventListener("click", () => {
+elements.pttButton.addEventListener("click", async () => {
   if (clientApp.localVoice.muted || clientApp.localVoice.deafened) return;
-  clientApp.localVoice.pushToTalk = !clientApp.localVoice.pushToTalk;
-  clientApp.localVoice.pttActive = clientApp.localVoice.pushToTalk;
-  render();
+  const pushToTalk = !clientApp.localVoice.pushToTalk;
+  await updateVoiceState({
+    ...clientApp.localVoice,
+    pushToTalk,
+    pttActive: pushToTalk,
+  });
 });
 
 function animate() {
@@ -690,10 +730,16 @@ function animate() {
 
 async function boot() {
   const loadedState = await loadInitialState();
-  clientApp = normalizeClientAppState(loadedState ?? fallbackClientApp);
-  localUserId = clientApp.localUserId ?? FALLBACK_LOCAL_USER_ID;
+  applySnapshot(loadedState ?? fallbackClientApp);
   render();
   animate();
+  if (canUseClientApi()) {
+    setInterval(() => {
+      refreshStateFromServer()
+        .then(render)
+        .catch(() => {});
+    }, 3000);
+  }
 }
 
 boot();

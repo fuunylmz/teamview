@@ -17,6 +17,7 @@ use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -622,13 +623,21 @@ async fn set_voice_state_if_requested(
     if !args.voice_state_requested() {
         return Ok(());
     }
+    set_voice_state(control, room_id, &args.ui_voice_control_state()).await
+}
+
+async fn set_voice_state(
+    control: &crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    voice: &VoiceControlState,
+) -> anyhow::Result<()> {
     let response = control
         .send(ClientControl::SetVoiceState(SetVoiceState {
             room_id,
-            muted: args.muted,
-            deafened: args.deafened,
-            push_to_talk: args.voice_push_to_talk_enabled(),
-            speaking: args.voice_speaking(),
+            muted: voice.muted,
+            deafened: voice.deafened,
+            push_to_talk: voice.push_to_talk,
+            speaking: voice_speaking_from_state(voice),
         }))
         .await?;
     print_control_response("set-voice-state", &response);
@@ -648,6 +657,10 @@ async fn set_voice_state_if_requested(
         ServerControl::Error(error) => bail!("set voice state failed: {}", error.message),
         other => bail!("unexpected set voice state response: {other:?}"),
     }
+}
+
+fn voice_speaking_from_state(voice: &VoiceControlState) -> bool {
+    !voice.muted && !voice.deafened && (!voice.push_to_talk || voice.ptt_active)
 }
 
 async fn run_list_rooms_flow(
@@ -744,6 +757,23 @@ async fn build_ui_state_json(
     control: &crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<(String, ClientApp)> {
+    build_ui_state_json_with_controls(
+        control,
+        args,
+        args.ui_voice_control_state(),
+        args.ui_screen_share_control_state(),
+        false,
+    )
+    .await
+}
+
+async fn build_ui_state_json_with_controls(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    local_voice: VoiceControlState,
+    local_screen_share: ScreenShareControlState,
+    push_voice_state: bool,
+) -> anyhow::Result<(String, ClientApp)> {
     let rooms = list_rooms(control).await?;
     let selected_channel_id = select_ui_state_channel_id(args, &rooms)?;
     let mut streams = Vec::new();
@@ -756,7 +786,11 @@ async fn build_ui_state_json(
             .await?;
         print_control_response("join-room", &joined);
         ensure_not_error("join room", &joined)?;
-        set_voice_state_if_requested(control, args, room_id).await?;
+        if push_voice_state {
+            set_voice_state(control, room_id, &local_voice).await?;
+        } else {
+            set_voice_state_if_requested(control, args, room_id).await?;
+        }
 
         streams = list_room_streams(control, room_id).await?;
         stream_configs = poll_configured_streams(control, room_id, &streams).await?;
@@ -764,8 +798,6 @@ async fn build_ui_state_json(
         leave_room(control, room_id).await?;
     }
 
-    let local_voice = args.ui_voice_control_state();
-    let local_screen_share = args.ui_screen_share_control_state();
     let app = ClientApp::from_discovery(ClientAppDiscovery {
         role: args.client_role(),
         relay_addr: &args.relay,
@@ -779,6 +811,74 @@ async fn build_ui_state_json(
     });
     let json = serde_json::to_string_pretty(&app)?;
     Ok((json, app))
+}
+
+#[derive(Debug, Clone)]
+struct UiServerState {
+    local_voice: Arc<Mutex<VoiceControlState>>,
+    local_screen_share: Arc<Mutex<ScreenShareControlState>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VoiceStatePatch {
+    muted: Option<bool>,
+    deafened: Option<bool>,
+    push_to_talk: Option<bool>,
+    ptt_active: Option<bool>,
+}
+
+impl UiServerState {
+    fn new(args: &Args) -> Self {
+        Self {
+            local_voice: Arc::new(Mutex::new(args.ui_voice_control_state())),
+            local_screen_share: Arc::new(Mutex::new(args.ui_screen_share_control_state())),
+        }
+    }
+
+    fn local_voice(&self) -> anyhow::Result<VoiceControlState> {
+        self.local_voice
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| anyhow::anyhow!("UI voice state lock is poisoned"))
+    }
+
+    fn local_screen_share(&self) -> anyhow::Result<ScreenShareControlState> {
+        self.local_screen_share
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|_| anyhow::anyhow!("UI screen state lock is poisoned"))
+    }
+
+    fn update_voice(&self, patch: VoiceStatePatch) -> anyhow::Result<VoiceControlState> {
+        let mut voice = self
+            .local_voice
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UI voice state lock is poisoned"))?;
+        if let Some(muted) = patch.muted {
+            voice.muted = muted;
+        }
+        if let Some(deafened) = patch.deafened {
+            voice.deafened = deafened;
+        }
+        if let Some(push_to_talk) = patch.push_to_talk {
+            voice.push_to_talk = push_to_talk;
+        }
+        if let Some(ptt_active) = patch.ptt_active {
+            voice.ptt_active = ptt_active;
+        }
+        if voice.deafened {
+            voice.muted = true;
+            voice.ptt_active = false;
+        }
+        if voice.muted {
+            voice.ptt_active = false;
+        }
+        if !voice.push_to_talk {
+            voice.ptt_active = false;
+        }
+        Ok(voice.clone())
+    }
 }
 
 async fn run_ui_server_flow(
@@ -797,8 +897,9 @@ async fn run_ui_server_flow(
 
     let control = control.clone();
     let args = args.clone();
+    let state = UiServerState::new(&args);
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || serve_ui_http(listener, runtime, control, args))
+    tokio::task::spawn_blocking(move || serve_ui_http(listener, runtime, control, args, state))
         .await
         .context("UI server task failed")?
 }
@@ -808,12 +909,13 @@ fn serve_ui_http(
     runtime: tokio::runtime::Handle,
     control: crate::transport::quic::ControlClient,
     args: Args,
+    state: UiServerState,
 ) -> anyhow::Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
                 if let Err(error) =
-                    handle_ui_http_connection(&mut stream, &runtime, &control, &args)
+                    handle_ui_http_connection(&mut stream, &runtime, &control, &args, &state)
                 {
                     eprintln!("ui-server request failed: {error:#}");
                 }
@@ -829,59 +931,99 @@ fn handle_ui_http_connection(
     runtime: &tokio::runtime::Handle,
     control: &crate::transport::quic::ControlClient,
     args: &Args,
+    state: &UiServerState,
 ) -> anyhow::Result<()> {
-    let mut request = [0_u8; 8192];
-    let read = stream
-        .read(&mut request)
-        .context("failed to read UI HTTP request")?;
-    let request = String::from_utf8_lossy(&request[..read]);
+    let request = read_ui_http_request(stream)?;
+    let method = ui_request_method(&request).unwrap_or("GET");
     let path = ui_request_path(&request).unwrap_or("/");
+    let body = ui_request_body(&request);
 
-    match ui_route_for_path(path) {
-        UiRoute::Index => write_http_response(
+    match (method, ui_route_for_path(path)) {
+        ("GET" | "HEAD", UiRoute::Index) => write_http_response(
             stream,
             "200 OK",
             "text/html; charset=utf-8",
             UI_INDEX_HTML.as_bytes(),
             false,
         ),
-        UiRoute::Script => write_http_response(
+        ("GET" | "HEAD", UiRoute::Script) => write_http_response(
             stream,
             "200 OK",
             "application/javascript; charset=utf-8",
             UI_APP_JS.as_bytes(),
             false,
         ),
-        UiRoute::Style => write_http_response(
+        ("GET" | "HEAD", UiRoute::Style) => write_http_response(
             stream,
             "200 OK",
             "text/css; charset=utf-8",
             UI_STYLES_CSS.as_bytes(),
             false,
         ),
-        UiRoute::State => match runtime.block_on(build_ui_state_json(control, args)) {
-            Ok((json, _)) => write_http_response(
-                stream,
-                "200 OK",
-                "application/json; charset=utf-8",
-                json.as_bytes(),
-                true,
-            ),
-            Err(error) => {
-                let body = serde_json::json!({
-                    "error": error.to_string(),
-                })
-                .to_string();
-                write_http_response(
+        ("GET" | "HEAD", UiRoute::State) => {
+            match runtime.block_on(build_ui_state_json_for_ui(control, args, state)) {
+                Ok((json, _)) => write_http_response(
                     stream,
-                    "500 Internal Server Error",
+                    "200 OK",
                     "application/json; charset=utf-8",
-                    body.as_bytes(),
+                    json.as_bytes(),
                     true,
-                )
+                ),
+                Err(error) => {
+                    let body = serde_json::json!({
+                        "error": error.to_string(),
+                    })
+                    .to_string();
+                    write_http_response(
+                        stream,
+                        "500 Internal Server Error",
+                        "application/json; charset=utf-8",
+                        body.as_bytes(),
+                        true,
+                    )
+                }
             }
-        },
-        UiRoute::NotFound => write_http_response(
+        }
+        ("POST", UiRoute::VoiceState) => {
+            let patch = match serde_json::from_str::<VoiceStatePatch>(body) {
+                Ok(patch) => patch,
+                Err(error) => {
+                    return write_json_error(
+                        stream,
+                        "400 Bad Request",
+                        &anyhow::anyhow!("failed to parse voice-state request: {error}"),
+                    );
+                }
+            };
+            if let Err(error) = state.update_voice(patch) {
+                return write_json_error(stream, "500 Internal Server Error", &error);
+            }
+            match runtime.block_on(build_ui_state_json_for_ui(control, args, state)) {
+                Ok((json, _)) => write_http_response(
+                    stream,
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    json.as_bytes(),
+                    true,
+                ),
+                Err(error) => write_json_error(stream, "500 Internal Server Error", &error),
+            }
+        }
+        (
+            _,
+            UiRoute::Index
+            | UiRoute::Script
+            | UiRoute::Style
+            | UiRoute::State
+            | UiRoute::VoiceState,
+        ) => write_http_response(
+            stream,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"method not allowed",
+            true,
+        ),
+        (_, UiRoute::NotFound) => write_http_response(
             stream,
             "404 Not Found",
             "text/plain; charset=utf-8",
@@ -891,22 +1033,106 @@ fn handle_ui_http_connection(
     }
 }
 
+fn read_ui_http_request(stream: &mut TcpStream) -> anyhow::Result<String> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .context("failed to read UI HTTP request")?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let header_text = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = ui_content_length(&header_text)?;
+        let expected_len = header_end + 4 + content_length;
+        while request.len() < expected_len {
+            let read = stream
+                .read(&mut buffer)
+                .context("failed to read UI HTTP request body")?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        break;
+    }
+    String::from_utf8(request).context("UI HTTP request was not valid UTF-8")
+}
+
+async fn build_ui_state_json_for_ui(
+    control: &crate::transport::quic::ControlClient,
+    args: &Args,
+    state: &UiServerState,
+) -> anyhow::Result<(String, ClientApp)> {
+    build_ui_state_json_with_controls(
+        control,
+        args,
+        state.local_voice()?,
+        state.local_screen_share()?,
+        true,
+    )
+    .await
+}
+
+fn write_json_error(
+    stream: &mut TcpStream,
+    status: &str,
+    error: &anyhow::Error,
+) -> anyhow::Result<()> {
+    let body = serde_json::json!({
+        "error": error.to_string(),
+    })
+    .to_string();
+    write_http_response(
+        stream,
+        status,
+        "application/json; charset=utf-8",
+        body.as_bytes(),
+        true,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UiRoute {
     Index,
     Script,
     Style,
     State,
+    VoiceState,
     NotFound,
+}
+
+fn ui_request_method(request: &str) -> Option<&str> {
+    let mut parts = request.lines().next()?.split_whitespace();
+    parts.next()
 }
 
 fn ui_request_path(request: &str) -> Option<&str> {
     let mut parts = request.lines().next()?.split_whitespace();
-    match parts.next()? {
-        "GET" | "HEAD" => {}
-        _ => return None,
-    }
+    parts.next()?;
     Some(parts.next()?.split('?').next().unwrap_or("/"))
+}
+
+fn ui_request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+}
+
+fn ui_content_length(headers: &str) -> anyhow::Result<usize> {
+    headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>())
+        })
+        .transpose()
+        .context("invalid UI HTTP content-length")
+        .map(|length| length.unwrap_or(0))
 }
 
 fn ui_route_for_path(path: &str) -> UiRoute {
@@ -915,6 +1141,7 @@ fn ui_route_for_path(path: &str) -> UiRoute {
         "/app.js" => UiRoute::Script,
         "/styles.css" => UiRoute::Style,
         "/state.json" => UiRoute::State,
+        "/api/voice-state" => UiRoute::VoiceState,
         _ => UiRoute::NotFound,
     }
 }
@@ -3671,7 +3898,53 @@ mod tests {
         assert_eq!(ui_route_for_path("/app.js"), UiRoute::Script);
         assert_eq!(ui_route_for_path("/styles.css"), UiRoute::Style);
         assert_eq!(ui_route_for_path("/state.json"), UiRoute::State);
+        assert_eq!(ui_route_for_path("/api/voice-state"), UiRoute::VoiceState);
         assert_eq!(ui_route_for_path("/missing"), UiRoute::NotFound);
+    }
+
+    #[test]
+    fn ui_content_length_is_case_insensitive_and_optional() {
+        assert_eq!(
+            ui_content_length("POST / HTTP/1.1\r\nContent-Length: 17").unwrap(),
+            17
+        );
+        assert_eq!(
+            ui_content_length("POST / HTTP/1.1\r\ncontent-length: 3").unwrap(),
+            3
+        );
+        assert_eq!(ui_content_length("GET / HTTP/1.1").unwrap(), 0);
+        assert!(ui_content_length("POST / HTTP/1.1\r\nContent-Length: nope").is_err());
+    }
+
+    #[test]
+    fn ui_voice_patch_applies_mute_deafen_and_ptt_rules() {
+        let args = Args::try_parse_from(["desktop-client"]).unwrap();
+        let state = UiServerState::new(&args);
+
+        let voice = state
+            .update_voice(VoiceStatePatch {
+                muted: Some(false),
+                deafened: Some(false),
+                push_to_talk: Some(true),
+                ptt_active: Some(true),
+            })
+            .unwrap();
+        assert!(voice.push_to_talk);
+        assert!(voice.ptt_active);
+        assert!(voice_speaking_from_state(&voice));
+
+        let voice = state
+            .update_voice(VoiceStatePatch {
+                muted: None,
+                deafened: Some(true),
+                push_to_talk: None,
+                ptt_active: None,
+            })
+            .unwrap();
+        assert!(voice.deafened);
+        assert!(voice.muted);
+        assert!(!voice.ptt_active);
+        assert!(!voice_speaking_from_state(&voice));
     }
 
     #[test]
