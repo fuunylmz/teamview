@@ -32,7 +32,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::info;
 
 use crate::{
-    audio::{LatestAudioPlayback, SyntheticOpusDecoder, SyntheticOpusEncoder},
+    audio::{AudioOutputPlayback, AudioPlayback, SyntheticOpusDecoder, SyntheticOpusEncoder},
     audio_capture::{
         AudioCaptureConfig, MicrophoneCapture, MicrophoneSource, MicrophoneSourceInfo,
         WindowsMicrophoneCapture,
@@ -89,6 +89,12 @@ enum RenderOutputArg {
     Window,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AudioOutputArg {
+    Sink,
+    Speaker,
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about = "TeamView native desktop client scaffold")]
 struct Args {
@@ -142,6 +148,9 @@ struct Args {
 
     #[arg(long, value_enum, default_value_t = RenderOutputArg::Sink)]
     render_output: RenderOutputArg,
+
+    #[arg(long, value_enum, default_value_t = AudioOutputArg::Sink)]
+    audio_output: AudioOutputArg,
 
     #[arg(long, default_value_t = 0)]
     media_frames: u32,
@@ -210,11 +219,12 @@ async fn main() -> anyhow::Result<()> {
         ?args.screen_input,
         ?args.voice_input,
         ?args.render_output,
+        ?args.audio_output,
         cursor_visible = args.cursor_visible,
         "desktop client endpoint and capture foundation ready"
     );
     println!(
-        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} voice_input={:?} render_output={:?}",
+        "desktop-client mode={:?} relay={} local={} capture_supported={} capture_source={:?} screen_input={:?} voice_input={:?} render_output={:?} audio_output={:?}",
         args.mode,
         args.relay,
         local_addr,
@@ -222,7 +232,8 @@ async fn main() -> anyhow::Result<()> {
         args.capture_source,
         args.screen_input,
         args.voice_input,
-        args.render_output
+        args.render_output,
+        args.audio_output
     );
 
     let mut control = connect_control_client(&endpoint, &args.relay).await?;
@@ -1456,7 +1467,7 @@ async fn run_synthetic_voice_viewer_media(
     let frame_interval_ms = frame_interval.as_millis().min(u16::MAX as u128) as u16;
     let mut buffer = FrameReassemblyBuffer::with_limits(64, args.reassembly_window_frames);
     let mut decoder = SyntheticOpusDecoder;
-    let mut playback = LatestAudioPlayback::default();
+    let mut playback = args.audio_playback()?;
     let mut stats = ClientMediaStats::default();
     let mut reassembled_frames = 0_u32;
     let mut decoded_frames = 0_u32;
@@ -1878,6 +1889,15 @@ impl Args {
             }
         }
     }
+
+    fn audio_playback(&self) -> anyhow::Result<AudioOutputPlayback> {
+        match self.audio_output {
+            AudioOutputArg::Sink => Ok(AudioOutputPlayback::sink()),
+            AudioOutputArg::Speaker => {
+                AudioOutputPlayback::speaker().context("failed to create speaker audio output")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1933,6 +1953,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.microphone_source().unwrap(), MicrophoneSource::Default);
+    }
+
+    #[test]
+    fn audio_output_flag_selects_speaker() {
+        let args = Args::try_parse_from([
+            "desktop-client",
+            "--media-kind",
+            "voice",
+            "--audio-output",
+            "speaker",
+        ])
+        .unwrap();
+
+        assert_eq!(args.audio_output, AudioOutputArg::Speaker);
     }
 
     #[test]

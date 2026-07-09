@@ -1,8 +1,19 @@
 use bytes::Bytes;
 use teamview_protocol::{codec::CodecId, frame::EncodedFrame};
 
+#[cfg(target_os = "windows")]
+use std::{collections::VecDeque, fmt, mem, ptr};
+
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Media::Audio::{
+    CALLBACK_NULL, HWAVEOUT, WAVE_FORMAT_PCM, WAVE_MAPPER, WAVEFORMATEX, WAVEHDR, WHDR_DONE,
+    waveOutClose, waveOutOpen, waveOutPrepareHeader, waveOutReset, waveOutUnprepareHeader,
+    waveOutWrite,
+};
+
 const SYNTHETIC_OPUS_MAGIC: &[u8; 4] = b"TVO1";
 const PCM_PAYLOAD_MAGIC: &[u8; 4] = b"TVP1";
+const MAX_PENDING_SPEAKER_BUFFERS: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticOpusEncoderConfig {
@@ -226,28 +237,54 @@ pub struct LatestAudioPlayback {
     latest: Option<PlayedAudioFrame>,
 }
 
+pub trait AudioPlayback {
+    fn play(&mut self, frame: DecodedAudioFrame) -> anyhow::Result<()>;
+}
+
+#[derive(Debug)]
+pub enum AudioOutputPlayback {
+    Sink(LatestAudioPlayback),
+    Speaker(SpeakerAudioPlayback),
+}
+
+impl AudioOutputPlayback {
+    pub fn sink() -> Self {
+        Self::Sink(LatestAudioPlayback::default())
+    }
+
+    pub fn speaker() -> anyhow::Result<Self> {
+        Ok(Self::Speaker(SpeakerAudioPlayback::new()?))
+    }
+
+    pub fn played_frames(&self) -> u64 {
+        match self {
+            Self::Sink(playback) => playback.played_frames(),
+            Self::Speaker(playback) => playback.played_frames(),
+        }
+    }
+
+    pub fn latest(&self) -> Option<&PlayedAudioFrame> {
+        match self {
+            Self::Sink(playback) => playback.latest(),
+            Self::Speaker(playback) => playback.latest(),
+        }
+    }
+}
+
+impl AudioPlayback for AudioOutputPlayback {
+    fn play(&mut self, frame: DecodedAudioFrame) -> anyhow::Result<()> {
+        match self {
+            Self::Sink(playback) => playback.play(frame),
+            Self::Speaker(playback) => playback.play(frame),
+        }
+    }
+}
+
 impl LatestAudioPlayback {
     pub fn play(&mut self, frame: DecodedAudioFrame) -> anyhow::Result<()> {
-        let expected_samples = frame
-            .sample_count
-            .checked_mul(frame.channel_count)
-            .map(|samples| samples as usize)
-            .ok_or_else(|| anyhow::anyhow!("decoded audio sample count overflow"))?;
-        if frame.pcm.len() != expected_samples {
-            anyhow::bail!(
-                "decoded audio sample buffer length mismatch: expected {}, got {}",
-                expected_samples,
-                frame.pcm.len()
-            );
-        }
-
+        let played = validate_decoded_audio_frame(&frame)?;
         self.played_frames = self.played_frames.saturating_add(1);
-        self.latest = Some(PlayedAudioFrame {
-            frame_id: frame.frame_id,
-            sample_rate_hz: frame.sample_rate_hz,
-            channel_count: frame.channel_count,
-            sample_count: frame.sample_count,
-        });
+        self.latest = Some(played);
         Ok(())
     }
 
@@ -258,6 +295,82 @@ impl LatestAudioPlayback {
     pub fn latest(&self) -> Option<&PlayedAudioFrame> {
         self.latest.as_ref()
     }
+}
+
+impl AudioPlayback for LatestAudioPlayback {
+    fn play(&mut self, frame: DecodedAudioFrame) -> anyhow::Result<()> {
+        Self::play(self, frame)
+    }
+}
+
+#[derive(Debug)]
+pub struct SpeakerAudioPlayback {
+    latest: LatestAudioPlayback,
+    #[cfg(target_os = "windows")]
+    device: Win32WaveOutPlayback,
+}
+
+impl SpeakerAudioPlayback {
+    pub fn new() -> anyhow::Result<Self> {
+        ensure_speaker_supported()?;
+        Ok(Self {
+            latest: LatestAudioPlayback::default(),
+            #[cfg(target_os = "windows")]
+            device: Win32WaveOutPlayback::new(),
+        })
+    }
+
+    pub fn played_frames(&self) -> u64 {
+        self.latest.played_frames()
+    }
+
+    pub fn latest(&self) -> Option<&PlayedAudioFrame> {
+        self.latest.latest()
+    }
+}
+
+impl AudioPlayback for SpeakerAudioPlayback {
+    fn play(&mut self, frame: DecodedAudioFrame) -> anyhow::Result<()> {
+        let played = validate_decoded_audio_frame(&frame)?;
+        #[cfg(target_os = "windows")]
+        self.device.play(&frame)?;
+        self.latest.played_frames = self.latest.played_frames.saturating_add(1);
+        self.latest.latest = Some(played);
+        Ok(())
+    }
+}
+
+pub fn speaker_output_supported() -> bool {
+    cfg!(target_os = "windows")
+}
+
+fn ensure_speaker_supported() -> anyhow::Result<()> {
+    if speaker_output_supported() {
+        Ok(())
+    } else {
+        anyhow::bail!("speaker audio output is only available on Windows")
+    }
+}
+
+fn validate_decoded_audio_frame(frame: &DecodedAudioFrame) -> anyhow::Result<PlayedAudioFrame> {
+    let expected_samples = frame
+        .sample_count
+        .checked_mul(frame.channel_count)
+        .map(|samples| samples as usize)
+        .ok_or_else(|| anyhow::anyhow!("decoded audio sample count overflow"))?;
+    if frame.pcm.len() != expected_samples {
+        anyhow::bail!(
+            "decoded audio sample buffer length mismatch: expected {}, got {}",
+            expected_samples,
+            frame.pcm.len()
+        );
+    }
+    Ok(PlayedAudioFrame {
+        frame_id: frame.frame_id,
+        sample_rate_hz: frame.sample_rate_hz,
+        channel_count: frame.channel_count,
+        sample_count: frame.sample_count,
+    })
 }
 
 pub fn synthetic_audio_payload_bytes(bitrate_bps: u32, frames_per_second: u16) -> usize {
@@ -310,6 +423,219 @@ fn embedded_pcm(
             .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
             .collect(),
     ))
+}
+
+#[cfg(target_os = "windows")]
+struct Win32WaveOutPlayback {
+    handle: Option<HWAVEOUT>,
+    sample_rate_hz: u32,
+    channel_count: u16,
+    pending: VecDeque<Box<WaveOutBuffer>>,
+}
+
+#[cfg(target_os = "windows")]
+impl Win32WaveOutPlayback {
+    fn new() -> Self {
+        Self {
+            handle: None,
+            sample_rate_hz: 0,
+            channel_count: 0,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn play(&mut self, frame: &DecodedAudioFrame) -> anyhow::Result<()> {
+        self.ensure_open(frame.sample_rate_hz, frame.channel_count)?;
+        self.reclaim_finished_buffers()?;
+        if self.pending.len() >= MAX_PENDING_SPEAKER_BUFFERS {
+            self.reset_pending_buffers()?;
+        }
+
+        let handle = self
+            .handle
+            .ok_or_else(|| anyhow::anyhow!("speaker output is not open"))?;
+        let mut buffer = Box::new(WaveOutBuffer::from_pcm(&frame.pcm)?);
+        mm_result("waveOutPrepareHeader", unsafe {
+            waveOutPrepareHeader(handle, &mut buffer.header, wave_header_size())
+        })?;
+        buffer.prepared = true;
+        let write_result = unsafe { waveOutWrite(handle, &mut buffer.header, wave_header_size()) };
+        if write_result != 0 {
+            let _ =
+                unsafe { waveOutUnprepareHeader(handle, &mut buffer.header, wave_header_size()) };
+            buffer.prepared = false;
+            mm_result("waveOutWrite", write_result)?;
+        }
+        self.pending.push_back(buffer);
+        Ok(())
+    }
+
+    fn ensure_open(&mut self, sample_rate_hz: u32, channel_count: u16) -> anyhow::Result<()> {
+        if self.handle.is_some()
+            && self.sample_rate_hz == sample_rate_hz
+            && self.channel_count == channel_count
+        {
+            return Ok(());
+        }
+
+        self.close()?;
+        let format = wave_format(sample_rate_hz, channel_count)?;
+        let mut handle: HWAVEOUT = ptr::null_mut();
+        mm_result("waveOutOpen", unsafe {
+            waveOutOpen(&mut handle, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL)
+        })?;
+        self.handle = Some(handle);
+        self.sample_rate_hz = sample_rate_hz;
+        self.channel_count = channel_count;
+        Ok(())
+    }
+
+    fn reclaim_finished_buffers(&mut self) -> anyhow::Result<()> {
+        while self
+            .pending
+            .front()
+            .is_some_and(|buffer| buffer.header.dwFlags & WHDR_DONE != 0)
+        {
+            let mut buffer = self.pending.pop_front().expect("front exists");
+            self.unprepare_buffer(&mut buffer)?;
+        }
+        Ok(())
+    }
+
+    fn reset_pending_buffers(&mut self) -> anyhow::Result<()> {
+        if let Some(handle) = self.handle {
+            mm_result("waveOutReset", unsafe { waveOutReset(handle) })?;
+        }
+        while let Some(mut buffer) = self.pending.pop_front() {
+            self.unprepare_buffer(&mut buffer)?;
+        }
+        Ok(())
+    }
+
+    fn unprepare_buffer(&self, buffer: &mut WaveOutBuffer) -> anyhow::Result<()> {
+        if let (Some(handle), true) = (self.handle, buffer.prepared) {
+            mm_result("waveOutUnprepareHeader", unsafe {
+                waveOutUnprepareHeader(handle, &mut buffer.header, wave_header_size())
+            })?;
+            buffer.prepared = false;
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> anyhow::Result<()> {
+        if self.handle.is_none() {
+            return Ok(());
+        }
+        self.reset_pending_buffers()?;
+        if let Some(handle) = self.handle.take() {
+            mm_result("waveOutClose", unsafe { waveOutClose(handle) })?;
+        }
+        self.sample_rate_hz = 0;
+        self.channel_count = 0;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Win32WaveOutPlayback {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl fmt::Debug for Win32WaveOutPlayback {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Win32WaveOutPlayback")
+            .field("handle", &self.handle)
+            .field("sample_rate_hz", &self.sample_rate_hz)
+            .field("channel_count", &self.channel_count)
+            .field("pending", &self.pending.len())
+            .finish()
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct WaveOutBuffer {
+    data: Vec<u8>,
+    header: WAVEHDR,
+    prepared: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl WaveOutBuffer {
+    fn from_pcm(samples: &[i16]) -> anyhow::Result<Self> {
+        let byte_len = samples
+            .len()
+            .checked_mul(mem::size_of::<i16>())
+            .ok_or_else(|| anyhow::anyhow!("speaker output buffer size overflow"))?;
+        if byte_len > u32::MAX as usize {
+            anyhow::bail!("speaker output buffer exceeds WinMM length field");
+        }
+
+        let mut data = Vec::with_capacity(byte_len);
+        for sample in samples {
+            data.extend_from_slice(&sample.to_le_bytes());
+        }
+        let header = WAVEHDR {
+            lpData: data.as_mut_ptr(),
+            dwBufferLength: byte_len as u32,
+            dwBytesRecorded: 0,
+            dwUser: 0,
+            dwFlags: 0,
+            dwLoops: 0,
+            lpNext: ptr::null_mut(),
+            reserved: 0,
+        };
+        Ok(Self {
+            data,
+            header,
+            prepared: false,
+        })
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wave_format(sample_rate_hz: u32, channel_count: u16) -> anyhow::Result<WAVEFORMATEX> {
+    if sample_rate_hz == 0 {
+        anyhow::bail!("speaker output sample rate must be non-zero");
+    }
+    if channel_count == 0 {
+        anyhow::bail!("speaker output channel count must be non-zero");
+    }
+
+    let bytes_per_sample = mem::size_of::<i16>() as u16;
+    let block_align = channel_count
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| anyhow::anyhow!("speaker output block align overflow"))?;
+    let avg_bytes_per_sec = sample_rate_hz
+        .checked_mul(block_align as u32)
+        .ok_or_else(|| anyhow::anyhow!("speaker output average bytes per second overflow"))?;
+
+    Ok(WAVEFORMATEX {
+        wFormatTag: WAVE_FORMAT_PCM as u16,
+        nChannels: channel_count,
+        nSamplesPerSec: sample_rate_hz,
+        nAvgBytesPerSec: avg_bytes_per_sec,
+        nBlockAlign: block_align,
+        wBitsPerSample: bytes_per_sample * 8,
+        cbSize: 0,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn wave_header_size() -> u32 {
+    mem::size_of::<WAVEHDR>() as u32
+}
+
+#[cfg(target_os = "windows")]
+fn mm_result(action: &str, result: u32) -> anyhow::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        anyhow::bail!("{action} failed with MMRESULT {}", result)
+    }
 }
 
 #[cfg(test)]
@@ -366,5 +692,25 @@ mod tests {
 
         assert_eq!(playback.played_frames(), 1);
         assert_eq!(playback.latest().unwrap().frame_id, 1);
+    }
+
+    #[test]
+    fn audio_output_sink_preserves_latest_frame_summary() {
+        let mut playback = AudioOutputPlayback::sink();
+
+        playback
+            .play(DecodedAudioFrame {
+                frame_id: 5,
+                sample_rate_hz: 48_000,
+                channel_count: 1,
+                sample_count: 3,
+                capture_time_micros: 10,
+                pcm: vec![1, 2, 3],
+            })
+            .unwrap();
+
+        assert_eq!(playback.played_frames(), 1);
+        assert_eq!(playback.latest().unwrap().frame_id, 5);
+        assert_eq!(playback.latest().unwrap().sample_count, 3);
     }
 }
