@@ -1,9 +1,6 @@
 use std::{
     collections::BTreeMap,
-    sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use anyhow::Context;
@@ -64,20 +61,17 @@ impl MediaRelay {
     pub fn register(&mut self, user_id: UserId, connection: Connection) {
         self.unregister(user_id);
         let (sender, receiver) = mpsc::channel(self.egress_queue_capacity);
-        let queued_media_ms = Arc::new(AtomicU32::new(0));
         let stream_depths = Arc::new(StdMutex::new(BTreeMap::new()));
         let send_task = tokio::spawn(send_viewer_egress(
             user_id,
             connection,
             receiver,
-            queued_media_ms.clone(),
             stream_depths.clone(),
         ));
         self.egress.insert(
             user_id,
             ViewerEgress {
                 sender,
-                queued_media_ms,
                 stream_depths,
                 send_task: Some(send_task),
             },
@@ -140,11 +134,13 @@ impl MediaRelay {
             if !egress.try_reserve_media(stream_id, media_duration_ms, self.viewer_queue_budget_ms)
             {
                 summary.dropped += 1;
+                let stream_depth = egress.stream_depth(stream_id);
                 debug!(
                     subscriber_id,
-                    queued_media_ms = egress.queued_media_ms.load(Ordering::Relaxed),
+                    stream_id,
+                    queued_media_ms = stream_depth.queued_media_ms,
                     budget_ms = self.viewer_queue_budget_ms,
-                    "dropping media datagram for over-budget viewer egress queue"
+                    "dropping media datagram for over-budget stream egress queue"
                 );
                 continue;
             }
@@ -184,7 +180,6 @@ impl MediaRelay {
             user_id,
             ViewerEgress {
                 sender,
-                queued_media_ms: Arc::new(AtomicU32::new(0)),
                 stream_depths: Arc::new(StdMutex::new(BTreeMap::new())),
                 send_task: None,
             },
@@ -215,7 +210,6 @@ impl Default for MediaRelay {
 #[derive(Debug)]
 struct ViewerEgress {
     sender: mpsc::Sender<EgressDatagram>,
-    queued_media_ms: Arc<AtomicU32>,
     stream_depths: Arc<StdMutex<BTreeMap<u32, EgressQueueDepth>>>,
     send_task: Option<JoinHandle<()>>,
 }
@@ -228,32 +222,18 @@ impl ViewerEgress {
         queue_budget_ms: u16,
     ) -> bool {
         let media_duration_ms = media_duration_ms as u32;
-        let queue_budget_ms = queue_budget_ms as u32;
-        let mut current = self.queued_media_ms.load(Ordering::Relaxed);
-        loop {
-            let Some(next) = current.checked_add(media_duration_ms) else {
-                return false;
-            };
-            if next > queue_budget_ms {
-                return false;
-            }
-            match self.queued_media_ms.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    reserve_stream_depth(&self.stream_depths, stream_id, media_duration_ms);
-                    return true;
-                }
-                Err(actual) => current = actual,
-            }
+        if !try_reserve_stream_depth(
+            &self.stream_depths,
+            stream_id,
+            media_duration_ms,
+            queue_budget_ms as u32,
+        ) {
+            return false;
         }
+        true
     }
 
     fn release_media(&self, stream_id: u32, media_duration_ms: u16) {
-        release_queued_media(&self.queued_media_ms, media_duration_ms);
         release_stream_depth(&self.stream_depths, stream_id, media_duration_ms);
     }
 
@@ -277,7 +257,6 @@ async fn send_viewer_egress(
     user_id: UserId,
     connection: Connection,
     mut receiver: mpsc::Receiver<EgressDatagram>,
-    queued_media_ms: Arc<AtomicU32>,
     stream_depths: Arc<StdMutex<BTreeMap<u32, EgressQueueDepth>>>,
 ) {
     while let Some(datagram) = receiver.recv().await {
@@ -295,7 +274,6 @@ async fn send_viewer_egress(
                 warn!(user_id, %error, "failed to encode queued media datagram");
             }
         }
-        release_queued_media(&queued_media_ms, media_duration_ms);
         release_stream_depth(&stream_depths, stream_id, media_duration_ms);
     }
 }
@@ -313,16 +291,6 @@ pub struct EgressQueueDepth {
     pub queued_media_ms: u16,
 }
 
-fn release_queued_media(queued_media_ms: &AtomicU32, media_duration_ms: u16) {
-    let media_duration_ms = media_duration_ms as u32;
-    if media_duration_ms == 0 {
-        return;
-    }
-    let _ = queued_media_ms.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(media_duration_ms))
-    });
-}
-
 fn packet_for_egress(packet: &MediaPacket, server_receive_time_micros: u64) -> MediaPacket {
     let mut packet = packet.clone();
     packet.header.server_receive_time_micros = server_receive_time_micros;
@@ -330,19 +298,26 @@ fn packet_for_egress(packet: &MediaPacket, server_receive_time_micros: u64) -> M
     packet
 }
 
-fn reserve_stream_depth(
+fn try_reserve_stream_depth(
     stream_depths: &StdMutex<BTreeMap<u32, EgressQueueDepth>>,
     stream_id: u32,
     media_duration_ms: u32,
-) {
+    queue_budget_ms: u32,
+) -> bool {
     let Ok(mut depths) = stream_depths.lock() else {
-        return;
+        return false;
     };
-    let depth = depths.entry(stream_id).or_default();
-    depth.queued_packets = depth.queued_packets.saturating_add(1);
-    depth.queued_media_ms = depth
+    let current = depths.get(&stream_id).copied().unwrap_or_default();
+    let next_media_ms = current
         .queued_media_ms
         .saturating_add(media_duration_ms.min(u16::MAX as u32) as u16);
+    if next_media_ms as u32 > queue_budget_ms {
+        return false;
+    }
+    let depth = depths.entry(stream_id).or_default();
+    depth.queued_packets = depth.queued_packets.saturating_add(1);
+    depth.queued_media_ms = next_media_ms;
+    true
 }
 
 fn release_stream_depth(
@@ -566,6 +541,68 @@ mod tests {
         assert!(viewer_rx.try_recv().is_err());
     }
 
+    #[test]
+    fn viewer_egress_media_budget_isolated_per_stream() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        let room_id = setup_published_stream(&mut state, &mut publisher, &mut viewer);
+        publish_voice_stream(&mut state, &mut publisher, room_id, 10);
+        subscribe_stream(&mut state, &mut viewer, room_id, 10);
+
+        let mut relay = MediaRelay::with_egress_limits(8, 50);
+        let mut viewer_rx = relay.register_paused_for_test(viewer.user_id.unwrap());
+
+        let first_screen = synthetic_packet_with_sequence(9, 1);
+        let first_screen_summary =
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &first_screen, 123_000);
+        assert_eq!(first_screen_summary.queued, 1);
+        assert_eq!(first_screen_summary.dropped, 0);
+
+        let first_voice = synthetic_audio_packet_with_sequence(10, 1);
+        let first_voice_summary =
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &first_voice, 124_000);
+        assert_eq!(first_voice_summary.queued, 1);
+        assert_eq!(first_voice_summary.dropped, 0);
+        assert_eq!(
+            relay.stream_egress_depth(&state, 9),
+            EgressQueueDepth {
+                queued_packets: 1,
+                queued_media_ms: 34,
+            }
+        );
+        assert_eq!(
+            relay.stream_egress_depth(&state, 10),
+            EgressQueueDepth {
+                queued_packets: 1,
+                queued_media_ms: 34,
+            }
+        );
+
+        let second_screen = synthetic_packet_with_sequence(9, 2);
+        let second_screen_summary =
+            relay.forward_media_packet(&state, publisher.user_id.unwrap(), &second_screen, 125_000);
+        assert_eq!(second_screen_summary.queued, 0);
+        assert_eq!(second_screen_summary.dropped, 1);
+        assert_eq!(
+            relay.stream_egress_depth(&state, 10),
+            EgressQueueDepth {
+                queued_packets: 1,
+                queued_media_ms: 34,
+            }
+        );
+
+        assert_eq!(
+            viewer_rx.try_recv().unwrap().packet,
+            packet_for_egress(&first_screen, 123_000)
+        );
+        assert_eq!(
+            viewer_rx.try_recv().unwrap().packet,
+            packet_for_egress(&first_voice, 124_000)
+        );
+        assert!(viewer_rx.try_recv().is_err());
+    }
+
     fn setup_published_stream(
         state: &mut ControlState,
         publisher: &mut Session,
@@ -666,6 +703,41 @@ mod tests {
         );
     }
 
+    fn publish_voice_stream(
+        state: &mut ControlState,
+        publisher: &mut Session,
+        room_id: u64,
+        stream_id: u32,
+    ) {
+        state.handle_client_envelope(
+            publisher,
+            ClientEnvelope::new(
+                6,
+                ClientControl::PublishStream(PublishStream {
+                    room_id,
+                    stream_id,
+                    codec: CodecId::Opus,
+                    media_kind: MediaKind::Voice,
+                }),
+            ),
+        );
+    }
+
+    fn subscribe_stream(
+        state: &mut ControlState,
+        viewer: &mut Session,
+        room_id: u64,
+        stream_id: u32,
+    ) {
+        state.handle_client_envelope(
+            viewer,
+            ClientEnvelope::new(
+                7,
+                ClientControl::SubscribeStream(SubscribeStream { room_id, stream_id }),
+            ),
+        );
+    }
+
     fn synthetic_packet(stream_id: u32) -> MediaPacket {
         synthetic_packet_with_sequence(stream_id, 1)
     }
@@ -675,6 +747,20 @@ mod tests {
         let mut header = MediaPacketHeader::new(
             PacketType::Video,
             CodecId::H264,
+            stream_id,
+            sequence_number,
+            payload.len() as u16,
+        );
+        header.frame_id = sequence_number;
+        header.flags = PacketFlags::empty().with(PacketFlags::END_OF_FRAME);
+        MediaPacket { header, payload }
+    }
+
+    fn synthetic_audio_packet_with_sequence(stream_id: u32, sequence_number: u32) -> MediaPacket {
+        let payload = Bytes::from_static(b"synthetic-audio");
+        let mut header = MediaPacketHeader::new(
+            PacketType::Audio,
+            CodecId::Opus,
             stream_id,
             sequence_number,
             payload.len() as u16,

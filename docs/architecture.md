@@ -4,7 +4,7 @@ TeamView is designed as a native-first real-time media system.
 
 The MVP avoids WebRTC and peer-to-peer delivery. A broadcaster sends low-latency encoded media to a Relay/SFU server over QUIC. The server forwards encoded packets to viewers without decoding, transcoding, compositing, or delaying fast viewers for slow viewers.
 
-The relay owns room and stream lifecycle state. Room creators join automatically, clients leave or unsubscribe during normal shutdown, and disconnect cleanup removes stale subscriptions, publisher-owned streams, stream metrics, keyframe requests, and empty rooms from discovery. Each viewer egress queue has both a bounded datagram capacity and a configurable media-time budget so a slow viewer drops its own queued datagrams instead of adding latency or delaying other viewers.
+The relay owns room and stream lifecycle state. Room creators join automatically, clients leave or unsubscribe during normal shutdown, and disconnect cleanup removes stale subscriptions, publisher-owned streams, stream metrics, keyframe requests, and empty rooms from discovery. Each subscribed viewer stream has a bounded egress datagram queue and configurable media-time budget, so a slow viewer or a backed-up stream drops its own queued datagrams instead of adding latency, delaying other viewers, or making screen and voice streams contend for the same latency budget.
 
 ## Primary pipeline
 
@@ -13,7 +13,7 @@ Windows capture
   -> low-latency hardware H.264 encode
   -> packetization into MTU-safe QUIC datagrams
   -> relay ingress
-  -> per-viewer bounded egress queues
+  -> per-viewer per-stream bounded egress queues
   -> QUIC datagram downlink
   -> tiny jitter/reorder buffer
   -> native decode

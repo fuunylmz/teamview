@@ -65,13 +65,13 @@ Publishers can set their current target bitrate and framerate. `PublisherFeedbac
 
 `ViewerStats` carries packet counts, decoded/dropped frame counts, jitter, estimated capture-to-viewer latency, reassembly/decode/render p50 and p95 milliseconds, and render FPS. The relay treats packet loss, dropped frames, excessive jitter/latency, slow reassembly/decode/render p95, or low nonzero render FPS as degraded viewer signals for publisher feedback.
 
-Room participants can poll `StreamMetrics` for a published stream. The relay reports server-observed ingress packets/bytes, cumulative queued and dropped egress datagrams, current egress queue packet/media depth, subscriber count, the last server ingress timestamp, and server route p50/p95 milliseconds from datagram receive to fanout enqueue/drop completion.
+Room participants can poll `StreamMetrics` for a published stream. The relay reports server-observed ingress packets/bytes, cumulative queued and dropped egress datagrams, current per-stream egress queue packet/media depth, subscriber count, the last server ingress timestamp, and server route p50/p95 milliseconds from datagram receive to fanout enqueue/drop completion.
 
 ## Media plane
 
 Media packets travel over QUIC datagrams. Each datagram carries one packet with a versioned binary header and an opaque encoded payload.
 
-The relay uses the stream framerate and fragment count to estimate queued media time for each datagram. If forwarding a datagram would push a viewer beyond its configured egress media budget, only that viewer's datagram is dropped.
+The relay uses the stream framerate and fragment count to estimate queued media time for each datagram. If forwarding a datagram would push a viewer's queue for that stream beyond its configured egress media budget, only that viewer/stream datagram is dropped; other subscribed streams for the same viewer keep their own budget.
 
 Encoded frames may be fragmented into multiple datagrams for MTU safety. Fragmentation is only a transport concern; the relay never decodes or transforms media content.
 

@@ -145,7 +145,7 @@ Expected behavior:
 
 - A publisher creates a room, publishes a screen stream, and sends fragmented synthetic frames as QUIC datagrams.
 - Each viewer joins, subscribes, receives every forwarded fragment, and reassembles each frame byte-for-byte.
-- The relay accepts publisher media into independent bounded viewer egress queues and drops only for viewers whose queue is full.
+- The relay accepts publisher media into independent bounded viewer/stream egress queues and drops only for viewers whose relevant stream queue is full.
 - Relay forwarding rejects media from non-publishers and packet types/codecs that do not match the published stream.
 
 Example output:
@@ -181,11 +181,11 @@ Expected behavior:
 - The final broadcaster summary includes capture/encode/packetize/send p50 and p95 timing.
 - Each received frame prints `latency_ms`, `calibrated_latency_ms`, `sender_encode_ms`, `sender_send_ms`, `server_queue_ms`, and `reassembly_ms`, and the final viewer summary includes latest estimated and calibrated latency plus sender encode/send, server queue, reassembly, decode, and render p50/p95 timing.
 - The viewer reassembly buffer drops stale incomplete frames after `--reassembly-window-frames` to avoid accumulating latency.
-- The relay enforces each viewer egress queue's media-time budget, dropping over-budget datagrams for that viewer without blocking other viewers.
+- The relay enforces each viewer/stream egress queue's media-time budget, dropping over-budget datagrams for that stream without blocking other viewers or the same viewer's other subscribed streams.
 - The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.
 - New subscribers, packet loss, and decoder recovery can register keyframe requests with the relay.
 - The broadcaster polls aggregated `PublisherFeedback`; when feedback requests a keyframe, the synthetic encoder marks the next frame as a keyframe.
-- The broadcaster polls relay `StreamMetrics` at the end of the run to report server-observed ingress, cumulative queued/dropped egress datagrams, current egress queue packet/media depth, and server route p50/p95 timing.
+- The broadcaster polls relay `StreamMetrics` at the end of the run to report server-observed ingress, cumulative queued/dropped egress datagrams, current per-stream egress queue packet/media depth, and server route p50/p95 timing.
 - When most viewers are degraded by packet loss, dropped frames, excessive jitter/latency, slow reassembly/decode/render p95, or low render FPS, relay feedback lowers the synthetic target bitrate, then framerate, then screen resolution when the earlier targets are already at their floor. The broadcaster shrinks subsequent synthetic frame payloads, rescales screen frames when needed, emits a keyframe after a resolution change, and updates `StreamConfig`.
 - The viewer unsubscribes and leaves on normal exit; when the last participant leaves, the relay removes the empty room from subsequent discovery.
 - The final viewer summary reports zero loss and drops on a healthy local run.
@@ -208,7 +208,7 @@ Expected behavior:
 - The broadcaster publishes an Opus voice stream config and prints `audio-send` lines with capture/encode/packetize/send timing.
 - The viewer prints `audio-recv` and `audio-play` lines for each decoded frame, including estimated/calibrated latency, sender encode/send, server queue, reassembly, decode/play timing, and playback FPS.
 - With `--audio-output speaker`, the viewer queues decoded PCM to the default Windows speaker through WinMM while keeping the same `audio-play` metrics.
-- The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams, zero drops, current egress queue depth, and server route timing percentiles.
+- The broadcaster polls relay `StreamMetrics`; a healthy single-viewer run reports queued egress datagrams, zero drops, current stream egress queue depth, and server route timing percentiles.
 - The final viewer summary reports `kind=voice`, matching decoded and played frame counts, and zero loss on a healthy local run.
 
 ## Desktop dual-stream broadcaster/viewer checks
