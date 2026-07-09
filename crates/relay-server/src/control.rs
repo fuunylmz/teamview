@@ -188,14 +188,19 @@ impl ControlState {
                     room_id: leave.room_id,
                 })
             }
-            ClientControl::ViewerStats(_) => {
+            ClientControl::ViewerStats(report) => {
+                let total_viewer_count = self.subscribers_for_stream(report.stream_id).len() as u32;
+                let viewer_is_degraded = report.lost_packets > 0
+                    || report.dropped_frames > 0
+                    || report.jitter_buffer_ms > 120
+                    || report.estimated_latency_ms > 200;
                 ServerControl::PublisherFeedback(teamview_protocol::control::PublisherFeedback {
-                    room_id: 0,
-                    stream_id: 0,
+                    room_id: report.room_id,
+                    stream_id: report.stream_id,
                     aggregate_available_bitrate_bps: 0,
-                    degraded_viewer_count: 0,
-                    total_viewer_count: 0,
-                    keyframe_requested: false,
+                    degraded_viewer_count: u32::from(viewer_is_degraded),
+                    total_viewer_count,
+                    keyframe_requested: report.lost_packets > 0 || report.dropped_frames > 0,
                 })
             }
             ClientControl::SetTargetBitrate(_) | ClientControl::SetTargetFramerate(_) => {
@@ -262,6 +267,7 @@ mod tests {
         codec::CodecId,
         control::{
             ClientEnvelope, CreateRoom, Hello, JoinRoom, MediaKind, PublishStream, SubscribeStream,
+            ViewerStatsReport,
         },
     };
 
@@ -340,6 +346,48 @@ mod tests {
         assert!(!room.participants.contains(&publisher.user_id.unwrap()));
         assert!(!room.published_streams.contains_key(&9));
         assert!(!room.subscriptions.contains_key(&9));
+    }
+
+    #[test]
+    fn viewer_stats_returns_degraded_publisher_feedback() {
+        let mut state = ControlState::new();
+        let mut publisher = Session::anonymous(1);
+        let mut viewer = Session::anonymous(2);
+        authenticate(&mut state, &mut publisher, "publisher");
+        authenticate(&mut state, &mut viewer, "viewer");
+        let room_id = create_room(&mut state, &mut publisher, "stage1");
+        join_room(&mut state, &mut publisher, room_id);
+        join_room(&mut state, &mut viewer, room_id);
+        publish_stream(&mut state, &mut publisher, room_id, 9);
+        subscribe_stream(&mut state, &mut viewer, room_id, 9);
+
+        let feedback = state.handle_client_envelope(
+            &mut viewer,
+            ClientEnvelope::new(
+                6,
+                ClientControl::ViewerStats(ViewerStatsReport {
+                    room_id,
+                    stream_id: 9,
+                    received_packets: 10,
+                    lost_packets: 1,
+                    decoded_frames: 2,
+                    dropped_frames: 0,
+                    jitter_buffer_ms: 40,
+                    estimated_latency_ms: 90,
+                }),
+            ),
+        );
+
+        match feedback.message {
+            ServerControl::PublisherFeedback(feedback) => {
+                assert_eq!(feedback.room_id, room_id);
+                assert_eq!(feedback.stream_id, 9);
+                assert_eq!(feedback.total_viewer_count, 1);
+                assert_eq!(feedback.degraded_viewer_count, 1);
+                assert!(feedback.keyframe_requested);
+            }
+            other => panic!("unexpected viewer stats response: {other:?}"),
+        }
     }
 
     #[test]

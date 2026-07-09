@@ -17,11 +17,12 @@ use teamview_protocol::{
     codec::CodecId,
     control::{
         ClientControl, CreateRoom, Hello, JoinRoom, MediaKind, PublishStream, RoomId,
-        ServerControl, ServerEnvelope, StreamId, SubscribeStream,
+        ServerControl, ServerEnvelope, StreamId, SubscribeStream, ViewerStatsReport,
     },
     frame::packetize_frame_for_datagram_target,
     packet::DEFAULT_DATAGRAM_PAYLOAD_TARGET,
 };
+use tokio::time::MissedTickBehavior;
 use tracing::info;
 
 use crate::{
@@ -29,6 +30,7 @@ use crate::{
     decode::{FrameReassemblyBuffer, VideoDecoder, h264::H264Decoder},
     encode::{VideoEncoder, h264::H264Encoder},
     playback::{NullPlayback, VideoPlayback},
+    stats::ClientMediaStats,
     transport::quic::{build_client_endpoint, connect_control_client},
 };
 
@@ -70,6 +72,12 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     media_frames: u32,
 
+    #[arg(long, default_value_t = 0)]
+    media_run_ms: u64,
+
+    #[arg(long, default_value_t = 30)]
+    media_fps: u16,
+
     #[arg(long, default_value_t = 512)]
     media_frame_bytes: usize,
 
@@ -78,6 +86,15 @@ struct Args {
 
     #[arg(long, default_value_t = 0)]
     media_start_delay_ms: u64,
+
+    #[arg(long, default_value_t = 250)]
+    media_end_linger_ms: u64,
+
+    #[arg(long, default_value_t = 5_000)]
+    media_idle_timeout_ms: u64,
+
+    #[arg(long, default_value_t = 30)]
+    stats_interval_frames: u32,
 }
 
 #[tokio::main]
@@ -162,7 +179,7 @@ async fn run_broadcaster_control_flow(
         "control-flow broadcaster room_id={} stream_id={}",
         room_id, args.stream_id
     );
-    if args.media_frames > 0 {
+    if args.synthetic_media_enabled() {
         run_synthetic_broadcaster_media(control, args).await?;
     }
     Ok(())
@@ -195,7 +212,7 @@ async fn run_viewer_control_flow(
         "control-flow viewer room_id={} stream_id={}",
         room_id, args.stream_id
     );
-    if args.media_frames > 0 {
+    if args.synthetic_media_enabled() {
         run_synthetic_viewer_media(control, args).await?;
     }
     Ok(())
@@ -208,6 +225,8 @@ async fn run_synthetic_broadcaster_media(
     if args.media_start_delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(args.media_start_delay_ms)).await;
     }
+    let media_frames = args.synthetic_media_frames()?;
+    let frame_interval = args.media_frame_interval()?;
 
     let mut capture = windows::WindowsGraphicsCapture::new(
         CaptureSource::PrimaryMonitor,
@@ -220,9 +239,14 @@ async fn run_synthetic_broadcaster_media(
     encoder.config.synthetic_payload_bytes = args.media_frame_bytes;
     encoder.request_keyframe();
 
+    let mut ticker = tokio::time::interval(frame_interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let capture_step_micros = frame_interval.as_micros().min(u64::MAX as u128) as u64;
     let mut sent_packets = 0_u64;
-    for frame_id in 1..=args.media_frames {
-        capture.push_test_frame(1280, 720, frame_id as u64 * 33_333);
+    let mut next_sequence_number = 1_u32;
+    for frame_id in 1..=media_frames {
+        ticker.tick().await;
+        capture.push_test_frame(1280, 720, frame_id as u64 * capture_step_micros.max(1));
         let Some(captured) = capture.next_frame()? else {
             continue;
         };
@@ -231,9 +255,10 @@ async fn run_synthetic_broadcaster_media(
         };
         let packets = packetize_frame_for_datagram_target(
             &frame,
-            frame_id.saturating_mul(100),
+            next_sequence_number,
             args.max_datagram_payload,
         )?;
+        next_sequence_number = next_sequence_number.wrapping_add(packets.len() as u32);
         for packet in &packets {
             control.send_media_packet(packet)?;
             sent_packets += 1;
@@ -247,27 +272,45 @@ async fn run_synthetic_broadcaster_media(
         );
     }
     println!(
-        "media-summary role=broadcaster frames={} packets={}",
-        args.media_frames, sent_packets
+        "media-summary role=broadcaster frames={} packets={} fps={} run_ms={}",
+        media_frames, sent_packets, args.media_fps, args.media_run_ms
     );
+    if args.media_end_linger_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(args.media_end_linger_ms)).await;
+    }
     Ok(())
 }
 
 async fn run_synthetic_viewer_media(
-    control: &crate::transport::quic::ControlClient,
+    control: &mut crate::transport::quic::ControlClient,
     args: &Args,
 ) -> anyhow::Result<()> {
+    let target_frames = args.synthetic_media_frames()?;
     let mut buffer = FrameReassemblyBuffer::new();
     let mut decoder = H264Decoder;
     let mut playback = NullPlayback;
+    let mut stats = ClientMediaStats::default();
     let mut reassembled_frames = 0_u32;
     let mut decoded_frames = 0_u32;
     let mut received_packets = 0_u64;
 
-    while reassembled_frames < args.media_frames {
-        let packet = tokio::time::timeout(Duration::from_secs(5), control.recv_media_packet())
-            .await
-            .context("timed out waiting for media packet")??;
+    while reassembled_frames < target_frames {
+        let packet = match tokio::time::timeout(
+            Duration::from_millis(args.media_idle_timeout_ms),
+            control.recv_media_packet(),
+        )
+        .await
+        {
+            Ok(Ok(packet)) => packet,
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                if args.media_frames == 0 && received_packets > 0 {
+                    break;
+                }
+                return Err(error).context("timed out waiting for media packet");
+            }
+        };
+        stats.record_packet(&packet);
         received_packets += 1;
         if let Some(frame) = buffer.push(packet)? {
             println!(
@@ -278,16 +321,43 @@ async fn run_synthetic_viewer_media(
             );
             if let Some(decoded) = decoder.decode(&frame.bytes)? {
                 playback.render(decoded)?;
+                stats.record_decoded_frame();
                 decoded_frames += 1;
+            } else {
+                stats.record_dropped_frame();
             }
             reassembled_frames += 1;
+            if args.stats_interval_frames > 0
+                && reassembled_frames.is_multiple_of(args.stats_interval_frames)
+            {
+                send_viewer_stats(control, args.room_id.unwrap(), args.stream_id, stats).await?;
+            }
         }
+    }
+    if received_packets > 0 {
+        send_viewer_stats(control, args.room_id.unwrap(), args.stream_id, stats).await?;
     }
 
     println!(
-        "media-summary role=viewer frames={} decoded={} packets={}",
-        reassembled_frames, decoded_frames, received_packets
+        "media-summary role=viewer frames={} decoded={} packets={} lost={} dropped={}",
+        reassembled_frames,
+        decoded_frames,
+        received_packets,
+        stats.lost_packets,
+        stats.dropped_frames
     );
+    Ok(())
+}
+
+async fn send_viewer_stats(
+    control: &mut crate::transport::quic::ControlClient,
+    room_id: RoomId,
+    stream_id: StreamId,
+    stats: ClientMediaStats,
+) -> anyhow::Result<()> {
+    let report: ViewerStatsReport = stats.to_viewer_report(room_id, stream_id);
+    let response = control.send(ClientControl::ViewerStats(report)).await?;
+    print_control_response("viewer-stats", &response);
     Ok(())
 }
 
@@ -303,4 +373,32 @@ fn ensure_not_error(action: &str, response: &ServerEnvelope) -> anyhow::Result<(
         bail!("{action} failed: {}", error.message);
     }
     Ok(())
+}
+
+impl Args {
+    fn synthetic_media_enabled(&self) -> bool {
+        self.media_frames > 0 || self.media_run_ms > 0
+    }
+
+    fn synthetic_media_frames(&self) -> anyhow::Result<u32> {
+        if self.media_frames > 0 {
+            return Ok(self.media_frames);
+        }
+        if self.media_fps == 0 {
+            bail!("--media-fps must be greater than zero");
+        }
+        let frames = self
+            .media_run_ms
+            .saturating_mul(self.media_fps as u64)
+            .div_ceil(1_000)
+            .max(1);
+        Ok(frames.min(u32::MAX as u64) as u32)
+    }
+
+    fn media_frame_interval(&self) -> anyhow::Result<Duration> {
+        if self.media_fps == 0 {
+            bail!("--media-fps must be greater than zero");
+        }
+        Ok(Duration::from_micros(1_000_000 / self.media_fps as u64))
+    }
 }

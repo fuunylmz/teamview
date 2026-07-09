@@ -103,6 +103,25 @@ Example output:
 quic-sample-forward frames=2 fragments=14 reassembled=4 delivered=28 dropped=0
 ```
 
+## Desktop synthetic session checks
+
+The desktop client can run a paced synthetic media session over the relay. The broadcaster uses a frame interval derived from `--media-fps`, keeps sequence numbers continuous across fragments, and lingers briefly after finite sends so in-flight datagrams can drain. The viewer reassembles frames, mock-decodes them, tracks packet loss from sequence gaps, and periodically sends `ViewerStats` over the control stream.
+
+Run in separate terminals:
+
+```bash
+cargo run -p relay-server -- --listen 127.0.0.1:4433
+cargo run -p desktop-client -- --mode broadcaster --relay 127.0.0.1:4433 --media-run-ms 1000 --media-start-delay-ms 2000 --media-fps 5 --media-frame-bytes 800 --max-datagram-payload 700
+cargo run -p desktop-client -- --mode viewer --relay 127.0.0.1:4433 --room-id 1 --media-run-ms 1000 --media-fps 5 --max-datagram-payload 700
+```
+
+Expected behavior:
+
+- The broadcaster prints five `media-send` lines at 5 fps for a 1000 ms run.
+- The viewer receives and decodes five frames split across ten packets with `--max-datagram-payload 700`.
+- The viewer sends periodic `ViewerStats` and receives `PublisherFeedback` responses.
+- The final viewer summary reports zero loss and drops on a healthy local run.
+
 ## Measurement plan
 
 Early milestones measure synthetic packet forwarding latency, queue behavior, encoded-frame reassembly behavior, capture queue behavior, and synthetic QUIC forwarding behavior. Later milestones add real capture, encode, server receive, server send, viewer receive, decode, and render timestamps.
